@@ -14,10 +14,12 @@ import sys
 import time
 
 HOME = os.path.expanduser("~")
-SRC_DIR = f"{HOME}/.reasonix/projects/<slug>/memory"
-MCP_CMD = "/home/<user>/.local/bin/memory-mcp"
-MCP_DB = "/home/<user>/shared-store/facts.db"
-PROJECT_SLUG = "<slug>"
+# All paths env-overridable so the tool runs in any environment; defaults are
+# the host layout.
+SRC_DIR = os.environ.get("MEMORY_MIGRATE_SRC", f"{HOME}/.reasonix/projects/<slug>/memory")
+MCP_CMD = os.environ.get("MEMORY_MCP_CMD", "/home/<user>/.local/bin/memory-mcp")
+MCP_DB = os.environ.get("MEMORY_MCP_DB", "/home/<user>/shared-store/facts.db")
+PROJECT_SLUG = os.environ.get("MEMORY_MIGRATE_PROJECT", "<slug>")
 
 FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 

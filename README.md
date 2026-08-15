@@ -30,8 +30,12 @@ trust CHECK IN ('high','medium','low'), strong, created_at, updated_at, archived
 
 ## Environment
 
-- `MEMORY_MCP_DB` — SQLite path (default `/home/<user>/shared-store/facts.db`)
-- Journal mode WAL, busy_timeout 5000 (multi-writer: host + containers)
+- `MEMORY_MCP_DB` — SQLite path. Default is **script-relative**: `<repo>/data/facts.db`
+  (portable — clone the repo anywhere and it works out of the box; `data/` is gitignored).
+  The deployment stack always sets it explicitly: host wrapper
+  (`~/.local/bin/memory-mcp`) → `/home/<user>/shared-store/facts.db`,
+  docker runtimes → `/opt/memory-shared/facts.db`.
+- Journal mode WAL, busy_timeout 5000 (multi-writer: host + containers).
 
 ## Integration
 
@@ -46,4 +50,6 @@ trust CHECK IN ('high','medium','low'), strong, created_at, updated_at, archived
   (see reasonix `internal/memory/mcp_sync.go`, best-effort).
 
 `migrate_memory.py` — one-time migration of native reasonix memory facts
-(frontmatter + body) into the shared store (Phase 3).
+(frontmatter + body) into the shared store (Phase 3). All its paths are
+env-overridable: `MEMORY_MIGRATE_SRC`, `MEMORY_MCP_CMD`, `MEMORY_MCP_DB`,
+`MEMORY_MIGRATE_PROJECT`.

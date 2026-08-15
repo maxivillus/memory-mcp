@@ -20,7 +20,16 @@ Tools:
 import hashlib, json, os, sqlite3, sys
 from datetime import datetime, timezone
 
-DB_PATH = os.environ.get("MEMORY_MCP_DB", "/home/<user>/shared-store/facts.db")
+def default_db_path():
+    """Script-relative default: <repo>/data/facts.db — portable across environments.
+
+    Override with MEMORY_MCP_DB (used by all deployment runtimes: host wrapper,
+    docker containers via /opt/memory-shared).
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "facts.db")
+
+
+DB_PATH = os.environ.get("MEMORY_MCP_DB") or default_db_path()
 VALID_TRUST = ("high", "medium", "low")
 
 _SCHEMA = """
@@ -354,7 +363,7 @@ def main():
                 "result": {
                     "protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "memory-mcp", "version": "0.2.0"},
+                    "serverInfo": {"name": "memory-mcp", "version": "0.2.1"},
                 },
             }
         elif msg.get("method") == "tools/list":

@@ -1,0 +1,9 @@
+# Local data (script-relative default DB) — never commit
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
