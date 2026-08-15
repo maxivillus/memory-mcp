@@ -33,7 +33,7 @@ trust CHECK IN ('high','medium','low'), strong, created_at, updated_at, archived
 - `MEMORY_MCP_DB` — SQLite path. Default is **script-relative**: `<repo>/data/facts.db`
   (portable — clone the repo anywhere and it works out of the box; `data/` is gitignored).
   The deployment stack always sets it explicitly: host wrapper
-  (`~/.local/bin/memory-mcp`) → `/home/<user>/shared-store/facts.db`,
+  (`~/.local/bin/memory-mcp`) → `the shared host store`,
   docker runtimes → `/opt/memory-shared/facts.db`.
 - Journal mode WAL, busy_timeout 5000 (multi-writer: host + containers).
 
