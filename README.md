@@ -19,14 +19,49 @@ extraction/gating/injection stay client-side (reasonix memory patches).
   description clipped at 120 chars, total capped at `max_chars` (default 4000,
   cut at line boundary) — mirrors the reasonix index-cap for prompt budgets
 - `forget_fact {id | sha256}` — soft delete (archived=1)
-- `stats {}` — totals by trust/domain
+- `stats {}` — totals by trust/domain plus v0.3 counts (entities/relations/decisions/evidence)
 - `export {}` — all facts incl. archived (migration/backup)
+
+### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
+
+Covers the agent needs that motivated the Semantica evaluation (decision
+rationale, precedent search, evidence lineage) with zero new dependencies —
+just SQLite + FTS5.
+
+- `remember_entity {name, type?, aliases?}` — upsert entity node
+- `remember_relation {subject, predicate, object, source_fact_id?}` — edge
+  (entities auto-created; dedup by triple)
+- `search_graph {entity, depth? (1-2), limit?}` — BFS neighbors, both directions
+- `record_decision {category?, subject?, scenario, reasoning?, outcome?,
+  confidence?, decision_maker?, issue_ref?, parent_decision_id?}` — decision node;
+  `parent_decision_id` builds causal chains
+- `query_decisions {category?, subject?, outcome?, decision_maker?, issue_ref?, limit?}`
+- `find_precedents {scenario, category?, limit?}` — similar decisions via FTS BM25
+  (OR-joined terms, ranked)
+- `get_causal_chain {decision_id}` — walk parent links to the root
+- `get_provenance {fact_id | sha256}` — fact + evidence rows
+- `attach_evidence {fact_id, source_ref, source_checksum?, fetched_at?}` — link a
+  fact to a source (dedup by fact_id+source_ref)
+- `detect_conflicts {text}` — near-duplicate facts (term coverage ≥ 0.6) +
+  decisions with the same subject but >1 distinct outcome
 
 ## Schema
 
 `facts(id, sha256 UNIQUE, text, source, project, domain,
 trust CHECK IN ('high','medium','low'), strong, created_at, updated_at, archived)`
 + `facts_fts` FTS5 virtual table with insert/delete/update triggers.
+
+v0.3 additions (all additive — `CREATE TABLE IF NOT EXISTS`, existing DBs
+migrate in place):
+
+- `entities(id, name UNIQUE, type, aliases, created_at, updated_at)`
+- `relations(id, subject_id → entities, predicate, object_id → entities,
+  source_fact_id?, created_at, UNIQUE(subject_id, predicate, object_id))`
+- `decisions(id, category, subject, scenario, reasoning, outcome, confidence,
+  decision_maker, issue_ref, parent_decision_id?, created_at, updated_at)`
+  + `decisions_fts` FTS5 (scenario/reasoning/category) with triggers
+- `evidence(id, fact_id → facts, source_ref, source_checksum, fetched_at,
+  created_at, UNIQUE(fact_id, source_ref))`
 
 ## Environment
 
