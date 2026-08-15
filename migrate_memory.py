@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Phase 3: migrate native reasonix memory facts -> memory-mcp (shared store).
 
-Source: ~/.reasonix/projects/<slug>/memory/*.md (frontmatter + body).
+Source: reasonix project memory dir (auto-discovered: first `<project>/memory`
+under `~/.reasonix/projects/`; override with MEMORY_MIGRATE_SRC).
 Target: memory-mcp server (spawned once, remember_fact batch).
 Mapping: text = title: description + body; trust = metadata.trust; domain = metadata.type;
 project = source project slug; source = migration-20260815; strong = false.
@@ -9,17 +10,47 @@ project = source project slug; source = migration-20260815; strong = false.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 
 HOME = os.path.expanduser("~")
-# All paths env-overridable so the tool runs in any environment; defaults are
-# the host layout.
-SRC_DIR = os.environ.get("MEMORY_MIGRATE_SRC", f"{HOME}/.reasonix/projects/<slug>/memory")
-MCP_CMD = os.environ.get("MEMORY_MCP_CMD", "/home/<user>/.local/bin/memory-mcp")
-MCP_DB = os.environ.get("MEMORY_MCP_DB", "/home/<user>/shared-store/facts.db")
-PROJECT_SLUG = os.environ.get("MEMORY_MIGRATE_PROJECT", "<slug>")
+
+
+def _default_src_dir():
+    """First reasonix project dir that has a memory/ subdir (portable discovery).
+
+    Symlinked project dirs are skipped: a planted symlink could redirect the
+    migration source.
+    """
+    projects = os.path.join(HOME, ".reasonix", "projects")
+    if os.path.isdir(projects):
+        for name in sorted(os.listdir(projects)):
+            proj = os.path.join(projects, name)
+            if os.path.islink(proj):
+                continue
+            candidate = os.path.join(proj, "memory")
+            if os.path.isdir(candidate):
+                return candidate
+    raise SystemExit(
+        "no reasonix project memory dir found under ~/.reasonix/projects/ — "
+        "set MEMORY_MIGRATE_SRC explicitly")
+
+
+# All paths env-overridable; defaults are portable (no host paths):
+#   MEMORY_MIGRATE_SRC     — source memory dir (default: auto-discovered)
+#   MEMORY_MIGRATE_PROJECT — project slug for fact.project (default: derived
+#                            from the discovered project dir name)
+#   MEMORY_MCP_CMD         — server command (default: 'memory-mcp' via PATH)
+#   MEMORY_MCP_DB          — target DB (default: XDG-style user data path;
+#                            only propagated to the server when explicitly set,
+#                            so a host wrapper pin is never overridden)
+SRC_DIR = os.environ.get("MEMORY_MIGRATE_SRC") or _default_src_dir()
+PROJECT_SLUG = os.environ.get("MEMORY_MIGRATE_PROJECT") or os.path.basename(os.path.dirname(SRC_DIR))
+MCP_DB_EXPLICIT = "MEMORY_MCP_DB" in os.environ
+MCP_DB = os.environ.get("MEMORY_MCP_DB") or os.path.join(HOME, ".local", "share", "memory-mcp", "facts.db")
+MCP_CMD = os.environ.get("MEMORY_MCP_CMD") or shutil.which("memory-mcp") or "memory-mcp"
 
 FM_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 
@@ -68,10 +99,16 @@ def load_facts():
 
 
 class MCPClient:
-    def __init__(self, cmd, db):
+    def __init__(self, cmd, db, db_explicit):
+        env = dict(os.environ)
+        # Propagate the target DB only when explicitly requested: otherwise the
+        # spawned server (e.g. a host wrapper pin) decides, and an implicit
+        # XDG default can never silently redirect a pinned store.
+        if db_explicit:
+            env["MEMORY_MCP_DB"] = db
         self.proc = subprocess.Popen(
             [cmd], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, env={**os.environ, "MEMORY_MCP_DB": db})
+            stderr=subprocess.PIPE, env=env)
         self.next_id = 0
 
     def call(self, method, params=None):
@@ -99,8 +136,12 @@ class MCPClient:
 
 def main():
     facts = load_facts()
+    target = MCP_DB if MCP_DB_EXPLICIT else "spawned server default (e.g. host wrapper pin); set MEMORY_MCP_DB to pin"
+    print(f"source: {SRC_DIR}")
+    print(f"server: {MCP_CMD}")
+    print(f"target db: {target}", flush=True)
     print(f"facts to migrate: {len(facts)}", flush=True)
-    client = MCPClient(MCP_CMD, MCP_DB)
+    client = MCPClient(MCP_CMD, MCP_DB, MCP_DB_EXPLICIT)
     try:
         client.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
                                    "clientInfo": {"name": "migration", "version": "1"}})

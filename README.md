@@ -50,6 +50,11 @@ trust CHECK IN ('high','medium','low'), strong, created_at, updated_at, archived
   (see reasonix `internal/memory/mcp_sync.go`, best-effort).
 
 `migrate_memory.py` — one-time migration of native reasonix memory facts
-(frontmatter + body) into the shared store (Phase 3). All its paths are
-env-overridable: `MEMORY_MIGRATE_SRC`, `MEMORY_MCP_CMD`, `MEMORY_MCP_DB`,
-`MEMORY_MIGRATE_PROJECT`.
+(frontmatter + body) into the shared store (Phase 3). All paths are
+env-overridable and default to portable values: `MEMORY_MIGRATE_SRC`
+(auto-discovered first `<project>/memory` under `~/.reasonix/projects/`,
+symlinked project dirs skipped), `MEMORY_MIGRATE_PROJECT` (derived from the
+project dir name), `MEMORY_MCP_CMD` (`memory-mcp` via PATH), `MEMORY_MCP_DB`
+(XDG-style `~/.local/share/memory-mcp/facts.db` — propagated to the server
+only when explicitly set, so a host wrapper pin is never overridden;
+resolved source/server/target are printed before writing).
