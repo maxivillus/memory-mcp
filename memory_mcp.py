@@ -170,8 +170,23 @@ def now():
 
 
 def get_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    con = sqlite3.connect(DB_PATH, timeout=10)
+    dbdir = os.path.dirname(DB_PATH) or "."
+    try:
+        os.makedirs(dbdir, exist_ok=True)
+    except OSError as e:
+        # Full detail to stderr only — the client-visible message must not
+        # leak the resolved host path (repo rule: no host paths).
+        print(f"memory-mcp: cannot create DB directory {dbdir!r}: {e}", file=sys.stderr)
+        raise RuntimeError(
+            "cannot open the fact store: DB directory is not writable; "
+            "set MEMORY_MCP_DB to a writable path (e.g. a rw bind-mount)")
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=10)
+    except sqlite3.DatabaseError as e:
+        print(f"memory-mcp: cannot open DB {DB_PATH!r}: {e}", file=sys.stderr)
+        raise RuntimeError(
+            "cannot open the fact store: DB file is not accessible or corrupt; "
+            "set MEMORY_MCP_DB to a writable path (e.g. a rw bind-mount)")
     con.row_factory = sqlite3.Row
     # Мульти-райтер: хост + docker-рантаймы пишут в один файл (bind-mount).
     con.execute("PRAGMA journal_mode=WAL")
