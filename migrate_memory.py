@@ -31,8 +31,9 @@ def _default_src_dir():
             if os.path.islink(proj):
                 continue
             candidate = os.path.join(proj, "memory")
-            if os.path.isdir(candidate):
-                return candidate
+            if os.path.islink(candidate) or not os.path.isdir(candidate):
+                continue
+            return candidate
     raise SystemExit(
         "no reasonix project memory dir found under ~/.reasonix/projects/ — "
         "set MEMORY_MIGRATE_SRC explicitly")
@@ -48,7 +49,7 @@ def _default_src_dir():
 #                            so a host wrapper pin is never overridden)
 SRC_DIR = os.environ.get("MEMORY_MIGRATE_SRC") or _default_src_dir()
 PROJECT_SLUG = os.environ.get("MEMORY_MIGRATE_PROJECT") or os.path.basename(os.path.dirname(SRC_DIR))
-MCP_DB_EXPLICIT = "MEMORY_MCP_DB" in os.environ
+MCP_DB_EXPLICIT = bool(os.environ.get("MEMORY_MCP_DB"))
 MCP_DB = os.environ.get("MEMORY_MCP_DB") or os.path.join(HOME, ".local", "share", "memory-mcp", "facts.db")
 MCP_CMD = os.environ.get("MEMORY_MCP_CMD") or shutil.which("memory-mcp") or "memory-mcp"
 
