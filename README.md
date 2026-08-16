@@ -83,6 +83,16 @@ migrate in place):
 - reasonix dual-write: `REASONIX_MEMORY_MCP=1` (+ `MEMORY_MCP_CMD`, `MEMORY_MCP_DB`)
   makes the memory-extract child process sync extracted facts into this store
   (see reasonix `internal/memory/mcp_sync.go`, best-effort).
+- reasonix read (step a, 2026-08-16): the same env flag turns on reading the
+  shared store in reasonix (see `internal/memory/mcp_read.go`):
+  - **prefix index** — `Load()` swaps the native (uncapped) index for the
+    capped `summarize_index` (4000 chars, freshest first); native index stays
+    as fallback on any server error;
+  - **per-turn recall** — `AutoRecall` additionally runs `search_facts` over
+    the shared store and scores the matches with the same BM25/freshness/trust
+    pipeline as native facts (dual-read; native wins on duplicate text, so
+    dual-write overlap costs nothing). One `search_facts` round-trip ≈ 0.1 s;
+    failures degrade silently to native-only.
 
 `migrate_memory.py` — one-time migration of native reasonix memory facts
 (frontmatter + body) into the shared store (Phase 3). All paths are
@@ -102,3 +112,28 @@ resolved source/server/target are printed before writing).
   store conventions. Compatible with the `SKILL.md` format used by agent skill
   collections; copy it into your agent's skill directory (or point discovery
   at this repo).
+
+## Design boundaries
+
+memory-mcp is a shared fact **store + search**, deliberately not a full memory
+system. The following stay client-side (e.g. the reasonix memory patches:
+extraction, recall tiers, fact gate):
+
+- **Fact extraction from conversations** and deciding what is worth
+  remembering.
+- **Prompt injection / recall assembly** — the store is read on demand
+  (`search_facts`, `summarize_index`) or by the client's own recall pipeline.
+- **Truth verification** — `trust`/`strong` are client-set metadata and query
+  filters, not a verification or protection mechanism.
+- **Semantic search** — `search_facts`/`find_precedents` are lexical
+  (FTS5 + BM25), chosen for zero dependencies, portability, and offline use.
+  `find_precedents` OR-joins terms on purpose: precedent lookup is about
+  similarity, and BM25 ranks partially matching decisions.
+- **Near-duplicate handling** — writes dedup on exact text (sha256).
+  Paraphrased facts stay separate records; `detect_conflicts` surfaces
+  near-duplicates (term coverage ≥ 0.6) on demand.
+
+## Deploying in a docker runtime
+
+Step-by-step guide with a codex-runtime compose example, verification
+commands, and MCP registration: see **DEPLOYMENT.md**.
