@@ -221,7 +221,6 @@ CREATE INDEX IF NOT EXISTS relations_subject_idx ON relations(subject_id);
 CREATE INDEX IF NOT EXISTS relations_object_idx ON relations(object_id);
 CREATE INDEX IF NOT EXISTS evidence_fact_idx ON evidence(fact_id);
 CREATE INDEX IF NOT EXISTS decisions_parent_idx ON decisions(parent_decision_id);
-CREATE UNIQUE INDEX IF NOT EXISTS facts_sha_ws ON facts(sha256, workspace_id);
 """
 
 # Optional semantic search (embeddings.py) — created here so the schema is
@@ -318,7 +317,8 @@ def _migrate_facts(con):
         except sqlite3.OperationalError:
             pass  # table not created yet (fresh DB)
     indexes = {r["name"] for r in con.execute("PRAGMA index_list(facts)")}
-    if "sqlite_autoindex_facts_1" in indexes or "facts_sha_ws" not in indexes:
+    if "sqlite_autoindex_facts_1" in indexes:
+        # legacy global UNIQUE(sha256) present -> rebuild
         cols = ("id, sha256, text, source, project, domain, trust, strong, importance, "
                 "invalid_at, superseded_by, confirmed, workspace_id, created_at, updated_at, archived")
         con.executescript(
@@ -335,6 +335,9 @@ def _migrate_facts(con):
             "INSERT INTO facts_fts(facts_fts) VALUES('rebuild');\n"
             "COMMIT;\n"
             "PRAGMA foreign_keys=ON;\n")
+    else:
+        # fresh or already-rebuilt DB: ensure the composite unique index
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS facts_sha_ws ON facts(sha256, workspace_id)")
     con.commit()
 
 
