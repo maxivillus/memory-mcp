@@ -12,11 +12,19 @@ metadata:
 
 # Shared Agent Memory (memory-mcp)
 
-Available to runtime agents as the `mcp__memory-mcp__*` tools (19 tools).
+Available to runtime agents as the `mcp__memory-mcp__*` tools (24 tools).
 One shared store across all runtimes: a fact or decision written in one
 session is visible to every later session.
 
-## Facts — remember_fact / search_facts / search_semantic / list_facts / summarize_index / forget_fact
+## Facts — remember_fact / add_fact / search_facts / search_semantic / list_facts / summarize_index / forget_fact
+
+- `ingest_turn {transcript, session_ref?}` — server-side extraction: send a
+  conversation transcript, the server's LLM provider extracts durable facts
+  and stores them with provenance (when enabled).
+- `compose_recall {turn_text}` — returns a ready-to-inject `<memory-recall>`
+  block (server-side scoring); `sweep_freshness` archives stale facts.
+- `verify_facts {text}` — LLM cross-check for contradictions/supersessions
+  before writing; superseded facts are archived on high-confidence verdicts.
 
 - `remember_fact {text, source?, project?, domain?, trust?, strong?}` — store a
   durable fact (upsert, dedup by sha256). Use `strong=true` for
