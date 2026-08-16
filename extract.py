@@ -25,8 +25,9 @@ agent memory store. Return ONLY JSON matching this schema:
 {"facts": [{"text": "...", "type": "user|feedback|project|reference", "trust": "high|medium|low", "strong": false, "scope": "project|global"}]}
 Rules:
 - text: one self-contained fact, present tense, no fluff, max ~200 words.
-  Write the fact text in the SAME LANGUAGE as the transcript (Russian
-  transcript -> Russian facts, English transcript -> English facts).
+  Write the fact in the language the conversation is held in (the user's
+  language) — do not force or switch languages, whatever that language is.
+  Technical terms and proper names may stay in their original form.
 - type: user = who the user is; feedback = guidance on how to work (with why);
   project = ongoing work/goals/constraints; reference = pointers to resources.
 - trust: high only for explicitly confirmed facts; medium default; low for
