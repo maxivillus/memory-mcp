@@ -733,6 +733,21 @@ def export_facts(_args=None):
 
 
 TOOLS = {
+    "add_fact": {
+        "description": "Alias for remember_fact: store a durable fact (upsert, dedup by sha256 of text).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Fact text"},
+                "source": {"type": "string", "description": "Origin: session/issue/run"},
+                "project": {"type": "string", "description": "Project scope"},
+                "domain": {"type": "string", "description": "Category/tag"},
+                "trust": {"type": "string", "enum": list(VALID_TRUST), "default": "medium"},
+                "strong": {"type": "boolean", "default": False},
+            },
+            "required": ["text"],
+        },
+    },
     "remember_fact": {
         "description": "Store a durable fact (upsert, dedup by sha256 of text).",
         "inputSchema": {
@@ -940,6 +955,7 @@ TOOLS = {
 }
 
 HANDLERS = {
+    "add_fact": remember_fact,
     "remember_fact": remember_fact,
     "search_facts": search_facts,
     "search_semantic": search_semantic,
