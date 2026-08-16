@@ -795,7 +795,7 @@ TOOLS = {
         },
     },
     "find_precedents": {
-        "description": "Semantic precedent lookup: FTS BM25 over decision scenario/reasoning (terms AND-joined; optional category filter).",
+        "description": "Semantic precedent lookup: FTS BM25 over decision scenario/reasoning (terms OR-joined; optional category filter).",
         "inputSchema": {
             "type": "object",
             "properties": {
