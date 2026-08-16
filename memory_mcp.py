@@ -291,6 +291,13 @@ def sweep_freshness(args):
     return m.sweep_freshness(args)
 
 
+def consolidate(args):
+    m = _mod("verify", "MEMORY_MCP_VERIFY")
+    if m is None:
+        return _disabled("MEMORY_MCP_VERIFY")
+    return m.consolidate(args)
+
+
 def verify_facts(args):
     m = _mod("verify", "MEMORY_MCP_VERIFY")
     if m is None:
@@ -855,6 +862,38 @@ def confirm_fact(args):
         con.close()
 
 
+def facts_for_session(args):
+    """All active facts recorded from one session (source=session_ref)."""
+    session_ref = (args.get("session_ref") or "").strip()
+    if not session_ref:
+        return {"error": "session_ref is required"}
+    limit = max(1, min(int(args.get("limit", 50)), 200))
+    con = get_db()
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
+            "created_at, updated_at FROM facts WHERE source=? AND archived=0 AND invalid_at='' "
+            "ORDER BY importance DESC, updated_at DESC LIMIT ?", (session_ref, limit))]
+        return {"count": len(rows), "session_ref": session_ref, "facts": rows}
+    finally:
+        con.close()
+
+
+def list_sessions(args):
+    """Session index: distinct sources with active-fact counts, freshest first."""
+    limit = max(1, min(int(args.get("limit", 50)), 200))
+    con = get_db()
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT source, COUNT(*) AS facts, MAX(updated_at) AS last_activity "
+            "FROM facts WHERE source != '' AND archived=0 AND invalid_at='' "
+            "GROUP BY source ORDER BY last_activity DESC LIMIT ?", (limit,))]
+        return {"count": len(rows), "sessions": rows}
+    finally:
+        con.close()
+
+
+
 
 def stats(_args=None):
     con = get_db()
@@ -967,7 +1006,7 @@ TOOLS = {
         },
     },
     "compose_recall": {
-        "description": "Build a ready-to-inject <memory-recall> block for a user turn (server-side scoring; see recall.py). Requires MEMORY_MCP_RECALL=1.",
+        "description": "Build a ready-to-inject <memory-recall> block for a user turn (server-side scoring: lexical + semantic + entity-graph RRF; see recall.py). Requires MEMORY_MCP_RECALL=1.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -975,6 +1014,8 @@ TOOLS = {
                 "limit": {"type": "integer", "default": 8},
                 "chars": {"type": "integer", "default": 2400},
                 "semantic": {"type": "boolean", "default": False},
+                "graph": {"type": "boolean", "default": False, "description": "Expand via the entity graph (third RRF source)"},
+                "session_expand": {"type": "integer", "default": 0, "description": "Pull up to N sibling facts from the top hits' sessions (background)"},
             },
             "required": ["turn_text"],
         },
@@ -989,6 +1030,14 @@ TOOLS = {
             "type": "object",
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
+        },
+    },
+    "consolidate": {
+        "description": "LLM-merge of paraphrased facts into one fact (inputs invalidated bi-temporally; strong/confirmed never merged). Requires MEMORY_MCP_VERIFY=1.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"ids": {"type": "array", "items": {"type": "integer"}}},
+            "required": ["ids"],
         },
     },
     "fact_history": {
@@ -1012,6 +1061,24 @@ TOOLS = {
             "type": "object",
             "properties": {"id": {"type": "integer"}},
             "required": ["id"],
+        },
+    },
+    "facts_for_session": {
+        "description": "All active facts recorded from one session (source=session_ref), importance-first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_ref": {"type": "string"},
+                "limit": {"type": "integer", "default": 50},
+            },
+            "required": ["session_ref"],
+        },
+    },
+    "list_sessions": {
+        "description": "Session index: distinct sources with active-fact counts, freshest first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "default": 50}},
         },
     },
     "list_facts": {
@@ -1183,6 +1250,7 @@ HANDLERS = {
     "compose_recall": compose_recall,
     "sweep_freshness": sweep_freshness,
     "verify_facts": verify_facts,
+    "consolidate": consolidate,
     "list_facts": list_facts,
     "summarize_index": summarize_index,
     "remember_entity": remember_entity,
@@ -1199,6 +1267,8 @@ HANDLERS = {
     "fact_history": fact_history,
     "review_pending": review_pending,
     "confirm_fact": confirm_fact,
+    "facts_for_session": facts_for_session,
+    "list_sessions": list_sessions,
     "stats": stats,
     "export": export_facts,
 }

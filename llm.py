@@ -79,6 +79,11 @@ def _chat_test(messages):
     """
     import re
     joined = "\n".join(m.get("content", "") for m in messages)
+    if "You consolidate" in joined:
+        cands = re.findall(r"- id=(\d+): (.+)", joined)
+        if cands:
+            return json.dumps({"merge": True, "text": cands[0][1] + " (consolidated)",
+                               "importance": 0.7, "reason": "test provider"})
     facts = [{"text": line[6:].strip(), "type": "project", "trust": "medium",
               "strong": False, "scope": "project", "importance": 0.7}
              for line in joined.splitlines() if line.startswith("FACT: ")]

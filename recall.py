@@ -73,24 +73,38 @@ def compose_recall(args):
         except Exception:
             sem = []
 
-    # RRF merge (k=60): lexical rank + semantic rank
+    # RRF merge (k=60): lexical + semantic + entity-graph ranks
     k = 60
     merged = {}
     for i, f in enumerate(fts):
         merged[f["id"]] = 1.0 / (k + i + 1)
     for i, f in enumerate(sem):
         merged[f["id"]] = merged.get(f["id"], 0.0) + 1.0 / (k + i + 1)
+    graph = []
+    if args.get("graph"):
+        graph = _graph_hits(fts + sem, limit * 2)
+        for i, f in enumerate(graph):
+            merged[f["id"]] = merged.get(f["id"], 0.0) + 1.0 / (k + i + 1)
     ranked = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:limit]
 
     by_id = {f["id"]: f for f in fts}
     by_id.update({f["id"]: f for f in sem})
+    by_id.update({f["id"]: f for f in graph})
     hits = [dict(by_id[fid], semantic_score=round(score, 4)) for fid, score in ranked]
 
-    # Authoritative tier: semantic agreement (hybrid score) or single strong
-    # distinctive hit; everything else goes to background.
+    # Session expansion: sibling facts from the same session as the top hits
+    # (letta/engram-style linking), appended as background context.
+    session_expanded = []
+    expand = max(0, min(int(args.get("session_expand", 0)), 10))
+    if expand and hits:
+        session_expanded = _session_hits(hits, expand)
+
+    # Authoritative tier: semantic agreement (hybrid score), strong or
+    # human-confirmed facts (letta-style core tier); everything else goes to
+    # background.
     authoritative, background = [], []
-    for f in hits:
-        if f.get("semantic_score", 0) >= 0.5 or f.get("strong"):
+    for f in hits + session_expanded:
+        if f.get("semantic_score", 0) >= 0.5 or f.get("strong") or f.get("confirmed"):
             authoritative.append(f)
         else:
             background.append(f)
@@ -113,7 +127,9 @@ def compose_recall(args):
     out.append(_CLOSE)
     block = "".join(out)
     return {"count": len(hits), "authoritative": len(authoritative),
-            "background": len(background), "chars": len(block), "block": block}
+            "background": len(background), "graph": len(graph),
+            "session_expanded": len(session_expanded),
+            "chars": len(block), "block": block}
 
 
 def _entry(f):
@@ -172,5 +188,72 @@ def sweep_freshness(args):
         con.commit()
         return {"archived": len(archived), "kept": len(kept),
                 "archived_ids": archived[:50], "window_days": _HARD_WINDOW_DAYS}
+    finally:
+        con.close()
+
+
+def _graph_hits(hits, limit=10):
+    """Entity-graph expansion: entities mentioned in the hit facts -> graph
+    neighbors -> facts mentioning the neighbors (third RRF source)."""
+    from memory_mcp import get_db
+    con = get_db()
+    try:
+        names = [r["name"] for r in con.execute(
+            "SELECT name FROM entities WHERE length(name) >= 3")]
+        mentioned = set()
+        for f in hits:
+            low = (f.get("text") or "").lower()
+            for n in names:
+                if n.lower() in low:
+                    mentioned.add(n)
+        neighbors = set()
+        for n in list(mentioned)[:8]:
+            for r in con.execute(
+                "SELECT o.name AS nb FROM relations r JOIN entities s ON s.id=r.subject_id "
+                "JOIN entities o ON o.id=r.object_id WHERE s.name=? "
+                "UNION SELECT s.name FROM relations r JOIN entities s ON s.id=r.subject_id "
+                "JOIN entities o ON o.id=r.object_id WHERE o.name=?", (n, n)):
+                neighbors.add(r["nb"])
+        out, seen = [], {f["id"] for f in hits}
+        for nb in list(neighbors)[:12]:
+            # entity names are operator data: escape LIKE wildcards
+            esc = nb.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            rows = con.execute(
+                "SELECT id, text, source, project, domain, trust, strong, importance, confirmed "
+                "FROM facts WHERE text LIKE ? ESCAPE '\\' AND archived=0 AND invalid_at='' LIMIT 5",
+                ("%" + esc + "%",)).fetchall()
+            for r in rows:
+                if r["id"] not in seen:
+                    seen.add(r["id"])
+                    out.append(dict(r))
+                    if len(out) >= limit:
+                        return out
+        return out
+    finally:
+        con.close()
+
+
+def _session_hits(hits, expand):
+    """Facts from the same session as the top hits (session linking)."""
+    from memory_mcp import get_db
+    sources = [f.get("source") for f in hits if f.get("source")]
+    if not sources:
+        return []
+    con = get_db()
+    try:
+        seen = {f["id"] for f in hits}
+        out = []
+        for src in sources[:3]:
+            rows = con.execute(
+                "SELECT id, text, source, project, domain, trust, strong, importance, confirmed "
+                "FROM facts WHERE source=? AND archived=0 AND invalid_at='' "
+                "ORDER BY importance DESC, updated_at DESC LIMIT ?", (src, expand)).fetchall()
+            for r in rows:
+                if r["id"] not in seen:
+                    seen.add(r["id"])
+                    out.append(dict(r))
+                    if len(out) >= expand:
+                        return out
+        return out
     finally:
         con.close()
