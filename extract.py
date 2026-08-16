@@ -46,7 +46,7 @@ def _min_chars():
         return 800
 
 
-def _remember(text, source, project, domain, importance=None):
+def _remember(text, source, project, domain, importance=None, workspace=""):
     """Store one fact via the core server's remember_fact (lazy import — the
     core imports this module, so the import must happen at call time)."""
     from memory_mcp import remember_fact
@@ -54,12 +54,17 @@ def _remember(text, source, project, domain, importance=None):
             "project": project or "", "domain": domain or "project"}
     if importance is not None:
         args["importance"] = importance
+    if workspace:
+        args["workspace"] = workspace
     return remember_fact(args)
 
 
-def _attach(fact_id, source_ref):
+def _attach(fact_id, source_ref, workspace=""):
     from memory_mcp import attach_evidence
-    return attach_evidence({"fact_id": fact_id, "source_ref": source_ref})
+    args = {"fact_id": fact_id, "source_ref": source_ref}
+    if workspace:
+        args["workspace"] = workspace
+    return attach_evidence(args)
 
 
 def ingest_turn(args):
@@ -72,6 +77,7 @@ def ingest_turn(args):
     session_ref = (args.get("session_ref") or "").strip()
     project = (args.get("project") or "").strip()
     domain = (args.get("domain") or "").strip()
+    workspace = (args.get("workspace") or "").strip()
     last_err = None
     parsed = None
     for attempt in range(llm.MAX_RETRIES):
@@ -100,14 +106,15 @@ def ingest_turn(args):
         if not text:
             continue
         try:
-            res = _remember(text, session_ref, project, domain, importance=f.get("importance"))
+            res = _remember(text, session_ref, project, domain, importance=f.get("importance"),
+                            workspace=workspace)
             if res.get("dedup"):
                 deduped += 1
             else:
                 stored += 1
-                new_facts.append({"id": res.get("id"), "text": text})
+                new_facts.append({"id": res.get("id"), "text": text, "workspace": workspace})
             if session_ref and res.get("id"):
-                _attach(res["id"], session_ref)
+                _attach(res["id"], session_ref, workspace)
         except Exception:
             failed += 1
 

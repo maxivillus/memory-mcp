@@ -69,13 +69,17 @@ def _min_confidence():
         return 0.8
 
 
-def _candidates(text, limit=8):
+def _candidates(text, limit=8, workspace=""):
     """Most relevant stored facts for the cross-check (OR-joined lexical top-N,
-    like find_precedents/compose_recall; falls back to the freshest facts)."""
+    like find_precedents/compose_recall; falls back to the freshest facts).
+    Scoped to the fact's workspace when provided."""
     from memory_mcp import fts_terms, get_db, search_facts
     terms = fts_terms(text)
     if terms:
-        res = search_facts({"query": " OR ".join(terms), "limit": limit})
+        sf = {"query": " OR ".join(terms), "limit": limit}
+        if workspace:
+            sf["workspace"] = workspace
+        res = search_facts(sf)
         if "error" not in res and res.get("facts"):
             rows = [{"id": f["id"], "text": f["text"]} for f in res["facts"]]
         else:
@@ -85,10 +89,11 @@ def _candidates(text, limit=8):
     if rows is None:
         con = get_db()
         try:
+            ws_clause = " AND workspace_id IN (?, '')" if workspace else " AND workspace_id = ''"
+            params = [workspace] if workspace else []
             rows = con.execute(
-                "SELECT id, text FROM facts WHERE archived=0 AND invalid_at='' "
-                "ORDER BY updated_at DESC LIMIT ?",
-                (limit,)).fetchall()
+                "SELECT id, text FROM facts WHERE archived=0 AND invalid_at=''" + ws_clause +
+                " ORDER BY updated_at DESC LIMIT ?", params + [limit]).fetchall()
         finally:
             con.close()
     # strong/confirmed flags ride along so the invalidation hook can protect
@@ -114,7 +119,7 @@ def verify_facts(args):
     text = (args.get("text") or "").strip()
     if not text:
         return {"error": "text is required"}
-    candidates = _candidates(text)
+    candidates = _candidates(text, workspace=(args.get("workspace") or "").strip())
     try:
         verdict = _llm_verdict(text, candidates)
         return {"text": text, "checked_against": len(candidates), "verdict": verdict,
@@ -139,12 +144,16 @@ def consolidate(args):
     if len(ids) > 20:
         return {"error": "ids: at most 20 facts can be consolidated at once"}
     from memory_mcp import get_db, remember_fact, attach_evidence
+    workspace = (args.get("workspace") or "").strip()
     con = get_db()
     try:
         marks = ",".join("?" * len(ids))
+        ws_clause = " AND workspace_id IN (%s, '')" % "?" if workspace else " AND workspace_id = ''"
+        ws_params = [workspace] if workspace else []
         rows = [dict(r) for r in con.execute(
             "SELECT id, text, strong, confirmed, importance FROM facts "
-            "WHERE id IN (%s) AND archived=0 AND invalid_at=''" % marks, ids)]
+            "WHERE id IN (%s) AND archived=0 AND invalid_at=''" % marks + ws_clause,
+            ids + ws_params)]
     finally:
         con.close()
     if len(rows) != len(set(ids)):
@@ -168,15 +177,21 @@ def consolidate(args):
     if not text:
         return {"error": "consolidation returned an empty text"}
     importance = max((float(r.get("importance") or 0.5) for r in rows), default=0.5)
-    res = remember_fact({"text": text, "source": "consolidate",
-                         "importance": verdict.get("importance", importance)})
+    rf = {"text": text, "source": "consolidate",
+          "importance": verdict.get("importance", importance)}
+    if workspace:
+        rf["workspace"] = workspace
+    res = remember_fact(rf)
     if "error" in res:
         return {"error": res["error"]}
     new_id = res["id"]
     invalidated = []
     for r in rows:
         if _invalidate(r["id"], new_id):
-            attach_evidence({"fact_id": new_id, "source_ref": "consolidated:%s" % r["id"]})
+            ev = {"fact_id": new_id, "source_ref": "consolidated:%s" % r["id"]}
+            if workspace:
+                ev["workspace"] = workspace
+            attach_evidence(ev)
             invalidated.append(r["id"])
     return {"merged": True, "new_id": new_id, "source_ids": invalidated,
             "reason": verdict.get("reason", ""), "text": text}
@@ -190,7 +205,8 @@ def check_new_facts(new_facts):
     summary = {"checked": 0, "superseded": [], "conflicts": [], "applied": 0, "skipped_low_conf": 0}
     for nf in new_facts:
         # the fact under test is excluded from the candidates it can target
-        candidates = [c for c in _candidates(nf["text"]) if c["id"] != nf["id"]]
+        candidates = [c for c in _candidates(nf["text"], workspace=nf.get("workspace", ""))
+                      if c["id"] != nf["id"]]
         if not candidates:
             continue
         try:
@@ -227,5 +243,8 @@ def check_new_facts(new_facts):
             bucket = "superseded" if action in ("supersedes", "update") else "deleted"
             summary.setdefault(bucket, []).append(
                 {"old_id": cid, "new_id": nf["id"], "reason": verdict.get("reason", "")})
-            attach_evidence({"fact_id": nf["id"], "source_ref": "%s:%s" % (action, cid)})
+            ev = {"fact_id": nf["id"], "source_ref": "%s:%s" % (action, cid)}
+            if nf.get("workspace"):
+                ev["workspace"] = nf["workspace"]
+            attach_evidence(ev)
     return summary

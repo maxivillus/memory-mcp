@@ -53,13 +53,17 @@ def compose_recall(args):
     budget = _budget(args.get("chars"))
 
     from memory_mcp import fts_terms, search_facts
+    ws = (args.get("workspace") or "").strip()
     terms = fts_terms(turn_text)
     if not terms:
         return {"error": "no searchable terms", "count": 0, "block": ""}
     # OR-joined like find_precedents: recall is about similarity, so a fact
     # sharing any distinctive term is a candidate; RRF ranks the overlap.
     query = " OR ".join(terms)
-    lexical = search_facts({"query": query, "limit": limit * 4})
+    sf_args = {"query": query, "limit": limit * 4}
+    if ws:
+        sf_args["workspace"] = ws
+    lexical = search_facts(sf_args)
     fts = lexical.get("facts", []) if "error" not in lexical else []
 
     sem = []
@@ -68,7 +72,10 @@ def compose_recall(args):
             import embeddings
             if embeddings.enabled():
                 from memory_mcp import search_semantic
-                sr = search_semantic({"query": turn_text, "limit": limit * 4})
+                ss_args = {"query": turn_text, "limit": limit * 4}
+                if ws:
+                    ss_args["workspace"] = ws
+                sr = search_semantic(ss_args)
                 sem = sr.get("facts", []) if "error" not in sr else []
         except Exception:
             sem = []
@@ -82,7 +89,7 @@ def compose_recall(args):
         merged[f["id"]] = merged.get(f["id"], 0.0) + 1.0 / (k + i + 1)
     graph = []
     if args.get("graph"):
-        graph = _graph_hits(fts + sem, limit * 2)
+        graph = _graph_hits(fts + sem, limit * 2, ws)
         for i, f in enumerate(graph):
             merged[f["id"]] = merged.get(f["id"], 0.0) + 1.0 / (k + i + 1)
     ranked = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:limit]
@@ -97,7 +104,7 @@ def compose_recall(args):
     session_expanded = []
     expand = max(0, min(int(args.get("session_expand", 0)), 10))
     if expand and hits:
-        session_expanded = _session_hits(hits, expand)
+        session_expanded = _session_hits(hits, expand, ws)
 
     # Authoritative tier: semantic agreement (hybrid score), strong or
     # human-confirmed facts (letta-style core tier); everything else goes to
@@ -162,11 +169,15 @@ def sweep_freshness(args):
     archived; anything 3x past the window goes regardless. Strong and
     human-confirmed facts are never auto-archived."""
     from memory_mcp import get_db
+    workspace = (args.get("workspace") or "").strip()
+    ws_clause = " AND workspace_id IN (?, '')" if workspace else " AND workspace_id = ''"
+    ws_params = [workspace] if workspace else []
     con = get_db()
     try:
         rows = con.execute(
             "SELECT id, text, domain, strong, confirmed, importance, updated_at "
-            "FROM facts WHERE archived=0 AND invalid_at=''").fetchall()
+            "FROM facts WHERE archived=0 AND invalid_at=''" + ws_clause,
+            ws_params).fetchall()
         archived, kept = [], []
         for r in rows:
             try:
@@ -192,17 +203,17 @@ def sweep_freshness(args):
         con.close()
 
 
-def _graph_hits(hits, limit=10):
+def _graph_hits(hits, limit=10, workspace=""):
     """Entity-graph expansion (shared core helper; third RRF source)."""
     from memory_mcp import _graph_expand_facts, get_db
     con = get_db()
     try:
-        return _graph_expand_facts(con, hits, limit)
+        return _graph_expand_facts(con, hits, limit, workspace)
     finally:
         con.close()
 
 
-def _session_hits(hits, expand):
+def _session_hits(hits, expand, workspace=""):
     """Facts from the same session as the top hits (session linking)."""
     from memory_mcp import get_db
     sources = [f.get("source") for f in hits if f.get("source")]
@@ -212,11 +223,16 @@ def _session_hits(hits, expand):
     try:
         seen = {f["id"] for f in hits}
         out = []
+        ws_clause = " AND workspace_id IN (?, '')" if workspace else " AND workspace_id = ''"
         for src in sources[:3]:
+            params = [src]
+            if workspace:
+                params.append(workspace)
             rows = con.execute(
                 "SELECT id, text, source, project, domain, trust, strong, importance, confirmed "
-                "FROM facts WHERE source=? AND archived=0 AND invalid_at='' "
-                "ORDER BY importance DESC, updated_at DESC LIMIT ?", (src, expand)).fetchall()
+                "FROM facts WHERE source=? AND archived=0 AND invalid_at=''" + ws_clause +
+                " ORDER BY importance DESC, updated_at DESC LIMIT ?",
+                params + [expand]).fetchall()
             for r in rows:
                 if r["id"] not in seen:
                     seen.add(r["id"])

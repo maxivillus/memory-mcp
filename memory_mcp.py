@@ -44,6 +44,76 @@ def default_db_path():
 DB_PATH = os.environ.get("MEMORY_MCP_DB") or default_db_path()
 VALID_TRUST = ("high", "medium", "low")
 
+# v0.5 rebuild DDL: same facts shape without the global UNIQUE(sha256).
+_FACTS_TABLE_DDL = """
+CREATE TABLE facts_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sha256 TEXT NOT NULL,
+  text TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  project TEXT NOT NULL DEFAULT '',
+  domain TEXT NOT NULL DEFAULT '',
+  trust TEXT NOT NULL DEFAULT 'medium' CHECK (trust IN ('high','medium','low')),
+  strong INTEGER NOT NULL DEFAULT 0,
+  importance REAL NOT NULL DEFAULT 0.5,
+  invalid_at TEXT NOT NULL DEFAULT '',
+  superseded_by INTEGER,
+  confirmed INTEGER NOT NULL DEFAULT 0,
+  workspace_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  archived INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+_FTS_TRIGGERS_DDL = """
+CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+  INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+  INSERT INTO facts_fts(facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+  INSERT INTO facts_fts(facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+  INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
+END;
+"""
+
+# v0.5 rebuild DDL: same facts shape without the global UNIQUE(sha256).
+_FACTS_TABLE_DDL = """
+CREATE TABLE facts_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sha256 TEXT NOT NULL,
+  text TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  project TEXT NOT NULL DEFAULT '',
+  domain TEXT NOT NULL DEFAULT '',
+  trust TEXT NOT NULL DEFAULT 'medium' CHECK (trust IN ('high','medium','low')),
+  strong INTEGER NOT NULL DEFAULT 0,
+  importance REAL NOT NULL DEFAULT 0.5,
+  invalid_at TEXT NOT NULL DEFAULT '',
+  superseded_by INTEGER,
+  confirmed INTEGER NOT NULL DEFAULT 0,
+  workspace_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  archived INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+_FTS_TRIGGERS_DDL = """
+CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+  INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+  INSERT INTO facts_fts(facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+  INSERT INTO facts_fts(facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+  INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
+END;
+"""
+
 # v0.4 (2026-08-16): bi-temporal validity + importance + human confirmation.
 # Additive columns — _migrate() adds them to existing databases.
 _FACT_EXTRA_COLUMNS = {
@@ -56,7 +126,7 @@ _FACT_EXTRA_COLUMNS = {
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  sha256 TEXT NOT NULL UNIQUE,
+  sha256 TEXT NOT NULL,
   text TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT '',
   project TEXT NOT NULL DEFAULT '',
@@ -67,6 +137,7 @@ CREATE TABLE IF NOT EXISTS facts (
   invalid_at TEXT NOT NULL DEFAULT '',
   superseded_by INTEGER,
   confirmed INTEGER NOT NULL DEFAULT 0,
+  workspace_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   archived INTEGER NOT NULL DEFAULT 0
@@ -91,6 +162,7 @@ CREATE TABLE IF NOT EXISTS entities (
   name TEXT NOT NULL UNIQUE,
   type TEXT NOT NULL DEFAULT '',
   aliases TEXT NOT NULL DEFAULT '',
+  workspace_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -100,6 +172,7 @@ CREATE TABLE IF NOT EXISTS relations (
   predicate TEXT NOT NULL,
   object_id INTEGER NOT NULL REFERENCES entities(id),
   source_fact_id INTEGER,
+  workspace_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   UNIQUE(subject_id, predicate, object_id)
 );
@@ -114,6 +187,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   decision_maker TEXT NOT NULL DEFAULT '',
   issue_ref TEXT NOT NULL DEFAULT '',
   parent_decision_id INTEGER,
+  workspace_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -147,6 +221,7 @@ CREATE INDEX IF NOT EXISTS relations_subject_idx ON relations(subject_id);
 CREATE INDEX IF NOT EXISTS relations_object_idx ON relations(object_id);
 CREATE INDEX IF NOT EXISTS evidence_fact_idx ON evidence(fact_id);
 CREATE INDEX IF NOT EXISTS decisions_parent_idx ON decisions(parent_decision_id);
+CREATE UNIQUE INDEX IF NOT EXISTS facts_sha_ws ON facts(sha256, workspace_id);
 """
 
 # Optional semantic search (embeddings.py) — created here so the schema is
@@ -223,35 +298,54 @@ def get_db():
 
 
 def _migrate_facts(con):
-    """Additive migration for databases created before v0.4: bring the facts
-    table up to the current columns without touching existing rows."""
+    """Additive migration: v0.4 columns, workspace_id, and the v0.5 facts
+    rebuild (global UNIQUE(sha256) -> UNIQUE(sha256, workspace_id)) so the
+    same text can exist per workspace. The rebuild copies rows with EXPLICIT
+    column lists (column order differs between the ALTERed legacy table and
+    facts_new), runs atomically in one executescript, and rebuilds the FTS
+    index. Legacy rows land in the shared pool (workspace_id='')."""
     existing = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
     for name, decl in _FACT_EXTRA_COLUMNS.items():
         if name not in existing:
             con.execute("ALTER TABLE facts ADD COLUMN %s %s" % (name, decl))
+    if "workspace_id" not in existing:
+        con.execute("ALTER TABLE facts ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''")
+    for table in ("decisions", "entities", "relations"):
+        try:
+            cols = {r["name"] for r in con.execute("PRAGMA table_info(%s)" % table)}
+            if "workspace_id" not in cols:
+                con.execute("ALTER TABLE %s ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''" % table)
+        except sqlite3.OperationalError:
+            pass  # table not created yet (fresh DB)
+    indexes = {r["name"] for r in con.execute("PRAGMA index_list(facts)")}
+    if "sqlite_autoindex_facts_1" in indexes or "facts_sha_ws" not in indexes:
+        cols = ("id, sha256, text, source, project, domain, trust, strong, importance, "
+                "invalid_at, superseded_by, confirmed, workspace_id, created_at, updated_at, archived")
+        con.executescript(
+            "PRAGMA foreign_keys=OFF;\n"
+            "BEGIN;\n"
+            + _FACTS_TABLE_DDL + "\n"
+            "INSERT INTO facts_new (%s) SELECT %s FROM facts;\n" % (cols, cols)
+            + "DROP TABLE facts;\n"
+            "ALTER TABLE facts_new RENAME TO facts;\n"
+            "CREATE UNIQUE INDEX IF NOT EXISTS facts_sha_ws ON facts(sha256, workspace_id);\n"
+            "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5("
+            "text, content='facts', content_rowid='id');\n"
+            + _FTS_TRIGGERS_DDL + "\n"
+            "INSERT INTO facts_fts(facts_fts) VALUES('rebuild');\n"
+            "COMMIT;\n"
+            "PRAGMA foreign_keys=ON;\n")
     con.commit()
 
 
-# ---------------- tools ----------------
-
-def _emb():
-    """Lazy handle to the optional embeddings module, or None when disabled
-    (MEMORY_MCP_EMBEDDINGS != 1) or unavailable. The core server never depends
-    on it: every call site treats None as 'semantic search off'."""
-    if os.environ.get("MEMORY_MCP_EMBEDDINGS") != "1":
-        return None
-    try:
-        import embeddings
-        return embeddings
-    except ImportError:
-        return None
-
-
-def _graph_expand_facts(con, hit_facts, limit=10):
+def _graph_expand_facts(con, hit_facts, limit=10, workspace=""):
     """Entity-graph expansion: entities mentioned in the hit facts -> graph
     neighbors -> facts mentioning the neighbors. Returns dict rows (id/text/...).
     Shared by search_facts {graph=true} and compose_recall {graph=true}."""
-    rows = con.execute("SELECT name FROM entities WHERE length(name) >= 3").fetchall()
+    ent_ws = _ws_check("entities", workspace)
+    ent_params = [workspace] if workspace else []
+    rows = con.execute("SELECT name FROM entities WHERE length(name) >= 3" + ent_ws,
+                       ent_params).fetchall()
     names = [r["name"] for r in rows]
     mentioned = set()
     for f in hit_facts:
@@ -263,17 +357,22 @@ def _graph_expand_facts(con, hit_facts, limit=10):
     for n in list(mentioned)[:8]:
         for r in con.execute(
             "SELECT o.name AS nb FROM relations r JOIN entities s ON s.id=r.subject_id "
-            "JOIN entities o ON o.id=r.object_id WHERE s.name=? "
-            "UNION SELECT s.name FROM relations r JOIN entities s ON s.id=r.subject_id "
-            "JOIN entities o ON o.id=r.object_id WHERE o.name=?", (n, n)):
+            "JOIN entities o ON o.id=r.object_id WHERE s.name=?" + _ws_check("r", workspace) +
+            " UNION SELECT s.name FROM relations r JOIN entities s ON s.id=r.subject_id "
+            "JOIN entities o ON o.id=r.object_id WHERE o.name=?" + _ws_check("r", workspace),
+            [n] + ent_params + [n] + ent_params):
             neighbors.add(r["nb"])
     out, seen = [], {f["id"] for f in hit_facts}
+    ws_clause = " AND workspace_id IN (?, '')" if workspace else " AND workspace_id = ''"
     for nb in list(neighbors)[:12]:
         esc = nb.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params = ["%" + esc + "%"]
+        if workspace:
+            params.append(workspace)
         rows = con.execute(
             "SELECT id, text, source, project, domain, trust, strong, importance, confirmed "
-            "FROM facts WHERE text LIKE ? ESCAPE '\\' AND archived=0 AND invalid_at='' LIMIT 5",
-            ("%" + esc + "%",)).fetchall()
+            "FROM facts WHERE text LIKE ? ESCAPE '\\' AND archived=0 AND invalid_at=''" +
+            ws_clause + " LIMIT 5", params).fetchall()
         for r in rows:
             if r["id"] not in seen:
                 seen.add(r["id"])
@@ -283,12 +382,44 @@ def _graph_expand_facts(con, hit_facts, limit=10):
     return out
 
 
+def _workspace(args):
+    """Workspace scope: explicit workspace param, or '' (shared pool)."""
+    return (args.get("workspace") or "").strip()
+
+
+def _ws_check(alias, workspace):
+    """Ownership predicate for by-id operations: the target must belong to the
+    caller's workspace or the shared pool; unscoped callers act on shared only."""
+    if workspace:
+        return " AND %s.workspace_id IN (?, '')" % alias
+    return " AND %s.workspace_id = ''" % alias
+
+
+def _ws_filter(alias, workspace):
+    """SQL fragment: workspace + shared pool when scoped; shared only otherwise."""
+    if workspace:
+        return " AND %s.workspace_id IN (?, '')" % alias
+    return " AND %s.workspace_id = ''" % alias
+
+
 def _importance(args):
     """Clamp the importance argument to [0,1]; default 0.5."""
     try:
         return max(0.0, min(1.0, float(args.get("importance", 0.5))))
     except (TypeError, ValueError):
         return 0.5
+
+
+def _emb():
+    """Lazy handle to the optional embeddings module, or None when disabled
+    (MEMORY_MCP_EMBEDDINGS != 1) or unavailable."""
+    if os.environ.get("MEMORY_MCP_EMBEDDINGS") != "1":
+        return None
+    try:
+        import embeddings
+        return embeddings
+    except ImportError:
+        return None
 
 
 def _mod(name, env):
@@ -349,14 +480,22 @@ def remember_fact(args):
     if trust not in VALID_TRUST:
         return {"error": f"trust must be one of {VALID_TRUST}"}
     importance = _importance(args)
+    workspace = _workspace(args)
     sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     ts = now()
     warning = ""
     if not (args.get("source") or "").strip():
         warning = "no source provided; add source=repo@commit/issue/run for provenance"
+    if not workspace:
+        warning = (warning + "; " if warning else "") + \
+            "no workspace provided; add workspace=<project_id> to scope this fact to your project"
     con = get_db()
     try:
-        cur = con.execute("SELECT id, created_at FROM facts WHERE sha256=?", (sha,))
+        # Workspace-scoped dedup: the same text is one fact per workspace.
+        # Unscoped callers dedup within the shared pool only.
+        cur = con.execute("SELECT id, created_at FROM facts WHERE sha256=?" +
+                          _ws_check("facts", workspace),
+                          [sha] + ([workspace] if workspace else []))
         row = cur.fetchone()
         if row:
             # Re-remembering resurrects an archived/invalidated fact and can
@@ -375,11 +514,11 @@ def remember_fact(args):
                 out["warning"] = warning
             return out
         cur = con.execute(
-            "INSERT INTO facts (sha256, text, source, project, domain, trust, strong, importance, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO facts (sha256, text, source, project, domain, trust, strong, importance, workspace_id, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (sha, text, args.get("source", ""), args.get("project", ""),
              args.get("domain", ""), trust, 1 if args.get("strong") else 0,
-             importance, ts, ts))
+             importance, workspace, ts, ts))
         con.commit()
         fid = cur.lastrowid
         emb = _emb()
@@ -404,7 +543,11 @@ def search_facts(args):
            "bm25(facts_fts) AS rank "
            "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
            "WHERE facts_fts MATCH ? AND f.archived=0")
+    ws = _workspace(args)
     params = [query]
+    sql += _ws_filter("f", ws)
+    if ws:
+        params.append(ws)
     if args.get("valid_at"):
         # bi-temporal: also include facts that were still valid at that time
         sql += " AND (f.invalid_at='' OR f.invalid_at >= ?)"
@@ -437,7 +580,7 @@ def search_facts(args):
                                                  [phrase] + params[1:])]
         graph = []
         if args.get("graph") and rows:
-            graph = _graph_expand_facts(con, rows, limit * 2)
+            graph = _graph_expand_facts(con, rows, limit * 2, ws)
             if graph:
                 k = 60
                 merged = {f["id"]: 1.0 / (k + i + 1) for i, f in enumerate(rows)}
@@ -450,9 +593,9 @@ def search_facts(args):
         emb = _emb()
         if emb is not None and args.get("semantic"):
             if rows:
-                return emb.hybrid_rerank(con, query, rows, limit=limit)
+                return emb.hybrid_rerank(con, query, rows, limit=limit, workspace=ws)
             # No lexical hits: fall back to semantic ranking alone.
-            return emb.search_semantic(con, query, limit=limit)
+            return emb.search_semantic(con, query, limit=limit, workspace=ws)
         result = {"count": len(rows), "facts": rows}
         if args.get("graph"):
             result["graph"] = len(graph)
@@ -473,9 +616,10 @@ def search_semantic(args):
         return {"error": "query is required"}
     limit = max(1, min(int(args.get("limit", 20)), 100))
     threshold = float(args.get("threshold", 0.0))
+    ws = _workspace(args)
     con = get_db()
     try:
-        return emb.search_semantic(con, query, limit=limit, threshold=threshold)
+        return emb.search_semantic(con, query, limit=limit, threshold=threshold, workspace=ws)
     finally:
         con.close()
 
@@ -487,7 +631,7 @@ def embed_backfill(args):
         return {"error": "semantic search is disabled (set MEMORY_MCP_EMBEDDINGS=1)"}
     con = get_db()
     try:
-        return emb.embed_backfill(con)
+        return emb.embed_backfill(con, workspace=_workspace(args))
     finally:
         con.close()
 
@@ -496,7 +640,11 @@ def list_facts(args):
     limit = max(1, min(int(args.get("limit", 50)), 500))
     sql = ("SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
            "created_at, updated_at FROM facts WHERE archived=0 AND invalid_at=''")
+    ws = _workspace(args)
     params = []
+    sql += _ws_filter("facts", ws)
+    if ws:
+        params.append(ws)
     if args.get("project"):
         sql += " AND project=?"
         params.append(args["project"])
@@ -523,7 +671,11 @@ def summarize_index(args):
     max_chars = max(int(args.get("max_chars", 4000)), 200)
     sql = ("SELECT id, text, project, domain, trust, strong, updated_at "
            "FROM facts WHERE archived=0 AND invalid_at=''")
+    ws = _workspace(args)
     params = []
+    sql += _ws_filter("facts", ws)
+    if ws:
+        params.append(ws)
     if args.get("project"):
         sql += " AND project=?"
         params.append(args["project"])
@@ -541,7 +693,10 @@ def summarize_index(args):
     params.append(limit)
     con = get_db()
     try:
-        total = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at=''").fetchone()[0]
+        ws = _workspace(args)
+        ws_params = [ws] if ws else []
+        total = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at=''" +
+                            _ws_check("facts", ws), ws_params).fetchone()[0]
         rows = [dict(r) for r in con.execute(sql, params)]
     finally:
         con.close()
@@ -564,17 +719,20 @@ def summarize_index(args):
             "truncated": truncated, "index": joined}
 
 
-def _resolve_entity(con, name, etype="", aliases=""):
-    """Get-or-create an entity by name; returns (id, created_flag)."""
+def _resolve_entity(con, name, etype="", aliases="", workspace=""):
+    """Get-or-create an entity by name; returns (id, created_flag). Scoped to
+    the workspace (or the shared pool)."""
     ts = now()
-    row = con.execute("SELECT id FROM entities WHERE name=?", (name,)).fetchone()
+    row = con.execute("SELECT id FROM entities WHERE name=?" + _ws_check("entities", workspace),
+                      [name] + ([workspace] if workspace else [])).fetchone()
     if row:
         con.execute("UPDATE entities SET updated_at=?, type=CASE WHEN ?<>'' THEN ? ELSE type END, "
                     "aliases=CASE WHEN ?<>'' THEN ? ELSE aliases END WHERE id=?",
                     (ts, etype, etype, aliases, aliases, row["id"]))
         return row["id"], False
-    cur = con.execute("INSERT INTO entities (name, type, aliases, created_at, updated_at) VALUES (?,?,?,?,?)",
-                      (name, etype, aliases, ts, ts))
+    cur = con.execute("INSERT INTO entities (name, type, aliases, workspace_id, created_at, updated_at) "
+                      "VALUES (?,?,?,?,?,?)",
+                      (name, etype, aliases, workspace, ts, ts))
     return cur.lastrowid, True
 
 
@@ -584,7 +742,11 @@ def remember_entity(args):
         return {"error": "name is required"}
     con = get_db()
     try:
-        eid, created = _resolve_entity(con, name, args.get("type", ""), args.get("aliases", ""))
+        try:
+            eid, created = _resolve_entity(con, name, args.get("type", ""), args.get("aliases", ""),
+                                           _workspace(args))
+        except sqlite3.IntegrityError:
+            return {"error": "entity name exists in another workspace", "name": name}
         con.commit()
         return {"id": eid, "name": name, "created": created}
     finally:
@@ -599,17 +761,23 @@ def remember_relation(args):
         return {"error": "subject, predicate and object are required"}
     con = get_db()
     try:
-        sid, _ = _resolve_entity(con, subject)
-        oid, _ = _resolve_entity(con, obj)
+        ws = _workspace(args)
+        sid, _ = _resolve_entity(con, subject, workspace=ws)
+        oid, _ = _resolve_entity(con, obj, workspace=ws)
         existing = con.execute(
-            "SELECT id FROM relations WHERE subject_id=? AND predicate=? AND object_id=?",
-            (sid, predicate, oid)).fetchone()
+            "SELECT id FROM relations WHERE subject_id=? AND predicate=? AND object_id=?" +
+            _ws_check("relations", ws),
+            [sid, predicate, oid] + ([ws] if ws else [])).fetchone()
         if existing:
             return {"id": existing["id"], "dedup": True}
-        cur = con.execute(
-            "INSERT INTO relations (subject_id, predicate, object_id, source_fact_id, created_at) "
-            "VALUES (?,?,?,?,?)",
-            (sid, predicate, oid, args.get("source_fact_id"), now()))
+        try:
+            cur = con.execute(
+                "INSERT INTO relations (subject_id, predicate, object_id, source_fact_id, workspace_id, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (sid, predicate, oid, args.get("source_fact_id"), ws, now()))
+        except sqlite3.IntegrityError:
+            return {"error": "relation already exists in another workspace",
+                    "subject": subject, "predicate": predicate, "object": obj}
         con.commit()
         return {"id": cur.lastrowid, "subject": subject, "predicate": predicate,
                 "object": obj, "dedup": False}
@@ -625,7 +793,9 @@ def search_graph(args):
     limit = max(1, min(int(args.get("limit", 50)), 200))
     con = get_db()
     try:
-        root = con.execute("SELECT id, name, type FROM entities WHERE name=?", (name,)).fetchone()
+        ws = _workspace(args)
+        root = con.execute("SELECT id, name, type FROM entities WHERE name=?" + _ws_check("entities", ws),
+                           [name] + ([ws] if ws else [])).fetchone()
         if not root:
             return {"error": f"entity {name!r} not found", "nodes": [], "edges": []}
         nodes, edges, seen = {root["id"]: dict(root)}, [], {root["id"]}
@@ -637,7 +807,8 @@ def search_graph(args):
                     "SELECT r.predicate, r.subject_id, r.object_id, s.name AS sn, o.name AS oname "
                     "FROM relations r JOIN entities s ON s.id=r.subject_id "
                     "JOIN entities o ON o.id=r.object_id "
-                    "WHERE r.subject_id=? OR r.object_id=?", (eid, eid)).fetchall()
+                    "WHERE (r.subject_id=? OR r.object_id=?)" + _ws_check("r", ws),
+                    [eid, eid] + ([ws] if ws else [])).fetchall()
                 for r in rows:
                     direction = "out" if r["subject_id"] == eid else "in"
                     other_id = r["object_id"] if direction == "out" else r["subject_id"]
@@ -672,13 +843,14 @@ def record_decision(args):
         confidence = float(confidence)
     con = get_db()
     try:
+        workspace = _workspace(args)
         cur = con.execute(
             "INSERT INTO decisions (category, subject, scenario, reasoning, outcome, confidence, "
-            "decision_maker, issue_ref, parent_decision_id, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "decision_maker, issue_ref, parent_decision_id, workspace_id, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (category, args.get("subject", ""), scenario, args.get("reasoning", ""),
              args.get("outcome", ""), confidence, args.get("decision_maker", ""),
-             args.get("issue_ref", ""), args.get("parent_decision_id"), ts, ts))
+             args.get("issue_ref", ""), args.get("parent_decision_id"), workspace, ts, ts))
         con.commit()
         return {"id": cur.lastrowid, "category": category, "scenario": scenario,
                 "created_at": ts}
@@ -689,6 +861,10 @@ def record_decision(args):
 def query_decisions(args):
     sql = "SELECT id, category, subject, scenario, reasoning, outcome, confidence, decision_maker, issue_ref, parent_decision_id, created_at FROM decisions WHERE 1=1"
     params = []
+    ws = _workspace(args)
+    sql += _ws_filter("decisions", ws)
+    if ws:
+        params.append(ws)
     for key in ("category", "subject", "outcome", "decision_maker", "issue_ref"):
         if args.get(key):
             sql += f" AND {key}=?"
@@ -723,6 +899,10 @@ def find_precedents(args):
     if args.get("category"):
         sql += " AND d.category=?"
         params.append(args["category"])
+    ws = _workspace(args)
+    sql += _ws_filter("d", ws)
+    if ws:
+        params.append(ws)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
     con = get_db()
@@ -736,7 +916,8 @@ def find_precedents(args):
             emb = _emb()
             if emb is not None:
                 try:
-                    sem = emb.search_decision_semantic(con, scenario, limit=limit * 2)
+                    sem = emb.search_decision_semantic(con, scenario, limit=limit * 2,
+                                                          workspace=ws)
                     sem_rows = sem.get("precedents", [])
                     if sem_rows:
                         k = 60
@@ -761,13 +942,15 @@ def get_causal_chain(args):
     did = args.get("decision_id")
     if did is None:
         return {"error": "decision_id is required"}
+    ws = _workspace(args)
     con = get_db()
     try:
         chain, cur, guard = [], int(did), 0
         while cur is not None and guard < 50:
             row = con.execute(
                 "SELECT id, category, subject, scenario, outcome, decision_maker, issue_ref, "
-                "parent_decision_id, created_at FROM decisions WHERE id=?", (cur,)).fetchone()
+                "parent_decision_id, created_at FROM decisions WHERE id=?" + _ws_check("decisions", ws),
+                [cur] + ([ws] if ws else [])).fetchone()
             if not row:
                 break
             chain.append(dict(row))
@@ -782,15 +965,18 @@ def get_causal_chain(args):
 def get_provenance(args):
     con = get_db()
     try:
+        ws = _workspace(args)
         fact = None
         if args.get("fact_id"):
             fact = con.execute("SELECT id, sha256, text, source, project, domain, trust, strong, "
-                               "created_at, updated_at FROM facts WHERE id=? AND archived=0",
-                               (args["fact_id"],)).fetchone()
+                               "created_at, updated_at FROM facts WHERE id=? AND archived=0" +
+                               _ws_check("facts", ws),
+                               [args["fact_id"]] + ([ws] if ws else [])).fetchone()
         elif args.get("sha256"):
             fact = con.execute("SELECT id, sha256, text, source, project, domain, trust, strong, "
-                               "created_at, updated_at FROM facts WHERE sha256=? AND archived=0",
-                               (args["sha256"],)).fetchone()
+                               "created_at, updated_at FROM facts WHERE sha256=? AND archived=0" +
+                               _ws_check("facts", ws),
+                               [args["sha256"]] + ([ws] if ws else [])).fetchone()
         if not fact:
             return {"error": "fact not found (use fact_id or sha256)", "fact": None, "evidence": []}
         evidence = [dict(r) for r in con.execute(
@@ -806,8 +992,14 @@ def attach_evidence(args):
     source_ref = (args.get("source_ref") or "").strip()
     if not fact_id or not source_ref:
         return {"error": "fact_id and source_ref are required"}
+    ws = _workspace(args)
     con = get_db()
     try:
+        owner = con.execute(
+            "SELECT id FROM facts WHERE id=? AND archived=0" + _ws_check("facts", ws),
+            [fact_id] + ([ws] if ws else [])).fetchone()
+        if not owner:
+            return {"error": "fact not found or not in your workspace", "fact_id": fact_id}
         cur = con.execute(
             "INSERT OR IGNORE INTO evidence (fact_id, source_ref, source_checksum, fetched_at, created_at) "
             "VALUES (?,?,?,?,?)",
@@ -826,6 +1018,7 @@ def detect_conflicts(args):
         return {"error": "text is required"}
     terms = fts_terms(text)
     text_l = text.lower()
+    ws = _workspace(args)
     con = get_db()
     try:
         result = {"text": text, "near_duplicates": [], "decision_conflicts": []}
@@ -833,9 +1026,11 @@ def detect_conflicts(args):
             query = " OR ".join(terms)
             sql = ("SELECT f.id, f.text, f.source, f.project, f.trust, f.strong, bm25(facts_fts) AS rank "
                    "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
-                   "WHERE facts_fts MATCH ? AND f.archived=0 AND f.invalid_at='' ORDER BY rank LIMIT 10")
+                   "WHERE facts_fts MATCH ? AND f.archived=0 AND f.invalid_at=''" +
+                   _ws_check("f", ws) +
+                   " ORDER BY rank LIMIT 10")
             try:
-                rows = [dict(r) for r in con.execute(sql, [query])]
+                rows = [dict(r) for r in con.execute(sql, [query] + ([ws] if ws else []))]
             except sqlite3.OperationalError:
                 rows = []
             # Near-duplicate = most query terms present in the candidate text
@@ -845,11 +1040,13 @@ def detect_conflicts(args):
                 cov = sum(1 for t in terms if t in r["text"].lower()) / len(terms)
                 r["coverage"] = round(cov, 2)
             result["near_duplicates"] = [r for r in rows if r["coverage"] >= 0.6][:5]
-        # decision conflicts: same subject, >1 distinct outcome
+        # decision conflicts: same subject, >1 distinct outcome (workspace-scoped)
         for row in con.execute(
                 "SELECT subject, COUNT(DISTINCT outcome) AS n, "
                 "GROUP_CONCAT(DISTINCT outcome) AS outcomes, MAX(created_at) AS last "
-                "FROM decisions WHERE subject<>'' GROUP BY subject HAVING n>1 LIMIT 20"):
+                "FROM decisions WHERE subject<>''" + _ws_check("decisions", ws) +
+                " GROUP BY subject HAVING n>1 LIMIT 20",
+                [ws] if ws else []):
             # Whole-subject match (case-insensitive): term overlap alone is
             # too loose ("alpha-service" vs text about "beta-service" shares
             # the token "service").
@@ -861,14 +1058,17 @@ def detect_conflicts(args):
 
 
 def forget_fact(args):
+    ws = _workspace(args)
     con = get_db()
     try:
         if args.get("id"):
-            cur = con.execute("UPDATE facts SET archived=1, updated_at=? WHERE id=? AND archived=0",
-                              (now(), args["id"]))
+            cur = con.execute("UPDATE facts SET archived=1, updated_at=? WHERE id=? AND archived=0" +
+                              _ws_check("facts", ws),
+                              [now(), args["id"]] + ([ws] if ws else []))
         elif args.get("sha256"):
-            cur = con.execute("UPDATE facts SET archived=1, updated_at=? WHERE sha256=? AND archived=0",
-                              (now(), args["sha256"]))
+            cur = con.execute("UPDATE facts SET archived=1, updated_at=? WHERE sha256=? AND archived=0" +
+                              _ws_check("facts", ws),
+                              [now(), args["sha256"]] + ([ws] if ws else []))
         else:
             return {"error": "id or sha256 is required"}
         con.commit()
@@ -885,12 +1085,14 @@ def fact_history(args):
         return {"error": "id is required"}
     con = get_db()
     try:
+        ws = _workspace(args)
         chain, cur, guard = [], int(fid), 0
         while cur is not None and guard < 50:
             row = con.execute(
                 "SELECT id, text, source, project, domain, trust, strong, importance, "
                 "confirmed, created_at, updated_at, invalid_at, superseded_by "
-                "FROM facts WHERE id=?", (cur,)).fetchone()
+                "FROM facts WHERE id=?" + _ws_check("facts", ws),
+                [cur] + ([ws] if ws else [])).fetchone()
             if not row:
                 break
             chain.append(dict(row))
@@ -907,14 +1109,18 @@ def review_pending(args):
     limit = max(1, min(int(args.get("limit", 20)), 100))
     con = get_db()
     try:
+        ws = _workspace(args)
+        ws_params = [ws] if ws else []
         total = con.execute(
             "SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at='' "
-            "AND confirmed=0 AND trust != 'high'").fetchone()[0]
+            "AND confirmed=0 AND trust != 'high'" + _ws_filter("facts", ws),
+            ws_params).fetchone()[0]
         rows = [dict(r) for r in con.execute(
             "SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
             "updated_at FROM facts WHERE archived=0 AND invalid_at='' "
-            "AND confirmed=0 AND trust != 'high' "
-            "ORDER BY importance DESC, updated_at DESC LIMIT ?", (limit,))]
+            "AND confirmed=0 AND trust != 'high'" + _ws_filter("facts", ws) +
+            " ORDER BY importance DESC, updated_at DESC LIMIT ?",
+            ws_params + [limit])]
         return {"count": len(rows), "total": total, "facts": rows}
     finally:
         con.close()
@@ -925,12 +1131,14 @@ def confirm_fact(args):
     fid = args.get("id")
     if fid is None:
         return {"error": "id is required"}
+    ws = _workspace(args)
     ts = now()
     con = get_db()
     try:
         cur = con.execute(
             "UPDATE facts SET confirmed=1, trust='high', updated_at=? "
-            "WHERE id=? AND archived=0", (ts, fid))
+            "WHERE id=? AND archived=0" + _ws_check("facts", ws),
+            [ts, fid] + ([ws] if ws else []))
         con.commit()
         if cur.rowcount == 0:
             return {"error": "fact not found or archived", "id": fid}
@@ -945,27 +1153,34 @@ def fact_references(args):
     fid = args.get("id")
     if fid is None:
         return {"error": "id is required"}
+    ws = _workspace(args)
     con = get_db()
     try:
         fact = con.execute(
             "SELECT id, text, source, trust, strong, importance, confirmed, "
-            "invalid_at, superseded_by, created_at, updated_at FROM facts WHERE id=?",
-            (fid,)).fetchone()
+            "invalid_at, superseded_by, created_at, updated_at FROM facts WHERE id=?" +
+            _ws_check("facts", ws),
+            [fid] + ([ws] if ws else [])).fetchone()
         if not fact:
             return {"error": "fact not found", "id": fid}
         f = dict(fact)
+        ws = _workspace(args)
+        ws_params = [ws] if ws else []
         superseded = [r["id"] for r in con.execute(
-            "SELECT id FROM facts WHERE superseded_by=? AND id!=?", (fid, fid))]
+            "SELECT id FROM facts WHERE superseded_by=? AND id!=?" + _ws_check("facts", ws),
+            [fid, fid] + ws_params)]
         supersedes = f.get("superseded_by")
         consolidated_from = [r["source_ref"] for r in con.execute(
             "SELECT source_ref FROM evidence WHERE fact_id=? AND source_ref LIKE 'consolidated:%'",
             (fid,))]
         consolidated_into = [r["fact_id"] for r in con.execute(
-            "SELECT fact_id FROM evidence WHERE source_ref=? AND fact_id!=?",
-            ("consolidated:%s" % fid, fid))]
+            "SELECT fact_id FROM evidence e JOIN facts f ON f.id=e.fact_id "
+            "WHERE e.source_ref=? AND e.fact_id!=?" + _ws_check("f", ws),
+            ["consolidated:%s" % fid, fid] + ws_params)]
         superseded_evidence = [r["fact_id"] for r in con.execute(
-            "SELECT fact_id FROM evidence WHERE source_ref=? AND fact_id!=?",
-            ("supersedes:%s" % fid, fid))]
+            "SELECT fact_id FROM evidence e JOIN facts f ON f.id=e.fact_id "
+            "WHERE e.source_ref=? AND e.fact_id!=?" + _ws_check("f", ws),
+            ["supersedes:%s" % fid, fid] + ws_params)]
         evidence = [dict(r) for r in con.execute(
             "SELECT source_ref, source_checksum, created_at FROM evidence WHERE fact_id=?",
             (fid,))]
@@ -991,6 +1206,7 @@ def export_rdf(args):
     """W3C PROV-flavoured Turtle export: facts, entities/relations, decisions,
     evidence, and bi-temporal supersession edges."""
     limit = max(1, min(int(args.get("limit", 5000)), 50000))
+    ws = _workspace(args)
     con = get_db()
     try:
         out = []
@@ -1004,7 +1220,9 @@ def export_rdf(args):
         def add(line):
             out.append(line)
         for r in con.execute("SELECT id, text, source, trust, strong, importance, confirmed, "
-                             "invalid_at, superseded_by, created_at, updated_at FROM facts ORDER BY id"):
+                             "invalid_at, superseded_by, created_at, updated_at FROM facts "
+                             "WHERE 1=1" + _ws_check("facts", ws) + " ORDER BY id",
+                             [ws] if ws else []):
             f = dict(r)
             add("mem:fact-%d a mem:Fact ;" % f["id"])
             add("    mem:text \"%s\" ;" % esc(f["text"][:400]))
@@ -1017,14 +1235,21 @@ def export_rdf(args):
                 add("mem:fact-%d prov:invalidatedAtTime \"%s\"^^xsd:dateTime ." % (f["id"], f["invalid_at"]))
             if f["superseded_by"]:
                 add("mem:fact-%d mem:supersededBy mem:fact-%d ." % (f["id"], f["superseded_by"]))
-        for r in con.execute("SELECT id, name, type FROM entities ORDER BY id"):
+        ent_ws = _ws_check("entities", ws)
+        ent_params = [ws] if ws else []
+        for r in con.execute("SELECT id, name, type FROM entities WHERE 1=1" + ent_ws + " ORDER BY id",
+                             ent_params):
             add("mem:entity-%d a mem:Entity ; mem:name \"%s\" ; mem:type \"%s\" ."
                 % (r["id"], esc(r["name"]), esc(r["type"] or "")))
-        for r in con.execute("SELECT id, subject_id, predicate, object_id FROM relations ORDER BY id"):
+        for r in con.execute("SELECT id, subject_id, predicate, object_id FROM relations "
+                             "WHERE 1=1" + _ws_check("relations", ws) + " ORDER BY id",
+                             [ws] if ws else []):
             add("mem:entity-%d mem:relatedTo mem:entity-%d ; mem:predicate \"%s\" ."
                 % (r["subject_id"], r["object_id"], esc(r["predicate"])))
         for r in con.execute("SELECT id, category, subject, scenario, outcome, "
-                             "parent_decision_id, created_at FROM decisions ORDER BY id"):
+                             "parent_decision_id, created_at FROM decisions "
+                             "WHERE 1=1" + _ws_check("decisions", ws) + " ORDER BY id",
+                             [ws] if ws else []):
             add("mem:decision-%d a mem:Decision ;" % r["id"])
             add("    mem:scenario \"%s\" ;" % esc(r["scenario"][:300]))
             if r["subject"]:
@@ -1034,8 +1259,10 @@ def export_rdf(args):
             if r["parent_decision_id"]:
                 add("    prov:wasDerivedFrom mem:decision-%d ;" % r["parent_decision_id"])
             add("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % r["created_at"])
-        for r in con.execute("SELECT fact_id, source_ref, source_checksum, created_at "
-                             "FROM evidence ORDER BY fact_id"):
+        for r in con.execute(
+                "SELECT e.fact_id, e.source_ref, e.source_checksum, e.created_at "
+                "FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE 1=1" +
+                _ws_check("f", ws) + " ORDER BY e.fact_id", [ws] if ws else []):
             add("mem:fact-%d prov:wasDerivedFrom [ a prov:Entity ; "
                 "prov:atLocation \"%s\" ; prov:value \"%s\" ] ;"
                 % (r["fact_id"], esc(r["source_ref"]), esc(r["source_checksum"])))
@@ -1060,10 +1287,16 @@ def facts_for_session(args):
     limit = max(1, min(int(args.get("limit", 50)), 200))
     con = get_db()
     try:
-        rows = [dict(r) for r in con.execute(
-            "SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
-            "created_at, updated_at FROM facts WHERE source=? AND archived=0 AND invalid_at='' "
-            "ORDER BY importance DESC, updated_at DESC LIMIT ?", (session_ref, limit))]
+        sql = ("SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
+               "created_at, updated_at FROM facts WHERE source=? AND archived=0 AND invalid_at=''")
+        ws = _workspace(args)
+        params = [session_ref]
+        sql += _ws_filter("facts", ws)
+        if ws:
+            params.append(ws)
+        sql += " ORDER BY importance DESC, updated_at DESC LIMIT ?"
+        params.append(limit)
+        rows = [dict(r) for r in con.execute(sql, params)]
         return {"count": len(rows), "session_ref": session_ref, "facts": rows}
     finally:
         con.close()
@@ -1074,10 +1307,13 @@ def list_sessions(args):
     limit = max(1, min(int(args.get("limit", 50)), 200))
     con = get_db()
     try:
+        ws = _workspace(args)
         rows = [dict(r) for r in con.execute(
             "SELECT source, COUNT(*) AS facts, MAX(updated_at) AS last_activity "
-            "FROM facts WHERE source != '' AND archived=0 AND invalid_at='' "
-            "GROUP BY source ORDER BY last_activity DESC LIMIT ?", (limit,))]
+            "FROM facts WHERE source != '' AND archived=0 AND invalid_at=''" +
+            _ws_check("facts", ws) +
+            " GROUP BY source ORDER BY last_activity DESC LIMIT ?",
+            ([limit] if not ws else [ws, limit]))]
         return {"count": len(rows), "sessions": rows}
     finally:
         con.close()
@@ -1088,17 +1324,29 @@ def list_sessions(args):
 def stats(_args=None):
     con = get_db()
     try:
-        total = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at=''").fetchone()[0]
+        ws = _workspace(_args or {})
+        ws_clause = _ws_check("facts", ws)
+        ws_params = [ws] if ws else []
+        total = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at=''" + ws_clause,
+                            ws_params).fetchone()[0]
         by_trust = {r["trust"]: r["n"] for r in con.execute(
-            "SELECT trust, COUNT(*) n FROM facts WHERE archived=0 AND invalid_at='' GROUP BY trust")}
+            "SELECT trust, COUNT(*) n FROM facts WHERE archived=0 AND invalid_at=''" + ws_clause +
+            " GROUP BY trust", ws_params)}
         by_domain = {r["domain"] or "(none)": r["n"] for r in con.execute(
-            "SELECT domain, COUNT(*) n FROM facts WHERE archived=0 AND invalid_at='' GROUP BY domain")}
-        strong = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at='' AND strong=1").fetchone()[0]
+            "SELECT domain, COUNT(*) n FROM facts WHERE archived=0 AND invalid_at=''" + ws_clause +
+            " GROUP BY domain", ws_params)}
+        strong = con.execute(
+            "SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at='' AND strong=1" + ws_clause,
+            ws_params).fetchone()[0]
         counts = {
-            "entities": con.execute("SELECT COUNT(*) FROM entities").fetchone()[0],
-            "relations": con.execute("SELECT COUNT(*) FROM relations").fetchone()[0],
-            "decisions": con.execute("SELECT COUNT(*) FROM decisions").fetchone()[0],
-            "evidence": con.execute("SELECT COUNT(*) FROM evidence").fetchone()[0],
+            "entities": con.execute("SELECT COUNT(*) FROM entities WHERE 1=1" + _ws_check("entities", ws),
+                                    ws_params).fetchone()[0],
+            "relations": con.execute("SELECT COUNT(*) FROM relations WHERE 1=1" + _ws_check("relations", ws),
+                                     ws_params).fetchone()[0],
+            "decisions": con.execute("SELECT COUNT(*) FROM decisions WHERE 1=1" + _ws_check("decisions", ws),
+                                     ws_params).fetchone()[0],
+            "evidence": con.execute("SELECT COUNT(*) FROM evidence e JOIN facts f ON f.id=e.fact_id "
+                                    "WHERE 1=1" + _ws_check("f", ws), ws_params).fetchone()[0],
         }
         return {"total": total, "strong": strong, "by_trust": by_trust, "by_domain": by_domain,
                 "counts": counts}
@@ -1109,9 +1357,11 @@ def stats(_args=None):
 def export_facts(_args=None):
     con = get_db()
     try:
+        ws = _workspace(_args or {})
         rows = [dict(r) for r in con.execute(
             "SELECT id, sha256, text, source, project, domain, trust, strong, created_at, updated_at, archived "
-            "FROM facts ORDER BY id")]
+            "FROM facts WHERE 1=1" + _ws_check("facts", ws) + " ORDER BY id",
+            [ws] if ws else [])]
         return {"count": len(rows), "facts": rows}
     finally:
         con.close()
@@ -1133,6 +1383,7 @@ TOOLS = {
                 "trust": {"type": "string", "enum": list(VALID_TRUST), "default": "medium"},
                 "strong": {"type": "boolean", "default": False},
                 "importance": {"type": "number", "default": 0.5, "description": "0..1 value of the fact for retention"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["text"],
         },
@@ -1151,6 +1402,7 @@ TOOLS = {
                 "semantic": {"type": "boolean", "default": False, "description": "Hybrid: RRF-merge FTS BM25 with embedding search (requires MEMORY_MCP_EMBEDDINGS=1)"},
                 "valid_at": {"type": "string", "description": "RFC3339: include facts that were still valid at that time (bi-temporal)"},
                 "graph": {"type": "boolean", "default": False, "description": "RRF-merge entity-graph expansion"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["query"],
         },
@@ -1180,6 +1432,7 @@ TOOLS = {
                 "session_ref": {"type": "string"},
                 "project": {"type": "string"},
                 "domain": {"type": "string"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["transcript"],
         },
@@ -1195,6 +1448,7 @@ TOOLS = {
                 "semantic": {"type": "boolean", "default": False},
                 "graph": {"type": "boolean", "default": False, "description": "Expand via the entity graph (third RRF source)"},
                 "session_expand": {"type": "integer", "default": 0, "description": "Pull up to N sibling facts from the top hits' sessions (background)"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["turn_text"],
         },
@@ -1207,7 +1461,10 @@ TOOLS = {
         "description": "LLM cross-check of a fact against the store (conflicts/supersessions; see verify.py). Requires MEMORY_MCP_VERIFY=1.",
         "inputSchema": {
             "type": "object",
-            "properties": {"text": {"type": "string"}},
+            "properties": {
+                "text": {"type": "string"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+            },
             "required": ["text"],
         },
     },
@@ -1215,31 +1472,40 @@ TOOLS = {
         "description": "LLM-merge of paraphrased facts into one fact (inputs invalidated bi-temporally; strong/confirmed never merged). Requires MEMORY_MCP_VERIFY=1.",
         "inputSchema": {
             "type": "object",
-            "properties": {"ids": {"type": "array", "items": {"type": "integer"}}},
-            "required": ["ids"],
+            "properties": {
+                "ids": {"type": "array", "items": {"type": "integer"}},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+            },
         },
     },
     "fact_history": {
         "description": "Bi-temporal history of one fact: walk the superseded_by chain (oldest first).",
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "integer"}},
-            "required": ["id"],
+            "properties": {
+                "id": {"type": "integer"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+            },
         },
     },
     "review_pending": {
         "description": "Unconfirmed active facts (confirmed=0, trust != high), importance-first — for human review; confirm with confirm_fact.",
         "inputSchema": {
             "type": "object",
-            "properties": {"limit": {"type": "integer", "default": 20}},
+            "properties": {
+                "limit": {"type": "integer", "default": 20},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the review to your project + shared pool"},
+            },
         },
     },
     "confirm_fact": {
         "description": "Mark a fact as human-confirmed (confirmed=1, trust=high).",
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "integer"}},
-            "required": ["id"],
+            "properties": {
+                "id": {"type": "integer"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+            },
         },
     },
     "facts_for_session": {
@@ -1249,6 +1515,7 @@ TOOLS = {
             "properties": {
                 "session_ref": {"type": "string"},
                 "limit": {"type": "integer", "default": 50},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["session_ref"],
         },
@@ -1257,22 +1524,30 @@ TOOLS = {
         "description": "Session index: distinct sources with active-fact counts, freshest first.",
         "inputSchema": {
             "type": "object",
-            "properties": {"limit": {"type": "integer", "default": 50}},
+            "properties": {
+                "limit": {"type": "integer", "default": 50},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+            },
         },
     },
     "fact_references": {
         "description": "Impact query for one fact: supersession chain, consolidation links, evidence.",
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "integer"}},
-            "required": ["id"],
+            "properties": {
+                "id": {"type": "integer"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+            },
         },
     },
     "export_rdf": {
         "description": "W3C PROV-flavoured Turtle export (facts, entities/relations, decisions, evidence, supersession edges).",
         "inputSchema": {
             "type": "object",
-            "properties": {"limit": {"type": "integer", "default": 5000}},
+            "properties": {
+                "limit": {"type": "integer", "default": 5000},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+            },
         },
     },
     "list_facts": {
@@ -1283,6 +1558,7 @@ TOOLS = {
                 "project": {"type": "string"},
                 "domain": {"type": "string"},
                 "limit": {"type": "integer", "default": 50},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
         },
     },
@@ -1297,6 +1573,7 @@ TOOLS = {
                 "strong_only": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "default": 200},
                 "max_chars": {"type": "integer", "default": 4000},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
         },
     },
@@ -1305,6 +1582,8 @@ TOOLS = {
         "inputSchema": {
             "type": "object",
             "properties": {
+
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
                 "name": {"type": "string"},
                 "type": {"type": "string"},
                 "aliases": {"type": "string"},
@@ -1317,6 +1596,8 @@ TOOLS = {
         "inputSchema": {
             "type": "object",
             "properties": {
+
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
                 "subject": {"type": "string"},
                 "predicate": {"type": "string"},
                 "object": {"type": "string"},
@@ -1333,8 +1614,8 @@ TOOLS = {
                 "entity": {"type": "string"},
                 "depth": {"type": "integer", "default": 1},
                 "limit": {"type": "integer", "default": 50},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
             },
-            "required": ["entity"],
         },
     },
     "record_decision": {
@@ -1351,6 +1632,7 @@ TOOLS = {
                 "decision_maker": {"type": "string"},
                 "issue_ref": {"type": "string"},
                 "parent_decision_id": {"type": "integer"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["scenario"],
         },
@@ -1366,6 +1648,7 @@ TOOLS = {
                 "decision_maker": {"type": "string"},
                 "issue_ref": {"type": "string"},
                 "limit": {"type": "integer", "default": 20},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
         },
     },
@@ -1378,6 +1661,7 @@ TOOLS = {
                 "category": {"type": "string"},
                 "limit": {"type": "integer", "default": 10},
                 "semantic": {"type": "boolean", "default": False},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["scenario"],
         },
@@ -1386,7 +1670,10 @@ TOOLS = {
         "description": "Walk parent_decision_id links from a decision to its root (oldest first).",
         "inputSchema": {
             "type": "object",
-            "properties": {"decision_id": {"type": "integer"}},
+            "properties": {
+                "decision_id": {"type": "integer"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+            },
             "required": ["decision_id"],
         },
     },
@@ -1394,7 +1681,11 @@ TOOLS = {
         "description": "Return a fact (by id or sha256) plus its evidence rows (source_ref, checksum).",
         "inputSchema": {
             "type": "object",
-            "properties": {"fact_id": {"type": "integer"}, "sha256": {"type": "string"}},
+            "properties": {
+                "fact_id": {"type": "integer"},
+                "sha256": {"type": "string"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+            },
         },
     },
     "attach_evidence": {
@@ -1406,28 +1697,36 @@ TOOLS = {
                 "source_ref": {"type": "string"},
                 "source_checksum": {"type": "string"},
                 "fetched_at": {"type": "string"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
             },
-            "required": ["fact_id", "source_ref"],
         },
     },
     "detect_conflicts": {
-        "description": "Near-duplicate facts (FTS all-terms AND) + decisions with the same subject but >1 distinct outcome.",
+        "description": "Near-duplicate facts (term coverage >= 0.6) + decisions with the same subject but >1 distinct outcome.",
         "inputSchema": {
             "type": "object",
-            "properties": {"text": {"type": "string"}},
-            "required": ["text"],
+            "properties": {
+                "text": {"type": "string"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+            },
         },
     },
     "forget_fact": {
         "description": "Soft-delete a fact by id or sha256.",
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "integer"}, "sha256": {"type": "string"}},
+            "properties": {
+                "id": {"type": "integer"},
+                "sha256": {"type": "string"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+            },
         },
     },
     "stats": {
         "description": "Store statistics (total, by trust, by domain).",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {"type": "object", "properties": {
+            "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
+        }},
     },
     "export": {
         "description": "Export all facts (including archived) as JSON — for migration/backup.",

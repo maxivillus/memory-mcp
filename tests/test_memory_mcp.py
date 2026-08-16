@@ -659,11 +659,18 @@ class AuditFollowupTest(unittest.TestCase):
         self.assertIn("warning", res)
         self.assertIn("source", res["warning"])
 
-    def test_remember_with_source_no_warning(self):
+    def test_remember_with_source_and_workspace_no_warning(self):
         res = mcp.remember_fact({"text": "fact with source for the warning test",
-                                 "source": "run-1"})
+                                 "source": "run-1", "workspace": "ws-warn"})
         self.assertNotIn("error", res, res)
         self.assertNotIn("warning", res)
+
+    def test_remember_without_workspace_warns(self):
+        res = mcp.remember_fact({"text": "workspace-less fact for the warning test",
+                                 "source": "run-2"})
+        self.assertNotIn("error", res, res)
+        self.assertIn("warning", res)
+        self.assertIn("workspace", res["warning"])
 
     def test_compose_recall_default_budget(self):
         os.environ["MEMORY_MCP_RECALL"] = "1"
@@ -671,3 +678,244 @@ class AuditFollowupTest(unittest.TestCase):
         res = mcp.compose_recall({"turn_text": "tau metric budget"})
         self.assertNotIn("error", res, res)
         self.assertLessEqual(res["chars"], 1400 + 10)
+
+
+class WorkspaceIsolationTest(unittest.TestCase):
+    """One DB, per-project separation via workspace_id (variant C)."""
+
+    def test_workspace_isolation(self):
+        mcp.remember_fact({"text": "secret of project alpha about the theta core",
+                           "source": "t", "workspace": "proj-alpha"})
+        mcp.remember_fact({"text": "secret of project beta about the theta core",
+                           "source": "t", "workspace": "proj-beta"})
+        mcp.remember_fact({"text": "shared fact about the theta core", "source": "t"})
+
+        # scoped to alpha: sees alpha + shared, NOT beta
+        a = mcp.search_facts({"query": "theta core", "workspace": "proj-alpha"})
+        texts = [f["text"] for f in a["facts"]]
+        self.assertTrue(any("secret of project alpha" in t for t in texts))
+        self.assertTrue(any("shared fact" in t for t in texts))
+        self.assertFalse(any("secret of project beta" in t for t in texts))
+
+        # scoped to beta: sees beta + shared, NOT alpha
+        b = mcp.search_facts({"query": "theta core", "workspace": "proj-beta"})
+        texts_b = [f["text"] for f in b["facts"]]
+        self.assertTrue(any("secret of project beta" in t for t in texts_b))
+        self.assertFalse(any("secret of project alpha" in t for t in texts_b))
+
+        # unscoped (legacy client): sees ONLY the shared pool
+        u = mcp.search_facts({"query": "theta core"})
+        self.assertTrue(all("secret of project" not in f["text"] for f in u["facts"]))
+        self.assertTrue(any("shared fact" in f["text"] for f in u["facts"]))
+
+    def test_summarize_and_review_scoped(self):
+        mcp.remember_fact({"text": "alpha-only metric fact about the lambda probe",
+                           "source": "t", "workspace": "proj-alpha"})
+        idx = mcp.summarize_index({"workspace": "proj-alpha"})
+        self.assertIn("lambda probe", idx["index"])
+        idx_b = mcp.summarize_index({"workspace": "proj-beta"})
+        self.assertNotIn("lambda probe", idx_b["index"])
+        rp = mcp.review_pending({"workspace": "proj-alpha", "limit": 100})
+        self.assertTrue(any("lambda probe" in f["text"] for f in rp["facts"]))
+        rp_b = mcp.review_pending({"workspace": "proj-beta", "limit": 100})
+        self.assertFalse(any("lambda probe" in f["text"] for f in rp_b["facts"]))
+
+
+class WorkspaceRecallScopingTest(unittest.TestCase):
+    """Workspace scoping in compose_recall and find_precedents."""
+
+    def setUp(self):
+        self._old = {k: os.environ.get(k) for k in ("MEMORY_MCP_RECALL",)}
+        os.environ["MEMORY_MCP_RECALL"] = "1"
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_compose_recall_workspace(self):
+        mcp.remember_fact({"text": "wf-only recall fact about the zeta probe",
+                           "source": "t", "workspace": "proj-wf"})
+        mcp.remember_fact({"text": "noise-only recall fact about the zeta probe",
+                           "source": "t", "workspace": "proj-noise"})
+        r_wf = mcp.compose_recall({"turn_text": "zeta probe", "workspace": "proj-wf"})
+        self.assertNotIn("error", r_wf, r_wf)
+        self.assertIn("wf-only", r_wf["block"])
+        self.assertNotIn("noise-only", r_wf["block"])
+        r_all = mcp.compose_recall({"turn_text": "zeta probe"})
+        self.assertNotIn("wf-only", r_all["block"])
+
+    def test_find_precedents_workspace(self):
+        mcp.record_decision({"scenario": "wf scenario about the omega gateway",
+                             "outcome": "adopt", "workspace": "proj-wf"})
+        mcp.record_decision({"scenario": "noise scenario about the omega gateway",
+                             "outcome": "reject", "workspace": "proj-noise"})
+        r = mcp.find_precedents({"scenario": "omega gateway decision", "workspace": "proj-wf"})
+        self.assertNotIn("error", r, r)
+        self.assertTrue(any("wf scenario" in p["scenario"] for p in r["precedents"]))
+        self.assertFalse(any("noise scenario" in p["scenario"] for p in r["precedents"]))
+
+
+class WorkspaceBypassGuardTest(unittest.TestCase):
+    """Isolation must hold on semantic, by-id, and export paths."""
+
+    def test_semantic_search_scoped(self):
+        os.environ["MEMORY_MCP_EMBEDDINGS"] = "1"
+        os.environ["MEMORY_MCP_EMBED_PROVIDER"] = "test"
+        mcp.remember_fact({"text": "alpha semantic probe about the mu core",
+                           "source": "t", "workspace": "proj-alpha"})
+        mcp.remember_fact({"text": "beta semantic probe about the mu core",
+                           "source": "t", "workspace": "proj-beta"})
+        a = mcp.search_facts({"query": "mu core probe", "semantic": True,
+                              "workspace": "proj-alpha"})
+        texts = [f["text"] for f in a["facts"]]
+        self.assertTrue(any("alpha semantic" in t for t in texts))
+        self.assertFalse(any("beta semantic" in t for t in texts))
+        # unscoped semantic: shared pool only
+        u = mcp.search_facts({"query": "mu core probe", "semantic": True})
+        self.assertTrue(all("semantic probe" not in f["text"] for f in u["facts"]))
+
+    def test_by_id_tools_scoped(self):
+        mcp.remember_fact({"text": "alpha secret about the nu endpoint",
+                           "source": "t", "workspace": "proj-alpha"})
+        fid = mcp.search_facts({"query": "nu endpoint", "workspace": "proj-alpha"})["facts"][0]["id"]
+        # forget from another workspace must not touch it
+        res = mcp.forget_fact({"id": fid, "workspace": "proj-beta"})
+        self.assertEqual(res["archived"], 0)
+        still = mcp.search_facts({"query": "nu endpoint", "workspace": "proj-alpha"})
+        self.assertGreaterEqual(still["count"], 1)
+        # confirm from another workspace must not elevate it
+        cf = mcp.confirm_fact({"id": fid, "workspace": "proj-beta"})
+        self.assertEqual(cf.get("confirmed"), None)
+        # unscoped client cannot see it via provenance
+        prov = mcp.get_provenance({"fact_id": fid})
+        self.assertIsNone(prov.get("fact"))
+
+    def test_export_scoped(self):
+        mcp.remember_fact({"text": "alpha export marker about the xi probe",
+                           "source": "t", "workspace": "proj-alpha"})
+        exp = mcp.export_facts({"workspace": "proj-beta"})
+        self.assertTrue(all("alpha export marker" not in f["text"] for f in exp["facts"]))
+        exp_a = mcp.export_facts({"workspace": "proj-alpha"})
+        self.assertTrue(any("alpha export marker" in f["text"] for f in exp_a["facts"]))
+
+
+class WorkspaceGraphScopeTest(unittest.TestCase):
+    """Entity graph + export + stats respect workspace isolation."""
+
+    def test_graph_and_export_scoped(self):
+        os.environ["MEMORY_MCP_RECALL"] = "1"
+        mcp.remember_entity({"name": "svc-wf", "type": "service", "workspace": "proj-wf"})
+        mcp.remember_entity({"name": "svc-noise", "type": "service", "workspace": "proj-noise"})
+        mcp.remember_relation({"subject": "svc-wf", "predicate": "uses",
+                               "object": "svc-wf", "workspace": "proj-wf"})
+        # search_graph scoped: other workspace entity invisible
+        r = mcp.search_graph({"entity": "svc-wf", "workspace": "proj-wf"})
+        self.assertNotIn("error", r, r)
+        r_other = mcp.search_graph({"entity": "svc-noise", "workspace": "proj-wf"})
+        self.assertIn("error", r_other)  # not visible from another workspace
+        # export_rdf scoped
+        exp = mcp.export_rdf({"workspace": "proj-wf"})
+        self.assertIn("svc-wf", exp["rdf"])
+        self.assertNotIn("svc-noise", exp["rdf"])
+        # stats scoped
+        st = mcp.stats({"workspace": "proj-wf"})
+        self.assertGreaterEqual(st["counts"]["entities"], 1)
+
+
+class MigrationAndDedupTest(unittest.TestCase):
+    """Data-preserving rebuild migration + per-workspace dedup."""
+
+    def _old_schema_db(self):
+        import sqlite3, tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        con = sqlite3.connect(tmp.name)
+        con.executescript("""
+        CREATE TABLE facts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          sha256 TEXT NOT NULL UNIQUE,
+          text TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT '',
+          project TEXT NOT NULL DEFAULT '',
+          domain TEXT NOT NULL DEFAULT '',
+          trust TEXT NOT NULL DEFAULT 'medium' CHECK (trust IN ('high','medium','low')),
+          strong INTEGER NOT NULL DEFAULT 0,
+          importance REAL NOT NULL DEFAULT 0.5,
+          invalid_at TEXT NOT NULL DEFAULT '',
+          superseded_by INTEGER,
+          confirmed INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          archived INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+          text, content='facts', content_rowid='id');
+        CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+          INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+          INSERT INTO facts_fts(facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+          INSERT INTO facts_fts(facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+          INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
+        END;
+        """)
+        import hashlib
+        ts = "2026-08-16T00:00:00Z"
+        sha = hashlib.sha256(b"legacy fact text").hexdigest()
+        con.execute("INSERT INTO facts (sha256, text, source, project, domain, trust, strong, "
+                    "importance, invalid_at, superseded_by, confirmed, created_at, updated_at, archived) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (sha, "legacy fact text", "s", "p", "d", "medium", 0, 0.9,
+                     "2026-08-15T00:00:00Z", 7, 1, ts, ts, 0))
+        con.commit(); con.close()
+        return tmp.name
+
+    def test_rebuild_preserves_data(self):
+        db = self._old_schema_db()
+        con = mcp.get_db.__globals__["sqlite3"].connect(db)
+        con.row_factory = mcp.get_db.__globals__["sqlite3"].Row
+        mcp._migrate_facts(con)
+        row = con.execute("SELECT * FROM facts WHERE text='legacy fact text'").fetchone()
+        con.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["workspace_id"], "")
+        self.assertEqual(row["confirmed"], 1)
+        self.assertEqual(row["superseded_by"], 7)
+        self.assertEqual(row["invalid_at"], "2026-08-15T00:00:00Z")
+        self.assertEqual(row["archived"], 0)
+        self.assertEqual(row["importance"], 0.9)
+        # FTS still finds it
+        mcp2 = mcp
+        import os as _os
+        _os.environ["MEMORY_MCP_DB"] = db
+        # search via direct sqlite FTS
+        hit = con if False else None
+        c = mcp.get_db.__globals__["sqlite3"].connect(db)
+        n = c.execute("SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH 'legacy'").fetchone()[0]
+        c.close()
+        self.assertEqual(n, 1)
+        _os.environ.pop("MEMORY_MCP_DB", None)
+
+    def test_per_workspace_dedup(self):
+        r1 = mcp.remember_fact({"text": "shared text across workspaces", "source": "t",
+                                "workspace": "ws-one"})
+        r2 = mcp.remember_fact({"text": "shared text across workspaces", "source": "t",
+                                "workspace": "ws-two"})
+        self.assertFalse(r1["dedup"])
+        self.assertFalse(r2["dedup"])
+        self.assertNotEqual(r1["id"], r2["id"])
+        # each workspace sees its own copy
+        a = mcp.search_facts({"query": "shared text across", "workspace": "ws-one"})
+        self.assertEqual(a["count"], 1)
+        b = mcp.search_facts({"query": "shared text across", "workspace": "ws-two"})
+        self.assertEqual(b["count"], 1)
+        self.assertNotEqual(a["facts"][0]["id"], b["facts"][0]["id"])
+        # same workspace dedups
+        r3 = mcp.remember_fact({"text": "shared text across workspaces", "source": "t",
+                                "workspace": "ws-one"})
+        self.assertTrue(r3["dedup"])

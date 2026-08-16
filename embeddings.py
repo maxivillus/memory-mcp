@@ -262,13 +262,17 @@ def _store_decision(con, decision_id, vec, model):
     con.commit()
 
 
-def search_decision_semantic(con, query, limit=10, threshold=0.0):
-    """Brute-force cosine over stored decision vectors, best first."""
+def search_decision_semantic(con, query, limit=10, threshold=0.0, workspace=""):
+    """Brute-force cosine over stored decision vectors, best first.
+    Workspace-scoped like lexical decision search."""
     qvec = _normalize(embed([query])[0])
+    ws_clause = " AND d.workspace_id IN (?, '')" if workspace else " AND d.workspace_id = ''"
+    params = [workspace] if workspace else []
     rows = con.execute(
         "SELECT d.id, d.category, d.subject, d.scenario, d.reasoning, d.outcome, "
         "d.confidence, d.decision_maker, d.issue_ref, d.created_at, e.vec "
-        "FROM decision_embeddings e JOIN decisions d ON d.id=e.decision_id").fetchall()
+        "FROM decision_embeddings e JOIN decisions d ON d.id=e.decision_id "
+        "WHERE 1=1" + ws_clause, params).fetchall()
     scored = []
     for r in rows:
         score = _dot(qvec, r["vec"])
@@ -286,12 +290,15 @@ def search_decision_semantic(con, query, limit=10, threshold=0.0):
     return {"count": len(out), "model": model_name(), "precedents": out}
 
 
-def embed_backfill(con):
-    """Compute vectors for facts that have none (or whose model changed)."""
+def embed_backfill(con, workspace=""):
+    """Compute vectors for facts that have none (or whose model changed).
+    Workspace-scoped: backfill within the caller's workspace + shared pool."""
+    ws_clause = " AND f.workspace_id IN (?, '')" if workspace else " AND f.workspace_id = ''"
+    params = [workspace] if workspace else []
     rows = con.execute(
-        "SELECT f.id, f.text FROM facts f WHERE f.archived=0 "
-        "AND NOT EXISTS (SELECT 1 FROM fact_embeddings e WHERE e.fact_id=f.id) "
-        "ORDER BY f.id LIMIT 500").fetchall()
+        "SELECT f.id, f.text FROM facts f WHERE f.archived=0" + ws_clause +
+        " AND NOT EXISTS (SELECT 1 FROM fact_embeddings e WHERE e.fact_id=f.id) "
+        "ORDER BY f.id LIMIT 500", params).fetchall()
     processed = failed = 0
     for r in rows:
         try:
@@ -300,21 +307,29 @@ def embed_backfill(con):
             processed += 1
         except Exception:
             failed += 1
-    return {"processed": processed, "failed": failed, "remaining": _missing_count(con)}
+    return {"processed": processed, "failed": failed,
+            "remaining": _missing_count(con, workspace)}
 
 
-def _missing_count(con):
+def _missing_count(con, workspace=""):
+    ws_clause = " AND f.workspace_id IN (?, '')" if workspace else " AND f.workspace_id = ''"
+    params = [workspace] if workspace else []
     return con.execute(
-        "SELECT COUNT(*) FROM facts f WHERE f.archived=0 "
-        "AND NOT EXISTS (SELECT 1 FROM fact_embeddings e WHERE e.fact_id=f.id)").fetchone()[0]
+        "SELECT COUNT(*) FROM facts f WHERE f.archived=0" + ws_clause +
+        " AND NOT EXISTS (SELECT 1 FROM fact_embeddings e WHERE e.fact_id=f.id)",
+        params).fetchone()[0]
 
 
-def search_semantic(con, query, limit=20, threshold=0.0):
-    """Brute-force cosine over stored vectors, best first."""
+def search_semantic(con, query, limit=20, threshold=0.0, workspace=""):
+    """Brute-force cosine over stored vectors, best first. Workspace-scoped
+    like lexical search: (workspace, '') when scoped, '' only when not."""
     qvec = _normalize(embed([query])[0])
+    ws_clause = " AND f.workspace_id IN (?, '')" if workspace else " AND f.workspace_id = ''"
+    params = [workspace] if workspace else []
     rows = con.execute(
         "SELECT e.fact_id, e.vec, e.model, f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong "
-        "FROM fact_embeddings e JOIN facts f ON f.id=e.fact_id WHERE f.archived=0").fetchall()
+        "FROM fact_embeddings e JOIN facts f ON f.id=e.fact_id WHERE f.archived=0" + ws_clause,
+        params).fetchall()
     scored = []
     for r in rows:
         score = _dot(qvec, r["vec"])
@@ -330,11 +345,11 @@ def search_semantic(con, query, limit=20, threshold=0.0):
     return {"count": len(out), "model": model_name(), "facts": out}
 
 
-def hybrid_rerank(con, query, fts_facts, limit=20):
+def hybrid_rerank(con, query, fts_facts, limit=20, workspace=""):
     """RRF merge of FTS BM25 ranks and semantic ranks (k=60)."""
     if not fts_facts:
-        return search_semantic(con, query, limit=limit)
-    sem = search_semantic(con, query, limit=200, threshold=0.0)
+        return search_semantic(con, query, limit=limit, workspace=workspace)
+    sem = search_semantic(con, query, limit=200, threshold=0.0, workspace=workspace)
     sem_index = {f["id"]: i for i, f in enumerate(sem["facts"])}
     fts_index = {f["id"]: i for i, f in enumerate(fts_facts)}
     k = 60
