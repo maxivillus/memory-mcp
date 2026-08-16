@@ -57,7 +57,8 @@ def _http_json(url, payload, headers=None):
 
 def _chat_ollama(messages):
     out = _http_json(base_url().rstrip("/") + "/api/chat", {
-        "model": model_name(), "messages": messages, "stream": False, "format": "json"})
+        "model": model_name(), "messages": messages, "stream": False,
+        "format": "json", "think": False})  # qwen3: disable reasoning tokens (CPU speed)
     return out["message"]["content"]
 
 
