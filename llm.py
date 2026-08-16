@@ -80,7 +80,7 @@ def _chat_test(messages):
     import re
     joined = "\n".join(m.get("content", "") for m in messages)
     facts = [{"text": line[6:].strip(), "type": "project", "trust": "medium",
-              "strong": False, "scope": "project"}
+              "strong": False, "scope": "project", "importance": 0.7}
              for line in joined.splitlines() if line.startswith("FACT: ")]
     if facts:
         return json.dumps({"facts": facts})
@@ -94,10 +94,10 @@ def _chat_test(messages):
         best = max(cands, key=lambda c: len(words & set(re.findall(r"[a-z]+", c[1].lower()))),
                    default=None)
         if best:
-            return json.dumps({"verdict": "supersedes",
-                               "conflicts": [{"id": int(best[0]), "reason": "test provider"}],
-                               "confidence": 1.0})
-    return json.dumps({"verdict": "consistent", "conflicts": [], "confidence": 1.0})
+            return json.dumps({"action": "supersedes", "target_id": int(best[0]),
+                               "reason": "test provider", "confidence": 1.0})
+    return json.dumps({"action": "add", "target_id": None, "reason": "",
+                       "confidence": 1.0})
 
 
 def chat_json(messages):
