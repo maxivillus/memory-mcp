@@ -351,6 +351,9 @@ def remember_fact(args):
     importance = _importance(args)
     sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     ts = now()
+    warning = ""
+    if not (args.get("source") or "").strip():
+        warning = "no source provided; add source=repo@commit/issue/run for provenance"
     con = get_db()
     try:
         cur = con.execute("SELECT id, created_at FROM facts WHERE sha256=?", (sha,))
@@ -366,8 +369,11 @@ def remember_fact(args):
             con.execute("UPDATE facts SET %s WHERE id=?" % ", ".join(sets),
                         params + [row["id"]])
             con.commit()
-            return {"id": row["id"], "sha256": sha, "dedup": True,
-                    "created_at": row["created_at"], "updated_at": ts}
+            out = {"id": row["id"], "sha256": sha, "dedup": True,
+                   "created_at": row["created_at"], "updated_at": ts}
+            if warning:
+                out["warning"] = warning
+            return out
         cur = con.execute(
             "INSERT INTO facts (sha256, text, source, project, domain, trust, strong, importance, created_at, updated_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -379,8 +385,11 @@ def remember_fact(args):
         emb = _emb()
         if emb is not None:
             emb.embed_fact(con, fid, text)  # best-effort, never raises
-        return {"id": fid, "sha256": sha, "dedup": False,
-                "created_at": ts, "updated_at": ts}
+        out = {"id": fid, "sha256": sha, "dedup": False,
+               "created_at": ts, "updated_at": ts}
+        if warning:
+            out["warning"] = warning
+        return out
     finally:
         con.close()
 
@@ -1109,21 +1118,9 @@ def export_facts(_args=None):
 
 
 TOOLS = {
-    "add_fact": {
-        "description": "Alias for remember_fact: store a durable fact (upsert, dedup by sha256 of text).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Fact text"},
-                "source": {"type": "string", "description": "Origin: session/issue/run"},
-                "project": {"type": "string", "description": "Project scope"},
-                "domain": {"type": "string", "description": "Category/tag"},
-                "trust": {"type": "string", "enum": list(VALID_TRUST), "default": "medium"},
-                "strong": {"type": "boolean", "default": False},
-            },
-            "required": ["text"],
-        },
-    },
+    # NOTE: add_fact exists as a HANDLERS alias for remember_fact (agents
+    # guess the name) but is intentionally NOT advertised in the schema —
+    # aliases would add tool-choice noise for every client.
     "remember_fact": {
         "description": "Store a durable fact (upsert, dedup by sha256 of text).",
         "inputSchema": {
@@ -1194,7 +1191,7 @@ TOOLS = {
             "properties": {
                 "turn_text": {"type": "string"},
                 "limit": {"type": "integer", "default": 8},
-                "chars": {"type": "integer", "default": 2400},
+                "chars": {"type": "integer", "default": 1400},
                 "semantic": {"type": "boolean", "default": False},
                 "graph": {"type": "boolean", "default": False, "description": "Expand via the entity graph (third RRF source)"},
                 "session_expand": {"type": "integer", "default": 0, "description": "Pull up to N sibling facts from the top hits' sessions (background)"},
