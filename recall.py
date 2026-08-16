@@ -193,42 +193,11 @@ def sweep_freshness(args):
 
 
 def _graph_hits(hits, limit=10):
-    """Entity-graph expansion: entities mentioned in the hit facts -> graph
-    neighbors -> facts mentioning the neighbors (third RRF source)."""
-    from memory_mcp import get_db
+    """Entity-graph expansion (shared core helper; third RRF source)."""
+    from memory_mcp import _graph_expand_facts, get_db
     con = get_db()
     try:
-        names = [r["name"] for r in con.execute(
-            "SELECT name FROM entities WHERE length(name) >= 3")]
-        mentioned = set()
-        for f in hits:
-            low = (f.get("text") or "").lower()
-            for n in names:
-                if n.lower() in low:
-                    mentioned.add(n)
-        neighbors = set()
-        for n in list(mentioned)[:8]:
-            for r in con.execute(
-                "SELECT o.name AS nb FROM relations r JOIN entities s ON s.id=r.subject_id "
-                "JOIN entities o ON o.id=r.object_id WHERE s.name=? "
-                "UNION SELECT s.name FROM relations r JOIN entities s ON s.id=r.subject_id "
-                "JOIN entities o ON o.id=r.object_id WHERE o.name=?", (n, n)):
-                neighbors.add(r["nb"])
-        out, seen = [], {f["id"] for f in hits}
-        for nb in list(neighbors)[:12]:
-            # entity names are operator data: escape LIKE wildcards
-            esc = nb.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            rows = con.execute(
-                "SELECT id, text, source, project, domain, trust, strong, importance, confirmed "
-                "FROM facts WHERE text LIKE ? ESCAPE '\\' AND archived=0 AND invalid_at='' LIMIT 5",
-                ("%" + esc + "%",)).fetchall()
-            for r in rows:
-                if r["id"] not in seen:
-                    seen.add(r["id"])
-                    out.append(dict(r))
-                    if len(out) >= limit:
-                        return out
-        return out
+        return _graph_expand_facts(con, hits, limit)
     finally:
         con.close()
 
