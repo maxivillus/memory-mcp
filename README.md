@@ -93,3 +93,12 @@ project dir name), `MEMORY_MCP_CMD` (`memory-mcp` via PATH), `MEMORY_MCP_DB`
 (XDG-style `~/.local/share/memory-mcp/facts.db` — propagated to the server
 only when explicitly set, so a host wrapper pin is never overridden;
 resolved source/server/target are printed before writing).
+
+## Agent skill
+
+- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 17 MCP tools:
+  when to search facts before researching, how to record decisions with
+  rationale for precedent lookup, graph/provenance/conflict usage, and shared-
+  store conventions. Compatible with the `SKILL.md` format used by agent skill
+  collections; copy it into your agent's skill directory (or point discovery
+  at this repo).
