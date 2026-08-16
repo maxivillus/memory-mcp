@@ -12,7 +12,7 @@ metadata:
 
 # Shared Agent Memory (memory-mcp)
 
-Available to runtime agents as the `mcp__memory-mcp__*` tools (27 tools).
+Available to runtime agents as the `mcp__memory-mcp__*` tools (30 tools).
 One shared store across all runtimes: a fact or decision written in one
 session is visible to every later session.
 
@@ -30,6 +30,11 @@ session is visible to every later session.
   facts and mark them verified (confirmed=1, trust=high).
 - `remember_fact {importance}` — 0..1 value for retention; low-importance
   stale facts are archived by `sweep_freshness`, strong/confirmed never.
+- `consolidate {ids}` — LLM-merge of paraphrased facts into one (old versions
+  stay in `fact_history`); strong/confirmed never merged.
+- `facts_for_session {session_ref}` / `list_sessions` — session-scoped views;
+  `compose_recall {session_expand}` adds same-session context.
+- `compose_recall {graph=true}` — entity-graph as a third recall source.
 
 - `remember_fact {text, source?, project?, domain?, trust?, strong?}` — store a
   durable fact (upsert, dedup by sha256). Use `strong=true` for

@@ -51,6 +51,17 @@ new fact may update or contradict older ones. Return ONLY JSON matching:
 Stored facts:"""
 
 
+CONSOLIDATE_PROMPT = """You consolidate paraphrased memory facts into a
+single fact. The facts describe the same subject with overlapping content.
+Return ONLY JSON matching:
+{"merge": true|false, "text": "<merged fact>", "importance": 0..1, "reason": "<short why>"}
+- merge=false when the facts are genuinely different and must stay separate.
+- merge=true: text preserves ALL non-redundant information from the inputs
+  (no invented details), in the language of the facts, present tense.
+- importance: keep the highest importance among the inputs.
+Facts:"""
+
+
 def _min_confidence():
     try:
         return min(1.0, max(0.0, float(os.environ.get("MEMORY_MCP_VERIFY_MIN_CONFIDENCE", "0.8"))))
@@ -111,6 +122,65 @@ def verify_facts(args):
     except Exception:
         return {"error": "verification failed (provider error; see server stderr)",
                 "checked_against": len(candidates)}
+
+def consolidate(args):
+    """LLM-merge of paraphrased facts (near-duplicates) into one fact. The
+    inputs are invalidated bi-temporally (history survives via fact_history);
+    strong/confirmed facts are never merged."""
+    ids = []
+    for v in (args.get("ids") or []):
+        try:
+            ids.append(int(v))
+        except (TypeError, ValueError):
+            continue
+    ids = sorted(set(ids))  # dedupe; cap keeps the LLM prompt bounded
+    if len(ids) < 2:
+        return {"error": "ids: at least 2 distinct fact ids are required"}
+    if len(ids) > 20:
+        return {"error": "ids: at most 20 facts can be consolidated at once"}
+    from memory_mcp import get_db, remember_fact, attach_evidence
+    con = get_db()
+    try:
+        marks = ",".join("?" * len(ids))
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, text, strong, confirmed, importance FROM facts "
+            "WHERE id IN (%s) AND archived=0 AND invalid_at=''" % marks, ids)]
+    finally:
+        con.close()
+    if len(rows) != len(set(ids)):
+        return {"error": "some ids are not active facts", "found": len(rows)}
+    protected = [r["id"] for r in rows if r.get("strong") or r.get("confirmed")]
+    if protected:
+        return {"error": "strong/confirmed facts cannot be consolidated",
+                "protected_ids": protected}
+    rows.sort(key=lambda r: r["id"])
+    try:
+        snippet = "\n".join("- id=%s: %s" % (r["id"], r["text"][:500]) for r in rows)
+        verdict = llm.chat_json([
+            {"role": "system", "content": CONSOLIDATE_PROMPT},
+            {"role": "user", "content": snippet},
+        ])
+    except Exception:
+        return {"error": "consolidation failed (provider error; see server stderr)"}
+    if not verdict.get("merge"):
+        return {"merged": False, "ids": ids, "reason": verdict.get("reason", "")}
+    text = (verdict.get("text") or "").strip()
+    if not text:
+        return {"error": "consolidation returned an empty text"}
+    importance = max((float(r.get("importance") or 0.5) for r in rows), default=0.5)
+    res = remember_fact({"text": text, "source": "consolidate",
+                         "importance": verdict.get("importance", importance)})
+    if "error" in res:
+        return {"error": res["error"]}
+    new_id = res["id"]
+    invalidated = []
+    for r in rows:
+        if _invalidate(r["id"], new_id):
+            attach_evidence({"fact_id": new_id, "source_ref": "consolidated:%s" % r["id"]})
+            invalidated.append(r["id"])
+    return {"merged": True, "new_id": new_id, "source_ids": invalidated,
+            "reason": verdict.get("reason", ""), "text": text}
+
 
 
 def check_new_facts(new_facts):

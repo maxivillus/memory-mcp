@@ -108,7 +108,7 @@ resolved source/server/target are printed before writing).
 
 ## Agent skill
 
-- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 27 MCP tools:
+- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 30 MCP tools:
   when to search facts before researching, how to record decisions with
   rationale for precedent lookup, graph/provenance/conflict usage, semantic
   search, and shared-store conventions. Compatible with the `SKILL.md` format
@@ -213,6 +213,15 @@ activate only when set, and every failure degrades to store-only.
   add/update/supersedes/delete/noop per ingested fact; supersedes/update
   invalidate the old fact bi-temporally (never archive, never touch strong
   facts, ids whitelisted to the verification context).
+- **Consolidation** — `consolidate {ids}` LLM-merges paraphrased facts into
+  one (inputs invalidated bi-temporally with `consolidated:<id>` evidence);
+  strong/confirmed facts are never merged.
+- **Sessions first-class** — `facts_for_session {session_ref}` and
+  `list_sessions` (source index); `compose_recall {session_expand}` pulls
+  sibling facts from the top hits' sessions as background context.
+- **Entity-graph in recall** — `compose_recall {graph=true}` adds a third RRF
+  source: entities mentioned in hits -> graph neighbors -> facts mentioning
+  them (facts unreachable by lexical/semantic search surface via the graph).
 
 ## Deploying in a docker runtime
 

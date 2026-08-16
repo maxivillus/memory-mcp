@@ -475,3 +475,91 @@ class TemporalAndReviewTest(unittest.TestCase):
         facts = mcp.search_facts({"query": "eta cache holds logs"})
         self.assertGreaterEqual(facts["count"], 1)
         self.assertEqual(facts["facts"][0]["importance"], 0.7)
+
+
+class ConsolidateSessionsGraphTest(unittest.TestCase):
+    """consolidate, sessions first-class, graph-in-RRF."""
+
+    def setUp(self):
+        self._old = {k: os.environ.get(k) for k in
+                     ("MEMORY_MCP_VERIFY", "MEMORY_MCP_RECALL", "MEMORY_MCP_LLM_PROVIDER")}
+        os.environ["MEMORY_MCP_VERIFY"] = "1"
+        os.environ["MEMORY_MCP_RECALL"] = "1"
+        os.environ["MEMORY_MCP_LLM_PROVIDER"] = "test"
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_consolidate_merges(self):
+        mcp.remember_fact({"text": "the phi cache stores session tokens", "source": "t"})
+        mcp.remember_fact({"text": "the phi cache holds tokens for sessions", "source": "t"})
+        f1 = mcp.search_facts({"query": "phi cache stores session tokens"})["facts"][0]
+        f2 = mcp.search_facts({"query": "phi cache holds tokens for sessions"})["facts"][0]
+        res = mcp.consolidate({"ids": [f1["id"], f2["id"]]})
+        self.assertNotIn("error", res, res)
+        self.assertTrue(res["merged"])
+        # merged fact active, sources invalidated bi-temporally
+        new = mcp.search_facts({"query": "phi cache stores session tokens"})
+        self.assertGreaterEqual(new["count"], 1)
+        hist = mcp.fact_history({"id": f1["id"]})
+        self.assertEqual(hist["count"], 2)
+        self.assertNotEqual(hist["chain"][0]["invalid_at"], "")
+        # evidence on the merged fact
+        prov = mcp.get_provenance({"fact_id": res["new_id"]})
+        self.assertTrue(any("consolidated:" in e["source_ref"] for e in prov["evidence"]))
+
+    def test_consolidate_protects_strong(self):
+        mcp.remember_fact({"text": "the chi cache is the source of truth", "source": "t",
+                           "strong": True})
+        mcp.remember_fact({"text": "the chi cache is the source of truth for config", "source": "t"})
+        fs = mcp.search_facts({"query": "chi cache source of truth"})["facts"]
+        strong_id = next(f["id"] for f in fs if f["strong"])
+        other_id = next(f["id"] for f in fs if not f["strong"])
+        res = mcp.consolidate({"ids": [strong_id, other_id]})
+        self.assertIn("error", res)
+        self.assertIn(strong_id, res["protected_ids"])
+
+    def test_consolidate_requires_two(self):
+        res = mcp.consolidate({"ids": [1]})
+        self.assertIn("error", res)
+
+    def test_facts_for_session(self):
+        mcp.remember_fact({"text": "session alpha fact about the delta queue", "source": "sess-alpha"})
+        mcp.remember_fact({"text": "session beta fact about the gamma queue", "source": "sess-beta"})
+        fa = mcp.facts_for_session({"session_ref": "sess-alpha"})
+        self.assertNotIn("error", fa, fa)
+        self.assertEqual(fa["count"], 1)
+        self.assertIn("delta queue", fa["facts"][0]["text"])
+        ls = mcp.list_sessions({})
+        self.assertIn("count", ls)
+        srcs = {s["source"] for s in ls["sessions"]}
+        self.assertIn("sess-alpha", srcs)
+        self.assertIn("sess-beta", srcs)
+
+    def test_compose_recall_session_expand(self):
+        mcp.remember_fact({"text": "the epsilon endpoint handles mobile auth", "source": "sess-s"})
+        # sibling shares NO query terms — only session linking can surface it
+        mcp.remember_fact({"text": "the zeta deploy runs every night", "source": "sess-s"})
+        res = mcp.compose_recall({"turn_text": "mobile auth epsilon endpoint", "limit": 3,
+                                  "session_expand": 3})
+        self.assertNotIn("error", res, res)
+        self.assertGreaterEqual(res["session_expanded"], 1)
+        self.assertIn("zeta deploy", res["block"])
+
+    def test_compose_recall_graph_expansion(self):
+        # the neighbor fact shares NO lexical terms with the query — only the
+        # entity graph can reach it
+        mcp.remember_entity({"name": "orders-svc", "type": "service"})
+        mcp.remember_entity({"name": "payments-db", "type": "database"})
+        mcp.remember_relation({"subject": "orders-svc", "predicate": "uses",
+                               "object": "payments-db"})
+        mcp.remember_fact({"text": "the orders-svc service handles orders", "source": "t"})
+        mcp.remember_fact({"text": "the payments-db stores payment records", "source": "t"})
+        res = mcp.compose_recall({"turn_text": "orders handling", "limit": 5, "graph": True})
+        self.assertNotIn("error", res, res)
+        self.assertGreaterEqual(res["graph"], 1)
+        self.assertIn("payments-db", res["block"])
