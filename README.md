@@ -10,7 +10,7 @@ extraction/gating/injection stay client-side (reasonix memory patches).
 ## Tools
 
 - `remember_fact {text, source?, project?, domain?, trust?, strong?}` — upsert
-  (dedup by sha256 of text)
+  (dedup by sha256 of text). `add_fact` is an alias for the same operation.
 - `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?}` —
   FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors
 - `list_facts {project?, domain?, limit?}` — recent non-archived facts

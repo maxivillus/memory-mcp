@@ -238,3 +238,15 @@ class EmbeddingsTest(unittest.TestCase):
         self.remember("plain lexical fact about the mu table")
         res = mcp.search_facts({"query": "mu table", "semantic": True})
         self.assertNotIn("error", res, res)
+
+
+class AddFactAliasTest(unittest.TestCase):
+    def test_add_fact_alias_stores_fact(self):
+        # add_fact is a protocol-level alias (HANDLERS), same handler as remember_fact
+        self.assertIn("add_fact", mcp.TOOLS)
+        self.assertIn("add_fact", mcp.HANDLERS)
+        res = mcp.HANDLERS["add_fact"]({"text": "alias fact about the nu cache", "source": "test"})
+        self.assertNotIn("error", res, res)
+        self.assertIn("id", res)
+        facts = mcp.search_facts({"query": "nu cache alias"})
+        self.assertTrue(any("nu cache" in f["text"] for f in facts["facts"]))
