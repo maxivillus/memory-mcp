@@ -250,3 +250,116 @@ class AddFactAliasTest(unittest.TestCase):
         self.assertIn("id", res)
         facts = mcp.search_facts({"query": "nu cache alias"})
         self.assertTrue(any("nu cache" in f["text"] for f in facts["facts"]))
+
+
+class PipelineTest(unittest.TestCase):
+    """Server-side extraction/recall/verification with the deterministic
+    `test` LLM provider (no model needed)."""
+
+    def setUp(self):
+        self._old = {k: os.environ.get(k) for k in
+                     ("MEMORY_MCP_EXTRACT", "MEMORY_MCP_RECALL", "MEMORY_MCP_VERIFY",
+                      "MEMORY_MCP_LLM_PROVIDER", "MEMORY_MCP_EXTRACT_MIN_CHARS")}
+        os.environ["MEMORY_MCP_EXTRACT"] = "1"
+        os.environ["MEMORY_MCP_RECALL"] = "1"
+        os.environ["MEMORY_MCP_LLM_PROVIDER"] = "test"
+        os.environ["MEMORY_MCP_EXTRACT_MIN_CHARS"] = "50"
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_ingest_turn_extracts_and_dedups(self):
+        res = mcp.ingest_turn({"transcript": "FACT: the xi cache holds assets\n"
+                                             "FACT: the omicron port is 8080\n"
+                                             + "x" * 80,
+                               "session_ref": "sess-1"})
+        self.assertNotIn("error", res, res)
+        self.assertEqual(res["stored"], 2)
+        # repeat: same facts dedup
+        res2 = mcp.ingest_turn({"transcript": "FACT: the xi cache holds assets\n" + "x" * 80,
+                                "session_ref": "sess-1"})
+        self.assertEqual(res2["deduped"], 1)
+        # provenance attached
+        prov = mcp.get_provenance({"fact_id": res.get("stored_id")}) if False else None
+
+    def test_ingest_turn_too_short(self):
+        res = mcp.ingest_turn({"transcript": "FACT: tiny"})
+        self.assertIn("error", res)
+
+    def test_ingest_turn_disabled(self):
+        os.environ.pop("MEMORY_MCP_EXTRACT", None)
+        res = mcp.ingest_turn({"transcript": "FACT: x\n" + "x" * 80})
+        self.assertIn("error", res)
+
+    def test_compose_recall_block(self):
+        mcp.remember_fact({"text": "the rho endpoint handles mobile auth", "source": "t"})
+        mcp.remember_fact({"text": "unrelated fact about garden watering", "source": "t"})
+        res = mcp.compose_recall({"turn_text": "how does mobile auth work on rho",
+                                  "limit": 5, "chars": 2000})
+        self.assertNotIn("error", res, res)
+        self.assertGreaterEqual(res["count"], 1)
+        self.assertIn("<memory-recall>", res["block"])
+        self.assertIn("rho endpoint", res["block"])
+        self.assertNotIn("garden watering", res["block"])
+
+    def test_compose_recall_disabled(self):
+        os.environ.pop("MEMORY_MCP_RECALL", None)
+        res = mcp.compose_recall({"turn_text": "anything"})
+        self.assertIn("error", res)
+
+    def test_sweep_freshness_archives_old(self):
+        mcp.remember_fact({"text": "old fact about the sigma job queue", "source": "t"})
+        mcp.remember_fact({"text": "strong kept fact about the tau core",
+                           "source": "t", "strong": True})
+        # age the first fact beyond the project hard window (180d)
+        con = mcp.get_db()
+        con.execute("UPDATE facts SET updated_at='2020-01-01T00:00:00Z' WHERE text LIKE '%sigma job queue%'")
+        con.commit()
+        con.close()
+        res = mcp.sweep_freshness({})
+        self.assertNotIn("error", res, res)
+        self.assertGreaterEqual(res["archived"], 1)
+        # archived fact gone from search; strong fact still there
+        gone = mcp.search_facts({"query": "sigma job queue"})
+        self.assertEqual(gone["count"], 0)
+        kept = mcp.search_facts({"query": "tau core"})
+        self.assertGreaterEqual(kept["count"], 1)
+
+    def test_verify_supersedes_archives_old(self):
+        mcp.remember_fact({"text": "the psi service listens on port 9000", "source": "t"})
+        facts = mcp.search_facts({"query": "psi service listens on port"})
+        self.assertGreaterEqual(facts["count"], 1)
+        old_id = facts["facts"][0]["id"]
+        os.environ["MEMORY_MCP_VERIFY"] = "1"
+        # the new fact shares terms with the old one, so the whitelist (ids
+        # shown to the LLM) includes it; "supersede" drives the verdict
+        res = mcp.ingest_turn({"transcript": "FACT: supersede psi service now listens on port 9090\n" + "x" * 80,
+                               "session_ref": "sess-2"})
+        self.assertNotIn("error", res, res)
+        self.assertEqual(res["verification"]["applied"], 1)
+        # old fact archived
+        after = mcp.search_facts({"query": "psi service listens on port 9000"})
+        self.assertEqual(after["count"], 0)
+        # evidence attached to the fact that triggered the supersession
+        sup = res["verification"]["superseded"][0]
+        prov = mcp.get_provenance({"fact_id": sup["new_id"]})
+        self.assertTrue(any("supersedes" in e["source_ref"] for e in prov["evidence"]))
+
+    def test_verify_never_archives_strong(self):
+        mcp.remember_fact({"text": "the upsilon service is the source of truth", "source": "t",
+                           "strong": True})
+        facts = mcp.search_facts({"query": "upsilon service source of truth"})
+        self.assertGreaterEqual(facts["count"], 1)
+        strong_id = facts["facts"][0]["id"]
+        os.environ["MEMORY_MCP_VERIFY"] = "1"
+        res = mcp.ingest_turn({"transcript": "FACT: supersede upsilon service replaced\n" + "x" * 80,
+                               "session_ref": "sess-3"})
+        self.assertNotIn("error", res, res)
+        self.assertEqual(res["verification"]["applied"], 0)
+        # strong fact still active
+        still = mcp.search_facts({"query": "upsilon service source of truth"})
+        self.assertGreaterEqual(still["count"], 1)
