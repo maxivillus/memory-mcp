@@ -80,6 +80,20 @@ session is visible to every later session.
   near-duplicate facts (term coverage >= 0.6) and same-subject decisions with
   divergent outcomes. Flag conflicts instead of silently overwriting.
 
+## Workspace scoping
+
+- One shared store, per-project isolation: pass `workspace=<project_id>` on
+  every read/write tool (remember_fact, search_facts, list_facts,
+  summarize_index, facts_for_session, review_pending, compose_recall,
+  find_precedents, record_decision, query_decisions, ingest_turn,
+  verify_facts, forget_fact, confirm_fact, fact_history,
+  get_provenance, fact_references, attach_evidence, detect_conflicts,
+  consolidate, export_facts, export_rdf, stats, list_sessions). Resolve it
+  from your task context (the project id of the card/issue you work on).
+- A scoped query sees YOUR project + the shared pool; an unscoped query sees
+  only the shared pool (legacy facts). `remember_fact` warns when
+  `workspace` is missing — always pass it.
+
 ## Conventions
 
 - Use consistent `project`/`domain` scopes so queries and the index stay
