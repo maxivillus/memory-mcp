@@ -12,17 +12,20 @@ metadata:
 
 # Shared Agent Memory (memory-mcp)
 
-Available to runtime agents as the `mcp__memory-mcp__*` tools (17 tools).
+Available to runtime agents as the `mcp__memory-mcp__*` tools (19 tools).
 One shared store across all runtimes: a fact or decision written in one
 session is visible to every later session.
 
-## Facts — remember_fact / search_facts / list_facts / summarize_index / forget_fact
+## Facts — remember_fact / search_facts / search_semantic / list_facts / summarize_index / forget_fact
 
 - `remember_fact {text, source?, project?, domain?, trust?, strong?}` — store a
   durable fact (upsert, dedup by sha256). Use `strong=true` for
   user-confirmed facts, `trust=high` for verified facts, default `medium`.
 - Before researching something, `search_facts` the store first — a fresh
   distinctive fact can skip heuristic research (fact gate).
+- `search_facts` with `semantic=true` merges lexical (FTS5/BM25) and embedding
+  rankings (RRF); `search_semantic` is pure embedding search — use it for
+  paraphrased or cross-language recall when embeddings are enabled.
 - `summarize_index` gives a compact freshest-first index for prompt budgets.
 - `forget_fact` soft-deletes (archives) an obsolete fact.
 
@@ -67,3 +70,4 @@ session is visible to every later session.
 - The store is a shared read-model: agents may write facts/decisions/evidence,
   but must not delete or mutate records owned by another agent without a
   strong reason.
+
