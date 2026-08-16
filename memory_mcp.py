@@ -930,6 +930,119 @@ def confirm_fact(args):
         con.close()
 
 
+def fact_references(args):
+    """Impact query for one fact: what it supersedes, what supersedes it,
+    what it was consolidated into/from, and its evidence."""
+    fid = args.get("id")
+    if fid is None:
+        return {"error": "id is required"}
+    con = get_db()
+    try:
+        fact = con.execute(
+            "SELECT id, text, source, trust, strong, importance, confirmed, "
+            "invalid_at, superseded_by, created_at, updated_at FROM facts WHERE id=?",
+            (fid,)).fetchone()
+        if not fact:
+            return {"error": "fact not found", "id": fid}
+        f = dict(fact)
+        superseded = [r["id"] for r in con.execute(
+            "SELECT id FROM facts WHERE superseded_by=? AND id!=?", (fid, fid))]
+        supersedes = f.get("superseded_by")
+        consolidated_from = [r["source_ref"] for r in con.execute(
+            "SELECT source_ref FROM evidence WHERE fact_id=? AND source_ref LIKE 'consolidated:%'",
+            (fid,))]
+        consolidated_into = [r["fact_id"] for r in con.execute(
+            "SELECT fact_id FROM evidence WHERE source_ref=? AND fact_id!=?",
+            ("consolidated:%s" % fid, fid))]
+        superseded_evidence = [r["fact_id"] for r in con.execute(
+            "SELECT fact_id FROM evidence WHERE source_ref=? AND fact_id!=?",
+            ("supersedes:%s" % fid, fid))]
+        evidence = [dict(r) for r in con.execute(
+            "SELECT source_ref, source_checksum, created_at FROM evidence WHERE fact_id=?",
+            (fid,))]
+        return {
+            "fact_id": fid, "text": f["text"][:200],
+            "incoming": {
+                "superseded_by_me": superseded,
+                "supersedes_me": supersedes,
+                "consolidated_into": consolidated_into,
+                "referenced_via_supersedes": superseded_evidence,
+            },
+            "outgoing": {
+                "supersedes": supersedes,
+                "consolidated_from": consolidated_from,
+            },
+            "evidence": evidence,
+        }
+    finally:
+        con.close()
+
+
+def export_rdf(args):
+    """W3C PROV-flavoured Turtle export: facts, entities/relations, decisions,
+    evidence, and bi-temporal supersession edges."""
+    limit = max(1, min(int(args.get("limit", 5000)), 50000))
+    con = get_db()
+    try:
+        out = []
+        out.append("@prefix prov: <http://www.w3.org/ns/prov#> .")
+        out.append("@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .")
+        out.append("@prefix mem: <https://memory-mcp.dev/vocab#> .")
+        n = 0
+        def esc(v):
+            return (str(v).replace("\\", "\\\\").replace('"', '\\"')
+                    .replace("\r", " ").replace("\n", " "))
+        def add(line):
+            out.append(line)
+        for r in con.execute("SELECT id, text, source, trust, strong, importance, confirmed, "
+                             "invalid_at, superseded_by, created_at, updated_at FROM facts ORDER BY id"):
+            f = dict(r)
+            add("mem:fact-%d a mem:Fact ;" % f["id"])
+            add("    mem:text \"%s\" ;" % esc(f["text"][:400]))
+            add("    mem:trust \"%s\" ;" % f["trust"])
+            add("    mem:importance \"%s\"^^xsd:decimal ;" % f["importance"])
+            if f["source"]:
+                add("    prov:wasGeneratedBy [ a prov:Activity ; prov:used \"%s\" ] ;" % esc(f["source"]))
+            add("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % f["created_at"])
+            if f["invalid_at"]:
+                add("mem:fact-%d prov:invalidatedAtTime \"%s\"^^xsd:dateTime ." % (f["id"], f["invalid_at"]))
+            if f["superseded_by"]:
+                add("mem:fact-%d mem:supersededBy mem:fact-%d ." % (f["id"], f["superseded_by"]))
+        for r in con.execute("SELECT id, name, type FROM entities ORDER BY id"):
+            add("mem:entity-%d a mem:Entity ; mem:name \"%s\" ; mem:type \"%s\" ."
+                % (r["id"], esc(r["name"]), esc(r["type"] or "")))
+        for r in con.execute("SELECT id, subject_id, predicate, object_id FROM relations ORDER BY id"):
+            add("mem:entity-%d mem:relatedTo mem:entity-%d ; mem:predicate \"%s\" ."
+                % (r["subject_id"], r["object_id"], esc(r["predicate"])))
+        for r in con.execute("SELECT id, category, subject, scenario, outcome, "
+                             "parent_decision_id, created_at FROM decisions ORDER BY id"):
+            add("mem:decision-%d a mem:Decision ;" % r["id"])
+            add("    mem:scenario \"%s\" ;" % esc(r["scenario"][:300]))
+            if r["subject"]:
+                add("    mem:subject \"%s\" ;" % esc(r["subject"]))
+            if r["outcome"]:
+                add("    mem:outcome \"%s\" ;" % esc(r["outcome"]))
+            if r["parent_decision_id"]:
+                add("    prov:wasDerivedFrom mem:decision-%d ;" % r["parent_decision_id"])
+            add("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % r["created_at"])
+        for r in con.execute("SELECT fact_id, source_ref, source_checksum, created_at "
+                             "FROM evidence ORDER BY fact_id"):
+            add("mem:fact-%d prov:wasDerivedFrom [ a prov:Entity ; "
+                "prov:atLocation \"%s\" ; prov:value \"%s\" ] ;"
+                % (r["fact_id"], esc(r["source_ref"]), esc(r["source_checksum"])))
+            add("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % r["created_at"])
+        # cap and cut at a triple boundary (last line ends with '.')
+        if len(out) > limit * 6:
+            out = out[:limit * 6]
+        while out and not out[-1].rstrip().endswith("."):
+            out.pop()
+        return {"format": "text/turtle", "triples": len(out), "truncated": len(out) >= limit * 6,
+                "rdf": "\n".join(out)}
+    finally:
+        con.close()
+
+
+
 def facts_for_session(args):
     """All active facts recorded from one session (source=session_ref)."""
     session_ref = (args.get("session_ref") or "").strip()
@@ -1150,6 +1263,21 @@ TOOLS = {
             "properties": {"limit": {"type": "integer", "default": 50}},
         },
     },
+    "fact_references": {
+        "description": "Impact query for one fact: supersession chain, consolidation links, evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"],
+        },
+    },
+    "export_rdf": {
+        "description": "W3C PROV-flavoured Turtle export (facts, entities/relations, decisions, evidence, supersession edges).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "default": 5000}},
+        },
+    },
     "list_facts": {
         "description": "List recent non-archived facts (optional project/domain filter).",
         "inputSchema": {
@@ -1337,6 +1465,8 @@ HANDLERS = {
     "fact_history": fact_history,
     "review_pending": review_pending,
     "confirm_fact": confirm_fact,
+    "fact_references": fact_references,
+    "export_rdf": export_rdf,
     "facts_for_session": facts_for_session,
     "list_sessions": list_sessions,
     "stats": stats,
