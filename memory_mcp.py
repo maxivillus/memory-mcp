@@ -136,6 +136,17 @@ CREATE INDEX IF NOT EXISTS evidence_fact_idx ON evidence(fact_id);
 CREATE INDEX IF NOT EXISTS decisions_parent_idx ON decisions(parent_decision_id);
 """
 
+# Optional semantic search (embeddings.py) — created here so the schema is
+# consistent even when the module is off; only filled when embeddings are on.
+_EMBED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fact_embeddings (
+  fact_id INTEGER PRIMARY KEY REFERENCES facts(id) ON DELETE CASCADE,
+  vec BLOB NOT NULL,
+  model TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+"""
+
 _STOPWORDS = {
     "the", "and", "for", "with", "that", "this", "from", "are", "was", "were",
     "has", "have", "had", "not", "but", "our", "its", "you", "your", "all",
@@ -193,10 +204,24 @@ def get_db():
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("PRAGMA foreign_keys=ON")
     con.executescript(_SCHEMA)
+    con.executescript(_EMBED_SCHEMA)
     return con
 
 
 # ---------------- tools ----------------
+
+def _emb():
+    """Lazy handle to the optional embeddings module, or None when disabled
+    (MEMORY_MCP_EMBEDDINGS != 1) or unavailable. The core server never depends
+    on it: every call site treats None as 'semantic search off'."""
+    if os.environ.get("MEMORY_MCP_EMBEDDINGS") != "1":
+        return None
+    try:
+        import embeddings
+        return embeddings
+    except ImportError:
+        return None
+
 
 def remember_fact(args):
     text = (args.get("text") or "").strip()
@@ -222,7 +247,11 @@ def remember_fact(args):
             (sha, text, args.get("source", ""), args.get("project", ""),
              args.get("domain", ""), trust, 1 if args.get("strong") else 0, ts, ts))
         con.commit()
-        return {"id": cur.lastrowid, "sha256": sha, "dedup": False,
+        fid = cur.lastrowid
+        emb = _emb()
+        if emb is not None:
+            emb.embed_fact(con, fid, text)  # best-effort, never raises
+        return {"id": fid, "sha256": sha, "dedup": False,
                 "created_at": ts, "updated_at": ts}
     finally:
         con.close()
@@ -255,17 +284,51 @@ def search_facts(args):
     params.append(limit)
     con = get_db()
     try:
-        rows = [dict(r) for r in con.execute(sql, params)]
-        return {"count": len(rows), "facts": rows}
-    except sqlite3.OperationalError:
-        # FTS5 синтаксис (дефисы/операторы) — повтор как литеральная фраза
-        phrase = '"' + query.replace('"', '""') + '"'
-        sql2 = sql.replace("facts_fts MATCH ?", "facts_fts MATCH ?", 1)
         try:
-            rows = [dict(r) for r in con.execute(sql2, [phrase] + params[1:])]
-            return {"count": len(rows), "facts": rows}
-        except sqlite3.OperationalError as e:
-            return {"error": f"query failed: {e}", "facts": []}
+            rows = [dict(r) for r in con.execute(sql, params)]
+        except sqlite3.OperationalError:
+            # FTS5 синтаксис (дефисы/операторы) — повтор как литеральная фраза
+            phrase = '"' + query.replace('"', '""') + '"'
+            rows = [dict(r) for r in con.execute(sql.replace("facts_fts MATCH ?", "facts_fts MATCH ?", 1),
+                                                 [phrase] + params[1:])]
+        emb = _emb()
+        if emb is not None and args.get("semantic"):
+            if rows:
+                return emb.hybrid_rerank(con, query, rows, limit=limit)
+            # No lexical hits: fall back to semantic ranking alone.
+            return emb.search_semantic(con, query, limit=limit)
+        return {"count": len(rows), "facts": rows}
+    except sqlite3.OperationalError as e:
+        return {"error": f"query failed: {e}", "facts": []}
+    finally:
+        con.close()
+
+
+def search_semantic(args):
+    """Semantic (embedding) search — enabled only with MEMORY_MCP_EMBEDDINGS=1."""
+    emb = _emb()
+    if emb is None:
+        return {"error": "semantic search is disabled (set MEMORY_MCP_EMBEDDINGS=1)"}
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"error": "query is required"}
+    limit = max(1, min(int(args.get("limit", 20)), 100))
+    threshold = float(args.get("threshold", 0.0))
+    con = get_db()
+    try:
+        return emb.search_semantic(con, query, limit=limit, threshold=threshold)
+    finally:
+        con.close()
+
+
+def embed_backfill(args):
+    """Compute vectors for facts that have none (backfill after enabling)."""
+    emb = _emb()
+    if emb is None:
+        return {"error": "semantic search is disabled (set MEMORY_MCP_EMBEDDINGS=1)"}
+    con = get_db()
+    try:
+        return emb.embed_backfill(con)
     finally:
         con.close()
 
@@ -686,7 +749,7 @@ TOOLS = {
         },
     },
     "search_facts": {
-        "description": "Full-text search over stored facts (FTS5, BM25 ranking).",
+        "description": "Full-text search over stored facts (FTS5, BM25 ranking). With semantic=true and MEMORY_MCP_EMBEDDINGS=1, merges lexical and embedding rankings (RRF).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -696,9 +759,26 @@ TOOLS = {
                 "strong_only": {"type": "boolean", "default": False},
                 "project": {"type": "string"},
                 "domain": {"type": "string"},
+                "semantic": {"type": "boolean", "default": False, "description": "Hybrid: RRF-merge FTS BM25 with embedding search (requires MEMORY_MCP_EMBEDDINGS=1)"},
             },
             "required": ["query"],
         },
+    },
+    "search_semantic": {
+        "description": "Semantic (embedding) search over stored facts — cosine similarity, best first. Requires MEMORY_MCP_EMBEDDINGS=1 (see embeddings.py).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 20},
+                "threshold": {"type": "number", "default": 0.0, "description": "Minimum cosine similarity"},
+            },
+            "required": ["query"],
+        },
+    },
+    "embed_backfill": {
+        "description": "Compute embeddings for facts that have none (backfill after enabling MEMORY_MCP_EMBEDDINGS=1).",
+        "inputSchema": {"type": "object", "properties": {}},
     },
     "list_facts": {
         "description": "List recent non-archived facts (optional project/domain filter).",
@@ -862,6 +942,8 @@ TOOLS = {
 HANDLERS = {
     "remember_fact": remember_fact,
     "search_facts": search_facts,
+    "search_semantic": search_semantic,
+    "embed_backfill": embed_backfill,
     "list_facts": list_facts,
     "summarize_index": summarize_index,
     "remember_entity": remember_entity,

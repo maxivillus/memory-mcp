@@ -170,3 +170,71 @@ class MemoryMCPTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class EmbeddingsTest(unittest.TestCase):
+    """Semantic search with the deterministic `test` provider (no model)."""
+
+    def setUp(self):
+        self._old = {k: os.environ.get(k) for k in
+                     ("MEMORY_MCP_EMBEDDINGS", "MEMORY_MCP_EMBED_PROVIDER")}
+        os.environ["MEMORY_MCP_EMBEDDINGS"] = "1"
+        os.environ["MEMORY_MCP_EMBED_PROVIDER"] = "test"
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def remember(self, text):
+        res = mcp.remember_fact({"text": text, "source": "test",
+                                 "project": "project", "domain": "project"})
+        self.assertNotIn("error", res, res)
+        return res
+
+    def test_semantic_search_finds_paraphrase(self):
+        self.remember("battery life on the phone is four hours")
+        self.remember("the phone lasts about four hours on a charge")
+        res = mcp.search_semantic({"query": "phone lasts four hours", "limit": 10})
+        self.assertNotIn("error", res, res)
+        self.assertGreaterEqual(res["count"], 2,
+                                "semantic search should surface both paraphrases")
+        # The two paraphrases rank on top and clearly above unrelated facts.
+        top = res["facts"][:2]
+        self.assertTrue(all(f["score"] > 0.5 for f in top),
+                        "n-gram vectors of paraphrases must be similar: %s" % res)
+        rest = res["facts"][2:]
+        self.assertTrue(not rest or all(f["score"] < 0.5 for f in rest),
+                        "unrelated facts must score well below the paraphrases: %s" % res)
+        # threshold keeps only strong matches
+        narrow = mcp.search_semantic({"query": "phone lasts four hours",
+                                      "limit": 10, "threshold": 0.5})
+        self.assertEqual(narrow["count"], 2)
+
+    def test_search_facts_hybrid(self):
+        self.remember("hybrid fact about the kappa cache")
+        res = mcp.search_facts({"query": "kappa cache", "semantic": True})
+        self.assertNotIn("error", res, res)
+        self.assertGreaterEqual(res["count"], 1)
+        self.assertIn("semantic_score", res["facts"][0])
+
+    def test_embed_backfill(self):
+        os.environ.pop("MEMORY_MCP_EMBEDDINGS", None)  # write without vectors
+        self.remember("backfill fact about the lambda queue")
+        os.environ["MEMORY_MCP_EMBEDDINGS"] = "1"  # enable before backfill
+        res = mcp.embed_backfill({})
+        self.assertNotIn("error", res, res)
+        self.assertGreaterEqual(res["processed"], 1)
+        hit = mcp.search_semantic({"query": "lambda queue", "limit": 5})
+        self.assertGreaterEqual(hit["count"], 1)
+
+    def test_disabled_returns_error(self):
+        os.environ.pop("MEMORY_MCP_EMBEDDINGS", None)
+        self.assertIn("error", mcp.search_semantic({"query": "anything"}))
+        self.assertIn("error", mcp.embed_backfill({}))
+        # hybrid flag without embeddings is a silent no-op (lexical only)
+        self.remember("plain lexical fact about the mu table")
+        res = mcp.search_facts({"query": "mu table", "semantic": True})
+        self.assertNotIn("error", res, res)
