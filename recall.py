@@ -21,7 +21,7 @@ import time
 _HARD_WINDOW_DAYS = {"reference": 45, "user": 365, "feedback": 365, "project": 180}
 _DEFAULT_HARD_WINDOW_DAYS = 180
 
-_DEFAULT_BUDGET = 2400
+_DEFAULT_BUDGET = 1400  # recommended range for per-turn recall: 1000-1500 chars
 _MIN_BUDGET = 480
 
 _OPEN = "<memory-recall>\n"

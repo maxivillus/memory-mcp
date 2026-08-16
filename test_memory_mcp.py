@@ -242,8 +242,10 @@ class EmbeddingsTest(unittest.TestCase):
 
 class AddFactAliasTest(unittest.TestCase):
     def test_add_fact_alias_stores_fact(self):
-        # add_fact is a protocol-level alias (HANDLERS), same handler as remember_fact
-        self.assertIn("add_fact", mcp.TOOLS)
+        # add_fact is a protocol-level alias (HANDLERS), same handler as
+        # remember_fact — but intentionally NOT advertised in the schema
+        # (tool-choice noise)
+        self.assertNotIn("add_fact", mcp.TOOLS)
         self.assertIn("add_fact", mcp.HANDLERS)
         res = mcp.HANDLERS["add_fact"]({"text": "alias fact about the nu cache", "source": "test"})
         self.assertNotIn("error", res, res)
@@ -646,3 +648,26 @@ class RdfAndReferencesTest(unittest.TestCase):
         bad = [ln for ln in r["rdf"].split("\n")
                if ln and not ln.startswith("@prefix") and not ln.rstrip().endswith((";", "."))]
         self.assertEqual(bad, [])
+
+
+class AuditFollowupTest(unittest.TestCase):
+    """Follow-ups: source warning, smaller recall budget."""
+
+    def test_remember_without_source_warns(self):
+        res = mcp.remember_fact({"text": "fact without source for the warning test"})
+        self.assertNotIn("error", res, res)
+        self.assertIn("warning", res)
+        self.assertIn("source", res["warning"])
+
+    def test_remember_with_source_no_warning(self):
+        res = mcp.remember_fact({"text": "fact with source for the warning test",
+                                 "source": "run-1"})
+        self.assertNotIn("error", res, res)
+        self.assertNotIn("warning", res)
+
+    def test_compose_recall_default_budget(self):
+        os.environ["MEMORY_MCP_RECALL"] = "1"
+        mcp.remember_fact({"text": "budget test fact about the tau metric", "source": "t"})
+        res = mcp.compose_recall({"turn_text": "tau metric budget"})
+        self.assertNotIn("error", res, res)
+        self.assertLessEqual(res["chars"], 1400 + 10)
