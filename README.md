@@ -106,12 +106,39 @@ resolved source/server/target are printed before writing).
 
 ## Agent skill
 
-- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 17 MCP tools:
+- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 19 MCP tools:
   when to search facts before researching, how to record decisions with
-  rationale for precedent lookup, graph/provenance/conflict usage, and shared-
-  store conventions. Compatible with the `SKILL.md` format used by agent skill
-  collections; copy it into your agent's skill directory (or point discovery
-  at this repo).
+  rationale for precedent lookup, graph/provenance/conflict usage, semantic
+  search, and shared-store conventions. Compatible with the `SKILL.md` format
+  used by agent skill collections; copy it into your agent's skill directory
+  (or point discovery at this repo).
+
+## Semantic search (optional module)
+
+`embeddings.py` adds embedding-based search without touching the stdlib-only
+core — it activates only when the server runs with `MEMORY_MCP_EMBEDDINGS=1`
+and every failure degrades to lexical-only.
+
+- **Providers** (`MEMORY_MCP_EMBED_PROVIDER`):
+  - `ollama` (default) — URL `MEMORY_MCP_EMBED_URL` (default
+    `http://localhost:11434`; in docker runtimes point at the ollama service),
+    model `MEMORY_MCP_EMBED_MODEL` (default `nomic-embed-text`; for mixed
+    RU/EN facts prefer `bge-m3`);
+  - `openai` — any OpenAI-compatible `/embeddings` endpoint
+    (`MEMORY_MCP_EMBED_URL` + optional `MEMORY_MCP_EMBED_KEY`);
+  - `fastembed` — offline ONNX (`pip install fastembed`; default model
+    `intfloat/multilingual-e5-small`);
+  - `test` — deterministic char-n-gram vectors (tests/diagnostics only).
+- **Storage**: one normalized float32 vector per fact in `fact_embeddings`;
+  computed on write (best-effort, synchronous — the write path waits at most
+  10 s for the provider; a down provider degrades to lexical-only) and
+  backfillable via `embed_backfill`.
+- **Privacy**: the configured provider receives fact texts to embed — use a
+  local/trusted provider (e.g. `ollama`) for private stores.
+- **Tools**: `search_semantic {query, limit?, threshold?}` (cosine, brute
+  force — milliseconds for a fact store of thousands of entries), and
+  `search_facts` with `semantic=true` for an RRF-merged hybrid ranking.
+- **Env**: `MEMORY_MCP_EMBEDDINGS=1` (+ `_PROVIDER`, `_URL`, `_MODEL`, `_KEY`).
 
 ## Design boundaries
 
@@ -125,8 +152,10 @@ extraction, recall tiers, fact gate):
   (`search_facts`, `summarize_index`) or by the client's own recall pipeline.
 - **Truth verification** — `trust`/`strong` are client-set metadata and query
   filters, not a verification or protection mechanism.
-- **Semantic search** — `search_facts`/`find_precedents` are lexical
-  (FTS5 + BM25), chosen for zero dependencies, portability, and offline use.
+- **Semantic search** — optional module (`embeddings.py`, gated by
+  `MEMORY_MCP_EMBEDDINGS=1`): `search_semantic` + hybrid `search_facts
+  semantic=true` (RRF merge). The core stays lexical (FTS5 + BM25) with zero
+  dependencies; embeddings add a provider dependency only when enabled.
   `find_precedents` OR-joins terms on purpose: precedent lookup is about
   similarity, and BM25 ranks partially matching decisions.
 - **Near-duplicate handling** — writes dedup on exact text (sha256).

@@ -23,6 +23,10 @@ services:
     environment:
       MEMORY_MCP_CMD: /opt/memory-mcp/memory_mcp.py
       MEMORY_MCP_DB: /opt/memory-shared/facts.db
+      # optional semantic search: enable + point at an embeddings provider
+      MEMORY_MCP_EMBEDDINGS: "1"
+      MEMORY_MCP_EMBED_PROVIDER: ollama
+      MEMORY_MCP_EMBED_URL: http://ollama:11434
       # reasonix runtimes: read+write the shared store (dual-write/dual-read)
       REASONIX_MEMORY_MCP: "1"
 ```
