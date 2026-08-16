@@ -83,6 +83,12 @@ CREATE TABLE IF NOT EXISTS fact_embeddings (
   model TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS decision_embeddings (
+  decision_id INTEGER PRIMARY KEY REFERENCES decisions(id) ON DELETE CASCADE,
+  vec BLOB NOT NULL,
+  model TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 
@@ -236,6 +242,48 @@ def embed_fact(con, fact_id, text):
         _store(con, fact_id, vec, model_name())
     except Exception:
         pass
+
+
+def embed_decision(con, decision_id, text):
+    """Best-effort: store the decision's vector (scenario + reasoning)."""
+    try:
+        vec = embed([text])[0]
+        _store_decision(con, decision_id, vec, model_name())
+    except Exception:
+        pass
+
+
+def _store_decision(con, decision_id, vec, model):
+    ts = _now()
+    con.execute(
+        "INSERT INTO decision_embeddings (decision_id, vec, model, updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(decision_id) DO UPDATE SET vec=excluded.vec, model=excluded.model, updated_at=excluded.updated_at",
+        (decision_id, _pack(vec), model, ts))
+    con.commit()
+
+
+def search_decision_semantic(con, query, limit=10, threshold=0.0):
+    """Brute-force cosine over stored decision vectors, best first."""
+    qvec = _normalize(embed([query])[0])
+    rows = con.execute(
+        "SELECT d.id, d.category, d.subject, d.scenario, d.reasoning, d.outcome, "
+        "d.confidence, d.decision_maker, d.issue_ref, d.created_at, e.vec "
+        "FROM decision_embeddings e JOIN decisions d ON d.id=e.decision_id").fetchall()
+    scored = []
+    for r in rows:
+        score = _dot(qvec, r["vec"])
+        if score < threshold:
+            continue
+        scored.append((score, r))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out = []
+    for score, r in scored[:limit]:
+        d = {k: r[k] for k in ("id", "category", "subject", "scenario", "reasoning",
+                               "outcome", "confidence", "decision_maker", "issue_ref",
+                               "created_at")}
+        d["score"] = round(float(score), 4)
+        out.append(d)
+    return {"count": len(out), "model": model_name(), "precedents": out}
 
 
 def embed_backfill(con):

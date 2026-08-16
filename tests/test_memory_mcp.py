@@ -563,3 +563,51 @@ class ConsolidateSessionsGraphTest(unittest.TestCase):
         self.assertNotIn("error", res, res)
         self.assertGreaterEqual(res["graph"], 1)
         self.assertIn("payments-db", res["block"])
+
+
+class SearchGraphAndSemanticPrecedentsTest(unittest.TestCase):
+    """graph=true in search_facts; semantic find_precedents."""
+
+    def setUp(self):
+        self._old = {k: os.environ.get(k) for k in
+                     ("MEMORY_MCP_EMBEDDINGS", "MEMORY_MCP_EMBED_PROVIDER")}
+        os.environ["MEMORY_MCP_EMBEDDINGS"] = "1"
+        os.environ["MEMORY_MCP_EMBED_PROVIDER"] = "test"
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_search_facts_graph_expansion(self):
+        mcp.remember_entity({"name": "orders-svc2", "type": "service"})
+        mcp.remember_entity({"name": "payments-db2", "type": "database"})
+        mcp.remember_relation({"subject": "orders-svc2", "predicate": "uses",
+                               "object": "payments-db2"})
+        mcp.remember_fact({"text": "the orders-svc2 service handles orders", "source": "t"})
+        mcp.remember_fact({"text": "the payments-db2 stores payment records", "source": "t"})
+        plain = mcp.search_facts({"query": "orders svc2"})
+        self.assertEqual(plain["count"], 1)  # graph-only fact NOT found lexically
+        with_graph = mcp.search_facts({"query": "orders svc2", "graph": True})
+        self.assertGreaterEqual(with_graph["count"], 2)
+        self.assertGreaterEqual(with_graph["graph"], 1)
+        self.assertTrue(any("payments-db2" in f["text"] for f in with_graph["facts"]))
+
+    def test_find_precedents_semantic(self):
+        mcp.record_decision({"category": "infra", "subject": "proxy",
+                             "scenario": "need an HTTP proxy for the cli tool",
+                             "reasoning": "CONNECT support", "outcome": "privoxy"})
+        # query with different wording — test provider's n-gram vectors share
+        # enough 3-grams with the scenario
+        res = mcp.find_precedents({"scenario": "choosing a proxy for command line",
+                                   "limit": 5, "semantic": True})
+        self.assertNotIn("error", res, res)
+        self.assertTrue(res["semantic"])
+        self.assertGreaterEqual(res["count"], 1)
+        # RRF surface: semantic-only matches appear
+        plain = mcp.find_precedents({"scenario": "choosing a proxy for command line", "limit": 5})
+        sem = mcp.find_precedents({"scenario": "choosing a proxy for command line",
+                                   "limit": 5, "semantic": True})
+        self.assertGreaterEqual(sem["count"], plain["count"])

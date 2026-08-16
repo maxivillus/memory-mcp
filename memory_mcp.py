@@ -247,6 +247,42 @@ def _emb():
         return None
 
 
+def _graph_expand_facts(con, hit_facts, limit=10):
+    """Entity-graph expansion: entities mentioned in the hit facts -> graph
+    neighbors -> facts mentioning the neighbors. Returns dict rows (id/text/...).
+    Shared by search_facts {graph=true} and compose_recall {graph=true}."""
+    rows = con.execute("SELECT name FROM entities WHERE length(name) >= 3").fetchall()
+    names = [r["name"] for r in rows]
+    mentioned = set()
+    for f in hit_facts:
+        low = (f.get("text") or "").lower()
+        for n in names:
+            if n.lower() in low:
+                mentioned.add(n)
+    neighbors = set()
+    for n in list(mentioned)[:8]:
+        for r in con.execute(
+            "SELECT o.name AS nb FROM relations r JOIN entities s ON s.id=r.subject_id "
+            "JOIN entities o ON o.id=r.object_id WHERE s.name=? "
+            "UNION SELECT s.name FROM relations r JOIN entities s ON s.id=r.subject_id "
+            "JOIN entities o ON o.id=r.object_id WHERE o.name=?", (n, n)):
+            neighbors.add(r["nb"])
+    out, seen = [], {f["id"] for f in hit_facts}
+    for nb in list(neighbors)[:12]:
+        esc = nb.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = con.execute(
+            "SELECT id, text, source, project, domain, trust, strong, importance, confirmed "
+            "FROM facts WHERE text LIKE ? ESCAPE '\\' AND archived=0 AND invalid_at='' LIMIT 5",
+            ("%" + esc + "%",)).fetchall()
+        for r in rows:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                out.append(dict(r))
+                if len(out) >= limit:
+                    return out
+    return out
+
+
 def _importance(args):
     """Clamp the importance argument to [0,1]; default 0.5."""
     try:
@@ -390,13 +426,28 @@ def search_facts(args):
             phrase = '"' + query.replace('"', '""') + '"'
             rows = [dict(r) for r in con.execute(sql.replace("facts_fts MATCH ?", "facts_fts MATCH ?", 1),
                                                  [phrase] + params[1:])]
+        graph = []
+        if args.get("graph") and rows:
+            graph = _graph_expand_facts(con, rows, limit * 2)
+            if graph:
+                k = 60
+                merged = {f["id"]: 1.0 / (k + i + 1) for i, f in enumerate(rows)}
+                for i, f in enumerate(graph):
+                    merged[f["id"]] = merged.get(f["id"], 0.0) + 1.0 / (k + i + 1)
+                ranked = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:limit]
+                by_id = {f["id"]: f for f in rows}
+                by_id.update({f["id"]: f for f in graph})
+                rows = [dict(by_id[fid], graph_rank=round(score, 4)) for fid, score in ranked]
         emb = _emb()
         if emb is not None and args.get("semantic"):
             if rows:
                 return emb.hybrid_rerank(con, query, rows, limit=limit)
             # No lexical hits: fall back to semantic ranking alone.
             return emb.search_semantic(con, query, limit=limit)
-        return {"count": len(rows), "facts": rows}
+        result = {"count": len(rows), "facts": rows}
+        if args.get("graph"):
+            result["graph"] = len(graph)
+        return result
     except sqlite3.OperationalError as e:
         return {"error": f"query failed: {e}", "facts": []}
     finally:
@@ -667,15 +718,32 @@ def find_precedents(args):
     params.append(limit)
     con = get_db()
     try:
-        rows = [dict(r) for r in con.execute(sql, params)]
-        return {"count": len(rows), "precedents": rows}
-    except sqlite3.OperationalError:
-        phrase = '"' + query.replace('"', '""') + '"'
         try:
+            rows = [dict(r) for r in con.execute(sql, params)]
+        except sqlite3.OperationalError:
+            phrase = '"' + query.replace('"', '""') + '"'
             rows = [dict(r) for r in con.execute(sql, [phrase] + params[1:])]
-            return {"count": len(rows), "precedents": rows}
-        except sqlite3.OperationalError as e:
-            return {"error": f"query failed: {e}", "count": 0, "precedents": []}
+        if args.get("semantic"):
+            emb = _emb()
+            if emb is not None:
+                try:
+                    sem = emb.search_decision_semantic(con, scenario, limit=limit * 2)
+                    sem_rows = sem.get("precedents", [])
+                    if sem_rows:
+                        k = 60
+                        merged = {r["id"]: 1.0 / (k + i + 1) for i, r in enumerate(rows)}
+                        for i, r in enumerate(sem_rows):
+                            merged[r["id"]] = merged.get(r["id"], 0.0) + 1.0 / (k + i + 1)
+                        ranked = sorted(merged.items(), key=lambda x: x[1], reverse=True)[:limit]
+                        by_id = {r["id"]: r for r in rows}
+                        by_id.update({r["id"]: r for r in sem_rows})
+                        rows = [dict(by_id[fid], semantic_score=round(score, 4))
+                                for fid, score in ranked]
+                except Exception:
+                    pass
+        return {"count": len(rows), "precedents": rows, "semantic": bool(args.get("semantic"))}
+    except sqlite3.OperationalError as e:
+        return {"error": f"query failed: {e}", "count": 0, "precedents": []}
     finally:
         con.close()
 
@@ -972,6 +1040,7 @@ TOOLS = {
                 "domain": {"type": "string"},
                 "semantic": {"type": "boolean", "default": False, "description": "Hybrid: RRF-merge FTS BM25 with embedding search (requires MEMORY_MCP_EMBEDDINGS=1)"},
                 "valid_at": {"type": "string", "description": "RFC3339: include facts that were still valid at that time (bi-temporal)"},
+                "graph": {"type": "boolean", "default": False, "description": "RRF-merge entity-graph expansion"},
             },
             "required": ["query"],
         },
@@ -1176,13 +1245,14 @@ TOOLS = {
         },
     },
     "find_precedents": {
-        "description": "Semantic precedent lookup: FTS BM25 over decision scenario/reasoning (terms OR-joined; optional category filter).",
+        "description": "Semantic precedent lookup: FTS BM25 over decision scenario/reasoning (terms OR-joined; optional category filter; semantic=true adds embedding RRF when MEMORY_MCP_EMBEDDINGS=1).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "scenario": {"type": "string"},
                 "category": {"type": "string"},
                 "limit": {"type": "integer", "default": 10},
+                "semantic": {"type": "boolean", "default": False},
             },
             "required": ["scenario"],
         },
