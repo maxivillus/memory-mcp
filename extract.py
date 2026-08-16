@@ -22,7 +22,7 @@ import llm
 
 PROMPT = """You extract durable facts from a conversation transcript for an
 agent memory store. Return ONLY JSON matching this schema:
-{"facts": [{"text": "...", "type": "user|feedback|project|reference", "trust": "high|medium|low", "strong": false, "scope": "project|global"}]}
+{"facts": [{"text": "...", "type": "user|feedback|project|reference", "trust": "high|medium|low", "strong": false, "scope": "project|global", "importance": 0.5}]}
 Rules:
 - text: one self-contained fact, present tense, no fluff, max ~200 words.
   Write the fact in the language the conversation is held in (the user's
@@ -33,6 +33,8 @@ Rules:
 - trust: high only for explicitly confirmed facts; medium default; low for
   unverified claims.
 - strong: true only for user-confirmed critical facts.
+- importance: 0..1 — how valuable this fact is for future work (1 = likely
+  needed again soon, 0 = barely worth keeping). Default 0.5.
 - scope: global only when the fact applies to every project.
 - Skip small talk, greetings, and transient details."""
 
@@ -44,12 +46,15 @@ def _min_chars():
         return 800
 
 
-def _remember(text, source, project, domain):
+def _remember(text, source, project, domain, importance=None):
     """Store one fact via the core server's remember_fact (lazy import — the
     core imports this module, so the import must happen at call time)."""
     from memory_mcp import remember_fact
-    return remember_fact({"text": text, "source": source or "ingest_turn",
-                          "project": project or "", "domain": domain or "project"})
+    args = {"text": text, "source": source or "ingest_turn",
+            "project": project or "", "domain": domain or "project"}
+    if importance is not None:
+        args["importance"] = importance
+    return remember_fact(args)
 
 
 def _attach(fact_id, source_ref):
@@ -95,7 +100,7 @@ def ingest_turn(args):
         if not text:
             continue
         try:
-            res = _remember(text, session_ref, project, domain)
+            res = _remember(text, session_ref, project, domain, importance=f.get("importance"))
             if res.get("dedup"):
                 deduped += 1
             else:

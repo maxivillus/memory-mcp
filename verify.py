@@ -18,13 +18,35 @@ import os
 
 import llm
 
+
+def _invalidate(old_id, new_id):
+    """Bi-temporal invalidation: the old fact keeps its history but stops
+    matching active searches (invalid_at set, superseded_by linked)."""
+    if old_id == new_id:
+        return False  # never self-invalidate
+    from memory_mcp import get_db
+    from datetime import datetime, timezone
+    con = get_db()
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        con.execute("UPDATE facts SET invalid_at=?, superseded_by=?, updated_at=? WHERE id=?",
+                    (ts, new_id, ts, old_id))
+        con.commit()
+        return True
+    finally:
+        con.close()
+
 PROMPT = """You verify a new memory fact against existing stored facts. The
 new fact may update or contradict older ones. Return ONLY JSON matching:
-{"verdict": "consistent" | "supersedes" | "conflict",
- "conflicts": [{"id": <int>, "reason": "<short why>"}],
- "confidence": <0..1>}
+{"action": "add" | "update" | "supersedes" | "delete" | "noop",
+ "target_id": <int or null>, "reason": "<short why>", "confidence": <0..1>}
+- add: the fact is new and consistent — store it (default).
+- update: the new fact refines/extends an OLD fact (same subject, more detail).
 - supersedes: the new fact makes an OLD fact obsolete (same subject, newer truth).
-- conflict: the new fact contradicts an old one but does not replace it.
+- delete: the new fact proves an OLD fact wrong.
+- conflict: the new fact contradicts an old one without replacing it — report
+  as action=noop with reason=conflict.
+- target_id: the old fact id, when the action targets one.
 - confidence: how sure you are; below-threshold verdicts are not applied.
 Stored facts:"""
 
@@ -53,18 +75,20 @@ def _candidates(text, limit=8):
         con = get_db()
         try:
             rows = con.execute(
-                "SELECT id, text FROM facts WHERE archived=0 ORDER BY updated_at DESC LIMIT ?",
+                "SELECT id, text FROM facts WHERE archived=0 AND invalid_at='' "
+                "ORDER BY updated_at DESC LIMIT ?",
                 (limit,)).fetchall()
         finally:
             con.close()
-    # strong flag rides along so the invalidation hook can protect user-confirmed facts
+    # strong/confirmed flags ride along so the invalidation hook can protect
+    # user-confirmed facts
     con = get_db()
     try:
-        strong_ids = {r["id"] for r in con.execute(
-            "SELECT id FROM facts WHERE strong=1 AND archived=0")}
+        protected_ids = {r["id"] for r in con.execute(
+            "SELECT id FROM facts WHERE (strong=1 OR confirmed=1) AND archived=0")}
     finally:
         con.close()
-    return [{"id": r["id"], "text": r["text"], "strong": r["id"] in strong_ids} for r in rows]
+    return [{"id": r["id"], "text": r["text"], "strong": r["id"] in protected_ids} for r in rows]
 
 
 def _llm_verdict(text, candidates):
@@ -95,7 +119,8 @@ def check_new_facts(new_facts):
     threshold = _min_confidence()
     summary = {"checked": 0, "superseded": [], "conflicts": [], "applied": 0, "skipped_low_conf": 0}
     for nf in new_facts:
-        candidates = _candidates(nf["text"])
+        # the fact under test is excluded from the candidates it can target
+        candidates = [c for c in _candidates(nf["text"]) if c["id"] != nf["id"]]
         if not candidates:
             continue
         try:
@@ -103,33 +128,34 @@ def check_new_facts(new_facts):
         except Exception:
             continue
         summary["checked"] += 1
-        if verdict.get("verdict") not in ("supersedes", "conflict"):
+        action = verdict.get("action") or "add"
+        if action == "noop":
+            if verdict.get("reason") == "conflict":
+                summary["conflicts"].append({"new_id": nf["id"], "reason": "conflict"})
+            continue
+        if action == "add":
             continue
         confidence = float(verdict.get("confidence", 0.0))
         if confidence < threshold:
             summary["skipped_low_conf"] += 1
             continue
-        candidate_ids = {c["id"] for c in candidates}
-        for c in verdict.get("conflicts", []):
-            cid = c.get("id")
-            # Only ids shown to the LLM may be acted on (prompt-injection
-            # guard: a poisoned transcript must not steer archiving of facts
-            # that were never part of the verification context).
-            if cid not in candidate_ids:
-                continue
-            target = next((x for x in candidates if x["id"] == cid), None)
-            if target is None or target.get("strong"):
-                # strong (user-confirmed) facts are never auto-archived
-                summary["conflicts"].append({"old_id": cid, "new_id": nf["id"],
-                                             "reason": c.get("reason", "") + " (strong fact, not archived)"})
-                continue
-            if verdict["verdict"] == "supersedes":
-                forget_fact({"id": cid})  # archive the old fact
-                attach_evidence({"fact_id": nf["id"], "source_ref": "supersedes:%s" % cid})
-                summary["superseded"].append({"old_id": cid, "new_id": nf["id"],
-                                              "reason": c.get("reason", "")})
-                summary["applied"] += 1
-            else:
-                summary["conflicts"].append({"old_id": cid, "new_id": nf["id"],
-                                             "reason": c.get("reason", "")})
+        cid = verdict.get("target_id")
+        # Only ids shown to the LLM may be acted on (prompt-injection guard:
+        # a poisoned transcript must not steer invalidation of facts that were
+        # never part of the verification context). The fact under test itself
+        # is never a valid target (models sometimes pick it).
+        if cid not in {c["id"] for c in candidates} or cid == nf["id"]:
+            continue
+        target = next((x for x in candidates if x["id"] == cid), None)
+        if target is None or target.get("strong"):
+            # strong/human-confirmed facts are never auto-invalidated
+            summary["conflicts"].append({"old_id": cid, "new_id": nf["id"],
+                                         "reason": verdict.get("reason", "") + " (strong/confirmed fact, not invalidated)"})
+            continue
+        if _invalidate(cid, nf["id"]):
+            summary["applied"] += 1
+            bucket = "superseded" if action in ("supersedes", "update") else "deleted"
+            summary.setdefault(bucket, []).append(
+                {"old_id": cid, "new_id": nf["id"], "reason": verdict.get("reason", "")})
+            attach_evidence({"fact_id": nf["id"], "source_ref": "%s:%s" % (action, cid)})
     return summary

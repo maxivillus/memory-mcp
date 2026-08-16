@@ -108,7 +108,7 @@ resolved source/server/target are printed before writing).
 
 ## Agent skill
 
-- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 24 MCP tools:
+- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 27 MCP tools:
   when to search facts before researching, how to record decisions with
   rationale for precedent lookup, graph/provenance/conflict usage, semantic
   search, and shared-store conventions. Compatible with the `SKILL.md` format
@@ -193,6 +193,26 @@ activate only when set, and every failure degrades to store-only.
 - **LLM provider** (shared by extract/verify): `MEMORY_MCP_LLM_PROVIDER`
   (ollama|openai|test), `_URL`, `_MODEL` (ollama default qwen2.5:14b), `_KEY`,
   `_TIMEOUT` (default 60s).
+
+## Memory quality (v0.4): bi-temporal validity, importance, confirmation
+
+- **Bi-temporal validity** — superseded facts are not deleted or archived:
+  `invalid_at` + `superseded_by` keep them queryable with
+  `search_facts {valid_at}` (what was true at time T) and `fact_history {id}`
+  (the version chain, oldest first). Default searches exclude invalidated
+  facts.
+- **Importance** — `remember_fact {importance 0..1}` (extraction assigns it
+  too). Retention (`sweep_freshness`) archives facts past their type window
+  only when they are low-importance; strong and human-confirmed facts are
+  never auto-archived.
+- **Human confirmation** — `review_pending` lists active unconfirmed facts
+  (importance-first); `confirm_fact` marks one as human-verified
+  (confirmed=1, trust=high). Confirmed facts ride the authoritative tier of
+  `compose_recall`.
+- **Update taxonomy** — verification (`verify.py`) decides
+  add/update/supersedes/delete/noop per ingested fact; supersedes/update
+  invalidate the old fact bi-temporally (never archive, never touch strong
+  facts, ids whitelisted to the verification context).
 
 ## Deploying in a docker runtime
 

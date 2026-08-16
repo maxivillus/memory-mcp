@@ -141,13 +141,16 @@ def _hard_window_days(ftype):
 
 
 def sweep_freshness(args):
-    """Archive facts older than their type's hard window (strong facts kept)."""
+    """Archive facts older than their type's hard window. Retention policy
+    (claude-mem-style): past the window, only low-importance facts are
+    archived; anything 3x past the window goes regardless. Strong and
+    human-confirmed facts are never auto-archived."""
     from memory_mcp import get_db
     con = get_db()
     try:
         rows = con.execute(
-            "SELECT id, text, domain, strong, updated_at FROM facts WHERE archived=0").fetchall()
-        now = time.time()
+            "SELECT id, text, domain, strong, confirmed, importance, updated_at "
+            "FROM facts WHERE archived=0 AND invalid_at=''").fetchall()
         archived, kept = [], []
         for r in rows:
             try:
@@ -158,7 +161,9 @@ def sweep_freshness(args):
                 kept.append(r["id"])
                 continue
             hard = _hard_window_days(r["domain"] or "project")
-            if age_days > hard and not r["strong"]:
+            importance = float(r["importance"] or 0.5)
+            if age_days > hard and not r["strong"] and not r["confirmed"] and \
+               (importance < 0.4 or (age_days > hard * 3 and importance < 0.7)):
                 con.execute("UPDATE facts SET archived=1, updated_at=? WHERE id=?",
                             (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), r["id"]))
                 archived.append(r["id"])

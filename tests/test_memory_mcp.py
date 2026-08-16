@@ -329,7 +329,7 @@ class PipelineTest(unittest.TestCase):
         kept = mcp.search_facts({"query": "tau core"})
         self.assertGreaterEqual(kept["count"], 1)
 
-    def test_verify_supersedes_archives_old(self):
+    def test_verify_supersedes_invalidates_old(self):
         mcp.remember_fact({"text": "the psi service listens on port 9000", "source": "t"})
         facts = mcp.search_facts({"query": "psi service listens on port"})
         self.assertGreaterEqual(facts["count"], 1)
@@ -341,9 +341,14 @@ class PipelineTest(unittest.TestCase):
                                "session_ref": "sess-2"})
         self.assertNotIn("error", res, res)
         self.assertEqual(res["verification"]["applied"], 1)
-        # old fact archived
+        # bi-temporal: old fact invalidated (excluded from active search)...
         after = mcp.search_facts({"query": "psi service listens on port 9000"})
         self.assertEqual(after["count"], 0)
+        # ...but its history survives
+        hist = mcp.fact_history({"id": old_id})
+        self.assertEqual(hist["count"], 2)
+        self.assertEqual(hist["chain"][0]["id"], old_id)
+        self.assertNotEqual(hist["chain"][0]["invalid_at"], "")
         # evidence attached to the fact that triggered the supersession
         sup = res["verification"]["superseded"][0]
         prov = mcp.get_provenance({"fact_id": sup["new_id"]})
@@ -363,3 +368,110 @@ class PipelineTest(unittest.TestCase):
         # strong fact still active
         still = mcp.search_facts({"query": "upsilon service source of truth"})
         self.assertGreaterEqual(still["count"], 1)
+
+
+class TemporalAndReviewTest(unittest.TestCase):
+    """Bi-temporal validity, importance, retention, and human confirmation."""
+
+    def test_migration_adds_columns(self):
+        import sqlite3, tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        con = sqlite3.connect(tmp.name)
+        con.execute("""CREATE TABLE facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sha256 TEXT NOT NULL UNIQUE, text TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '', project TEXT NOT NULL DEFAULT '',
+            domain TEXT NOT NULL DEFAULT '', trust TEXT NOT NULL DEFAULT 'medium',
+            strong INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0)""")
+        con.commit(); con.close()
+        con = sqlite3.connect(tmp.name)
+        con.row_factory = sqlite3.Row
+        mcp._migrate_facts(con)  # DB_PATH is captured at import; test the migrator directly
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
+        con.close(); os.unlink(tmp.name)
+        self.assertTrue({"importance", "invalid_at", "superseded_by", "confirmed"} <= cols)
+
+    def test_remember_importance(self):
+        res = mcp.remember_fact({"text": "important fact about the chi cache",
+                                 "source": "t", "importance": 0.9})
+        self.assertNotIn("error", res, res)
+        facts = mcp.search_facts({"query": "chi cache important"})
+        self.assertGreaterEqual(facts["count"], 1)
+        self.assertEqual(facts["facts"][0]["importance"], 0.9)
+
+    def test_search_valid_at(self):
+        mcp.remember_fact({"text": "the omega endpoint used to be on port 7000",
+                           "source": "t"})
+        old = mcp.search_facts({"query": "omega endpoint port 7000"})
+        self.assertGreaterEqual(old["count"], 1)
+        old_id = old["facts"][0]["id"]
+        # invalidate directly (as verify would)
+        mcp.get_db().execute(
+            "UPDATE facts SET invalid_at='2026-08-01T00:00:00Z', superseded_by=999999 WHERE id=?",
+            (old_id,)).connection.commit()
+        # excluded by default
+        self.assertEqual(mcp.search_facts({"query": "omega endpoint port 7000"})["count"], 0)
+        # included with valid_at before invalidation
+        past = mcp.search_facts({"query": "omega endpoint port 7000",
+                                 "valid_at": "2026-07-01T00:00:00Z"})
+        self.assertGreaterEqual(past["count"], 1)
+
+    def test_fact_history_chain(self):
+        mcp.remember_fact({"text": "the kappa flag was renamed", "source": "t"})
+        f1 = mcp.search_facts({"query": "kappa flag renamed"})["facts"][0]
+        mcp.remember_fact({"text": "the kappa flag was renamed again", "source": "t"})
+        f2 = mcp.search_facts({"query": "kappa flag renamed again"})["facts"][0]
+        mcp.get_db().execute(
+            "UPDATE facts SET invalid_at='2026-08-15T00:00:00Z', superseded_by=? WHERE id=?",
+            (f2["id"], f1["id"])).connection.commit()
+        hist = mcp.fact_history({"id": f1["id"]})
+        self.assertEqual(hist["count"], 2)
+        self.assertEqual([x["id"] for x in hist["chain"]], [f1["id"], f2["id"]])
+
+    def test_review_pending_and_confirm(self):
+        mcp.remember_fact({"text": "unconfirmed fact about the lambda metric", "source": "t"})
+        mcp.remember_fact({"text": "confirmed fact about the mu store", "source": "t",
+                           "trust": "high"})
+        rp = mcp.review_pending({"limit": 100})
+        self.assertNotIn("error", rp, rp)
+        matches = [f for f in rp["facts"] if "lambda metric" in f["text"]]
+        if not matches:
+            self.fail("review_pending should include the unconfirmed fact (facts=%s)" % rp["facts"][:3])
+        target = matches[0]
+        self.assertEqual(target["confirmed"], 0)
+        cf = mcp.confirm_fact({"id": target["id"]})
+        self.assertEqual(cf["confirmed"], True)
+        rp2 = mcp.review_pending({"limit": 100})
+        self.assertFalse(any(f["id"] == target["id"] for f in rp2["facts"]))
+
+    def test_sweep_retention_keeps_important(self):
+        os.environ["MEMORY_MCP_RECALL"] = "1"
+        # old + high importance -> kept; old + low importance -> archived
+        mcp.remember_fact({"text": "old important fact about the xi queue",
+                           "source": "t", "importance": 0.9})
+        mcp.remember_fact({"text": "old unimportant fact about the omicron queue",
+                           "source": "t", "importance": 0.1})
+        con = mcp.get_db()
+        con.execute("UPDATE facts SET updated_at='2020-01-01T00:00:00Z' "
+                    "WHERE text LIKE '%queue%'")
+        con.commit(); con.close()
+        res = mcp.sweep_freshness({})
+        self.assertNotIn("error", res, res)
+        self.assertGreaterEqual(res["archived"], 1)
+        kept = mcp.search_facts({"query": "xi queue important"})
+        self.assertGreaterEqual(kept["count"], 1)
+
+    def test_extract_importance(self):
+        os.environ["MEMORY_MCP_EXTRACT"] = "1"
+        os.environ["MEMORY_MCP_LLM_PROVIDER"] = "test"
+        os.environ["MEMORY_MCP_EXTRACT_MIN_CHARS"] = "50"
+        # test provider emits importance=0.7 for every fact
+        res = mcp.ingest_turn({"transcript": "FACT: the eta cache holds logs\n" + "x" * 80,
+                               "session_ref": "imp"})
+        self.assertNotIn("error", res, res)
+        facts = mcp.search_facts({"query": "eta cache holds logs"})
+        self.assertGreaterEqual(facts["count"], 1)
+        self.assertEqual(facts["facts"][0]["importance"], 0.7)

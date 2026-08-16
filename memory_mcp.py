@@ -44,6 +44,15 @@ def default_db_path():
 DB_PATH = os.environ.get("MEMORY_MCP_DB") or default_db_path()
 VALID_TRUST = ("high", "medium", "low")
 
+# v0.4 (2026-08-16): bi-temporal validity + importance + human confirmation.
+# Additive columns — _migrate() adds them to existing databases.
+_FACT_EXTRA_COLUMNS = {
+    "importance": "REAL NOT NULL DEFAULT 0.5",
+    "invalid_at": "TEXT NOT NULL DEFAULT ''",
+    "superseded_by": "INTEGER",
+    "confirmed": "INTEGER NOT NULL DEFAULT 0",
+}
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,6 +63,10 @@ CREATE TABLE IF NOT EXISTS facts (
   domain TEXT NOT NULL DEFAULT '',
   trust TEXT NOT NULL DEFAULT 'medium' CHECK (trust IN ('high','medium','low')),
   strong INTEGER NOT NULL DEFAULT 0,
+  importance REAL NOT NULL DEFAULT 0.5,
+  invalid_at TEXT NOT NULL DEFAULT '',
+  superseded_by INTEGER,
+  confirmed INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   archived INTEGER NOT NULL DEFAULT 0
@@ -205,7 +218,18 @@ def get_db():
     con.execute("PRAGMA foreign_keys=ON")
     con.executescript(_SCHEMA)
     con.executescript(_EMBED_SCHEMA)
+    _migrate_facts(con)
     return con
+
+
+def _migrate_facts(con):
+    """Additive migration for databases created before v0.4: bring the facts
+    table up to the current columns without touching existing rows."""
+    existing = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
+    for name, decl in _FACT_EXTRA_COLUMNS.items():
+        if name not in existing:
+            con.execute("ALTER TABLE facts ADD COLUMN %s %s" % (name, decl))
+    con.commit()
 
 
 # ---------------- tools ----------------
@@ -221,6 +245,14 @@ def _emb():
         return embeddings
     except ImportError:
         return None
+
+
+def _importance(args):
+    """Clamp the importance argument to [0,1]; default 0.5."""
+    try:
+        return max(0.0, min(1.0, float(args.get("importance", 0.5))))
+    except (TypeError, ValueError):
+        return 0.5
 
 
 def _mod(name, env):
@@ -273,6 +305,7 @@ def remember_fact(args):
     trust = args.get("trust", "medium")
     if trust not in VALID_TRUST:
         return {"error": f"trust must be one of {VALID_TRUST}"}
+    importance = _importance(args)
     sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     ts = now()
     con = get_db()
@@ -280,15 +313,24 @@ def remember_fact(args):
         cur = con.execute("SELECT id, created_at FROM facts WHERE sha256=?", (sha,))
         row = cur.fetchone()
         if row:
-            con.execute("UPDATE facts SET updated_at=?, archived=0 WHERE id=?", (ts, row["id"]))
+            # Re-remembering resurrects an archived/invalidated fact and can
+            # refresh its importance.
+            sets = ["updated_at=?", "archived=0", "invalid_at=''", "superseded_by=NULL"]
+            params = [ts]
+            if "importance" in args:
+                sets.append("importance=?")
+                params.append(importance)
+            con.execute("UPDATE facts SET %s WHERE id=?" % ", ".join(sets),
+                        params + [row["id"]])
             con.commit()
             return {"id": row["id"], "sha256": sha, "dedup": True,
                     "created_at": row["created_at"], "updated_at": ts}
         cur = con.execute(
-            "INSERT INTO facts (sha256, text, source, project, domain, trust, strong, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO facts (sha256, text, source, project, domain, trust, strong, importance, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (sha, text, args.get("source", ""), args.get("project", ""),
-             args.get("domain", ""), trust, 1 if args.get("strong") else 0, ts, ts))
+             args.get("domain", ""), trust, 1 if args.get("strong") else 0,
+             importance, ts, ts))
         con.commit()
         fid = cur.lastrowid
         emb = _emb()
@@ -306,10 +348,17 @@ def search_facts(args):
         return {"error": "query is required"}
     limit = max(1, min(int(args.get("limit", 20)), 100))
     sql = ("SELECT f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong, "
-           "f.created_at, bm25(facts_fts) AS rank "
+           "f.importance, f.confirmed, f.invalid_at, f.created_at, "
+           "bm25(facts_fts) AS rank "
            "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
            "WHERE facts_fts MATCH ? AND f.archived=0")
     params = [query]
+    if args.get("valid_at"):
+        # bi-temporal: also include facts that were still valid at that time
+        sql += " AND (f.invalid_at='' OR f.invalid_at >= ?)"
+        params.append(args["valid_at"])
+    else:
+        sql += " AND f.invalid_at=''"
     if args.get("trust_min"):
         order = {"high": 0, "medium": 1, "low": 2}
         allowed = [t for t in VALID_TRUST if order[t] <= order[args["trust_min"]]]
@@ -378,7 +427,8 @@ def embed_backfill(args):
 
 def list_facts(args):
     limit = max(1, min(int(args.get("limit", 50)), 500))
-    sql = "SELECT id, text, source, project, domain, trust, strong, created_at, updated_at FROM facts WHERE archived=0"
+    sql = ("SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
+           "created_at, updated_at FROM facts WHERE archived=0 AND invalid_at=''")
     params = []
     if args.get("project"):
         sql += " AND project=?"
@@ -405,7 +455,7 @@ def summarize_index(args):
     limit = max(1, min(int(args.get("limit", 200)), 500))
     max_chars = max(int(args.get("max_chars", 4000)), 200)
     sql = ("SELECT id, text, project, domain, trust, strong, updated_at "
-           "FROM facts WHERE archived=0")
+           "FROM facts WHERE archived=0 AND invalid_at=''")
     params = []
     if args.get("project"):
         sql += " AND project=?"
@@ -424,7 +474,7 @@ def summarize_index(args):
     params.append(limit)
     con = get_db()
     try:
-        total = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0").fetchone()[0]
+        total = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at=''").fetchone()[0]
         rows = [dict(r) for r in con.execute(sql, params)]
     finally:
         con.close()
@@ -699,7 +749,7 @@ def detect_conflicts(args):
             query = " OR ".join(terms)
             sql = ("SELECT f.id, f.text, f.source, f.project, f.trust, f.strong, bm25(facts_fts) AS rank "
                    "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
-                   "WHERE facts_fts MATCH ? AND f.archived=0 ORDER BY rank LIMIT 10")
+                   "WHERE facts_fts MATCH ? AND f.archived=0 AND f.invalid_at='' ORDER BY rank LIMIT 10")
             try:
                 rows = [dict(r) for r in con.execute(sql, [query])]
             except sqlite3.OperationalError:
@@ -743,15 +793,78 @@ def forget_fact(args):
         con.close()
 
 
+def fact_history(args):
+    """Bi-temporal history of one fact: walk the superseded_by chain from the
+    given id toward the newest version, oldest first."""
+    fid = args.get("id")
+    if fid is None:
+        return {"error": "id is required"}
+    con = get_db()
+    try:
+        chain, cur, guard = [], int(fid), 0
+        while cur is not None and guard < 50:
+            row = con.execute(
+                "SELECT id, text, source, project, domain, trust, strong, importance, "
+                "confirmed, created_at, updated_at, invalid_at, superseded_by "
+                "FROM facts WHERE id=?", (cur,)).fetchone()
+            if not row:
+                break
+            chain.append(dict(row))
+            cur = row["superseded_by"]
+            guard += 1
+        return {"count": len(chain), "root_id": int(fid), "chain": chain}
+    finally:
+        con.close()
+
+
+def review_pending(args):
+    """Human-in-the-loop: unconfirmed facts (confirmed=0, trust != high) that
+    are active — ordered by importance, then recency. Confirm with confirm_fact."""
+    limit = max(1, min(int(args.get("limit", 20)), 100))
+    con = get_db()
+    try:
+        total = con.execute(
+            "SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at='' "
+            "AND confirmed=0 AND trust != 'high'").fetchone()[0]
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
+            "updated_at FROM facts WHERE archived=0 AND invalid_at='' "
+            "AND confirmed=0 AND trust != 'high' "
+            "ORDER BY importance DESC, updated_at DESC LIMIT ?", (limit,))]
+        return {"count": len(rows), "total": total, "facts": rows}
+    finally:
+        con.close()
+
+
+def confirm_fact(args):
+    """Mark a fact as human-confirmed: confirmed=1, trust=high."""
+    fid = args.get("id")
+    if fid is None:
+        return {"error": "id is required"}
+    ts = now()
+    con = get_db()
+    try:
+        cur = con.execute(
+            "UPDATE facts SET confirmed=1, trust='high', updated_at=? "
+            "WHERE id=? AND archived=0", (ts, fid))
+        con.commit()
+        if cur.rowcount == 0:
+            return {"error": "fact not found or archived", "id": fid}
+        return {"id": fid, "confirmed": True, "trust": "high", "updated_at": ts}
+    finally:
+        con.close()
+
+
+
 def stats(_args=None):
     con = get_db()
     try:
-        total = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0").fetchone()[0]
+        total = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at=''").fetchone()[0]
         by_trust = {r["trust"]: r["n"] for r in con.execute(
-            "SELECT trust, COUNT(*) n FROM facts WHERE archived=0 GROUP BY trust")}
+            "SELECT trust, COUNT(*) n FROM facts WHERE archived=0 AND invalid_at='' GROUP BY trust")}
         by_domain = {r["domain"] or "(none)": r["n"] for r in con.execute(
-            "SELECT domain, COUNT(*) n FROM facts WHERE archived=0 GROUP BY domain")}
-        strong = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND strong=1").fetchone()[0]
+            "SELECT domain, COUNT(*) n FROM facts WHERE archived=0 AND invalid_at='' GROUP BY domain")}
+        strong = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at='' AND strong=1").fetchone()[0]
         counts = {
             "entities": con.execute("SELECT COUNT(*) FROM entities").fetchone()[0],
             "relations": con.execute("SELECT COUNT(*) FROM relations").fetchone()[0],
@@ -802,6 +915,7 @@ TOOLS = {
                 "domain": {"type": "string", "description": "Category/tag"},
                 "trust": {"type": "string", "enum": list(VALID_TRUST), "default": "medium"},
                 "strong": {"type": "boolean", "default": False},
+                "importance": {"type": "number", "default": 0.5, "description": "0..1 value of the fact for retention"},
             },
             "required": ["text"],
         },
@@ -818,6 +932,7 @@ TOOLS = {
                 "project": {"type": "string"},
                 "domain": {"type": "string"},
                 "semantic": {"type": "boolean", "default": False, "description": "Hybrid: RRF-merge FTS BM25 with embedding search (requires MEMORY_MCP_EMBEDDINGS=1)"},
+                "valid_at": {"type": "string", "description": "RFC3339: include facts that were still valid at that time (bi-temporal)"},
             },
             "required": ["query"],
         },
@@ -874,6 +989,29 @@ TOOLS = {
             "type": "object",
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
+        },
+    },
+    "fact_history": {
+        "description": "Bi-temporal history of one fact: walk the superseded_by chain (oldest first).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"],
+        },
+    },
+    "review_pending": {
+        "description": "Unconfirmed active facts (confirmed=0, trust != high), importance-first — for human review; confirm with confirm_fact.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "default": 20}},
+        },
+    },
+    "confirm_fact": {
+        "description": "Mark a fact as human-confirmed (confirmed=1, trust=high).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+            "required": ["id"],
         },
     },
     "list_facts": {
@@ -1058,6 +1196,9 @@ HANDLERS = {
     "attach_evidence": attach_evidence,
     "detect_conflicts": detect_conflicts,
     "forget_fact": forget_fact,
+    "fact_history": fact_history,
+    "review_pending": review_pending,
+    "confirm_fact": confirm_fact,
     "stats": stats,
     "export": export_facts,
 }
