@@ -27,6 +27,13 @@ services:
       MEMORY_MCP_EMBEDDINGS: "1"
       MEMORY_MCP_EMBED_PROVIDER: ollama
       MEMORY_MCP_EMBED_URL: http://ollama:11434
+      # optional server-side pipeline: extraction / recall / verification
+      MEMORY_MCP_EXTRACT: "1"
+      MEMORY_MCP_RECALL: "1"
+      MEMORY_MCP_VERIFY: "1"
+      MEMORY_MCP_LLM_PROVIDER: ollama
+      MEMORY_MCP_LLM_URL: http://ollama:11434
+      MEMORY_MCP_LLM_MODEL: qwen2.5:14b
       # reasonix runtimes: read+write the shared store (dual-write/dual-read)
       REASONIX_MEMORY_MCP: "1"
 ```

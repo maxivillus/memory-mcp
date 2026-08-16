@@ -4,8 +4,10 @@ Shared fact-memory MCP server (stdio, JSON-RPC 2.0, newline-delimited) for
 reasonix / jcode / codex runtimes. SQLite + FTS5 storage; one fact store
 shared across the host and docker runtimes via bind-mount.
 
-Replaces the per-runtime memory storage with a single searchable store:
-extraction/gating/injection stay client-side (reasonix memory patches).
+Replaces the per-runtime memory storage with a single searchable store.
+Extraction/gating/injection are client-side by default (reasonix memory
+patches); optional server-side modules (extract/recall/verify) move the same
+pipeline into the server for runtimes that have no client patches.
 
 ## Tools
 
@@ -106,7 +108,7 @@ resolved source/server/target are printed before writing).
 
 ## Agent skill
 
-- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 19 MCP tools:
+- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 24 MCP tools:
   when to search facts before researching, how to record decisions with
   rationale for precedent lookup, graph/provenance/conflict usage, semantic
   search, and shared-store conventions. Compatible with the `SKILL.md` format
@@ -143,13 +145,16 @@ and every failure degrades to lexical-only.
 ## Design boundaries
 
 memory-mcp is a shared fact **store + search**, deliberately not a full memory
-system. The following stay client-side (e.g. the reasonix memory patches:
-extraction, recall tiers, fact gate):
+system. The following stay client-side by default (e.g. the reasonix memory
+patches: extraction, recall tiers, fact gate); the optional server-side
+pipeline modules below move each of them into the server when enabled:
 
 - **Fact extraction from conversations** and deciding what is worth
-  remembering.
+  remembering — client-side by default, or `ingest_turn` (extract.py).
 - **Prompt injection / recall assembly** — the store is read on demand
-  (`search_facts`, `summarize_index`) or by the client's own recall pipeline.
+  (`search_facts`, `summarize_index`) or via the client's own recall pipeline;
+  `compose_recall` (recall.py) returns a ready-to-inject block, so the client
+  only inserts it.
 - **Truth verification** — `trust`/`strong` are client-set metadata and query
   filters, not a verification or protection mechanism.
 - **Semantic search** — optional module (`embeddings.py`, gated by
@@ -161,6 +166,33 @@ extraction, recall tiers, fact gate):
 - **Near-duplicate handling** — writes dedup on exact text (sha256).
   Paraphrased facts stay separate records; `detect_conflicts` surfaces
   near-duplicates (term coverage ≥ 0.6) on demand.
+
+
+## Server-side pipeline (optional modules)
+
+Same env-gate pattern as embeddings — the core stays stdlib-only; these
+activate only when set, and every failure degrades to store-only.
+
+- **Extraction** (`MEMORY_MCP_EXTRACT=1`): `ingest_turn {transcript,
+  session_ref?, project?, domain?}` sends the transcript to the LLM provider
+  (see llm.py; ollama/openai/test) and stores extracted facts with provenance
+  (`attach_evidence`). Minimum transcript length:
+  `MEMORY_MCP_EXTRACT_MIN_CHARS` (default 800). When `MEMORY_MCP_VERIFY=1`,
+  new facts are cross-checked and superseded ones archived.
+- **Recall assembly** (`MEMORY_MCP_RECALL=1`): `compose_recall {turn_text,
+  limit?, chars?, semantic?}` returns a ready-to-inject `<memory-recall>`
+  block (authoritative + background tiers, reasonix-compatible format);
+  `sweep_freshness {}` archives facts past their type's hard window (strong
+  facts kept): reference 45d, user/feedback 365d, project 180d.
+- **Verification** (`MEMORY_MCP_VERIFY=1`): `verify_facts {text}` LLM
+  cross-checks a candidate against the store (conflicts/supersessions).
+  `check_new_facts` (ingestion hook) archives superseded old facts
+  (graphiti-style invalidation) only on high-confidence verdicts
+  (`MEMORY_MCP_VERIFY_MIN_CONFIDENCE`, default 0.8) and attaches
+  `supersedes:<old_id>` evidence to the new one.
+- **LLM provider** (shared by extract/verify): `MEMORY_MCP_LLM_PROVIDER`
+  (ollama|openai|test), `_URL`, `_MODEL` (ollama default qwen2.5:14b), `_KEY`,
+  `_TIMEOUT` (default 60s).
 
 ## Deploying in a docker runtime
 

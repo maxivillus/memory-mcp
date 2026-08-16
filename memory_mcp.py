@@ -223,6 +223,49 @@ def _emb():
         return None
 
 
+def _mod(name, env):
+    """Generic lazy loader for the optional pipeline modules (extract/recall/
+    verify). Same contract as _emb: None when the env gate is off."""
+    if os.environ.get(env) != "1":
+        return None
+    try:
+        return __import__(name)
+    except ImportError:
+        return None
+
+
+def _disabled(env):
+    return {"error": "disabled (set %s=1)" % env}
+
+
+def ingest_turn(args):
+    m = _mod("extract", "MEMORY_MCP_EXTRACT")
+    if m is None:
+        return _disabled("MEMORY_MCP_EXTRACT")
+    return m.ingest_turn(args)
+
+
+def compose_recall(args):
+    m = _mod("recall", "MEMORY_MCP_RECALL")
+    if m is None:
+        return _disabled("MEMORY_MCP_RECALL")
+    return m.compose_recall(args)
+
+
+def sweep_freshness(args):
+    m = _mod("recall", "MEMORY_MCP_RECALL")
+    if m is None:
+        return _disabled("MEMORY_MCP_RECALL")
+    return m.sweep_freshness(args)
+
+
+def verify_facts(args):
+    m = _mod("verify", "MEMORY_MCP_VERIFY")
+    if m is None:
+        return _disabled("MEMORY_MCP_VERIFY")
+    return m.verify_facts(args)
+
+
 def remember_fact(args):
     text = (args.get("text") or "").strip()
     if not text:
@@ -795,6 +838,44 @@ TOOLS = {
         "description": "Compute embeddings for facts that have none (backfill after enabling MEMORY_MCP_EMBEDDINGS=1).",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    "ingest_turn": {
+        "description": "Server-side fact extraction from a conversation transcript (LLM provider, see extract.py). Requires MEMORY_MCP_EXTRACT=1.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "transcript": {"type": "string"},
+                "session_ref": {"type": "string"},
+                "project": {"type": "string"},
+                "domain": {"type": "string"},
+            },
+            "required": ["transcript"],
+        },
+    },
+    "compose_recall": {
+        "description": "Build a ready-to-inject <memory-recall> block for a user turn (server-side scoring; see recall.py). Requires MEMORY_MCP_RECALL=1.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "turn_text": {"type": "string"},
+                "limit": {"type": "integer", "default": 8},
+                "chars": {"type": "integer", "default": 2400},
+                "semantic": {"type": "boolean", "default": False},
+            },
+            "required": ["turn_text"],
+        },
+    },
+    "sweep_freshness": {
+        "description": "Archive facts older than their type's hard window (strong facts kept; see recall.py). Requires MEMORY_MCP_RECALL=1.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    "verify_facts": {
+        "description": "LLM cross-check of a fact against the store (conflicts/supersessions; see verify.py). Requires MEMORY_MCP_VERIFY=1.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
     "list_facts": {
         "description": "List recent non-archived facts (optional project/domain filter).",
         "inputSchema": {
@@ -960,6 +1041,10 @@ HANDLERS = {
     "search_facts": search_facts,
     "search_semantic": search_semantic,
     "embed_backfill": embed_backfill,
+    "ingest_turn": ingest_turn,
+    "compose_recall": compose_recall,
+    "sweep_freshness": sweep_freshness,
+    "verify_facts": verify_facts,
     "list_facts": list_facts,
     "summarize_index": summarize_index,
     "remember_entity": remember_entity,
