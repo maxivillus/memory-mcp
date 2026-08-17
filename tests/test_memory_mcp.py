@@ -1120,3 +1120,129 @@ class WorkspaceMgmtTest(unittest.TestCase):
         r = mcp.archive_database({"name": "twice", "hard": True, "confirm": True})
         self.assertNotIn("error", r, r)
         self.assertTrue(r["deleted"])
+
+
+class DecayTest(unittest.TestCase):
+    """v0.7: active-day decay — degraded/forgotten lifecycle, revival, protection."""
+
+    def setUp(self):
+        import shutil as _shutil
+        self._old_db = mcp.DB_PATH
+        self.tmpdir = tempfile.mkdtemp(prefix="mcp-decay-")
+        self.db = os.path.join(self.tmpdir, "active.db")
+        os.environ["MEMORY_MCP_DB"] = self.db
+        mcp.DB_PATH = self.db
+        self._shutil = __import__("shutil")
+
+    def tearDown(self):
+        os.environ.pop("MEMORY_MCP_DB", None)
+        mcp.DB_PATH = self._old_db
+        self._shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _add_active_days(self, n):
+        """Insert n activity days strictly after today (ISO dates)."""
+        from datetime import date, timedelta
+        con = __import__("sqlite3").connect(self.db)
+        base = date.today()
+        for i in range(1, n + 1):
+            con.execute("INSERT OR IGNORE INTO activity_days (day) VALUES (?)",
+                        [(base + timedelta(days=i)).isoformat()])
+        con.commit()
+        con.close()
+
+    def _lifecycle(self, fid):
+        con = __import__("sqlite3").connect(self.db)
+        row = con.execute("SELECT lifecycle FROM facts WHERE id=?", [fid]).fetchone()
+        con.close()
+        return row[0] if row else None
+
+    def test_decay_sweep_degraded_then_forgotten(self):
+        r = mcp.remember_fact({"text": "alpha widget decay target", "source": "t", "importance": 1})
+        fid = r["id"]
+        self._add_active_days(30)
+        res = mcp.decay_sweep({})
+        self.assertEqual(res["moved"]["to_degraded"], 1)
+        self.assertEqual(self._lifecycle(fid), "degraded")
+        self._add_active_days(50)  # total 80: 0.95^80 << 0.1
+        res = mcp.decay_sweep({})
+        self.assertEqual(res["moved"]["to_forgotten"], 1)
+        self.assertEqual(self._lifecycle(fid), "forgotten")
+
+    def test_decay_protects_strong_and_confirmed(self):
+        r1 = mcp.remember_fact({"text": "strong protected fact", "source": "t", "strong": True})
+        r2 = mcp.remember_fact({"text": "confirmed protected fact", "source": "t"})
+        con = __import__("sqlite3").connect(self.db)
+        con.execute("UPDATE facts SET confirmed=1 WHERE id=?", [r2["id"]])
+        con.commit()
+        con.close()
+        self._add_active_days(80)
+        mcp.decay_sweep({})
+        self.assertEqual(self._lifecycle(r1["id"]), "active")
+        self.assertEqual(self._lifecycle(r2["id"]), "active")
+
+    def test_search_hit_updates_access_metrics(self):
+        r = mcp.remember_fact({"text": "hit me please beta core", "source": "t"})
+        hits = mcp.search_facts({"query": "beta core"})
+        self.assertGreaterEqual(hits["count"], 1)
+        con = __import__("sqlite3").connect(self.db)
+        row = con.execute("SELECT access_count, last_accessed_at FROM facts WHERE id=?",
+                          [r["id"]]).fetchone()
+        con.close()
+        self.assertEqual(row[0], 1)
+        self.assertNotEqual(row[1], "")
+
+    def test_degraded_hidden_then_revived_after_three_attempts(self):
+        r = mcp.remember_fact({"text": "gamma widget revival test", "source": "t", "importance": 1})
+        fid = r["id"]
+        self._add_active_days(30)
+        mcp.decay_sweep({})
+        self.assertEqual(self._lifecycle(fid), "degraded")
+        # two matching searches: still degraded, revival_count climbs
+        for _ in range(2):
+            res = mcp.search_facts({"query": "gamma widget revival"})
+            self.assertEqual(res["count"], 0)  # hidden from plain search
+        self.assertEqual(self._lifecycle(fid), "degraded")
+        con = __import__("sqlite3").connect(self.db)
+        rc = con.execute("SELECT revival_count FROM facts WHERE id=?", [fid]).fetchone()[0]
+        con.close()
+        self.assertEqual(rc, 2)
+        # third matching search: revived to active
+        mcp.search_facts({"query": "gamma widget revival"})
+        self.assertEqual(self._lifecycle(fid), "active")
+        res = mcp.search_facts({"query": "gamma widget revival"})
+        self.assertGreaterEqual(res["count"], 1)
+
+    def test_forgotten_visible_only_via_list_forgotten_and_restore(self):
+        r = mcp.remember_fact({"text": "delta widget forgotten test", "source": "t", "importance": 1})
+        fid = r["id"]
+        self._add_active_days(80)
+        mcp.decay_sweep({})
+        self.assertEqual(self._lifecycle(fid), "forgotten")
+        res = mcp.search_facts({"query": "delta widget forgotten"})
+        self.assertEqual(res["count"], 0)
+        # repeated searches do NOT revive forgotten facts
+        for _ in range(5):
+            mcp.search_facts({"query": "delta widget forgotten"})
+        self.assertEqual(self._lifecycle(fid), "forgotten")
+        lst = mcp.list_forgotten({})
+        self.assertTrue(any(f["id"] == fid for f in lst["facts"]))
+        restored = mcp.restore_fact({"id": fid})
+        self.assertEqual(restored["to"], "active")
+        res = mcp.search_facts({"query": "delta widget forgotten"})
+        self.assertGreaterEqual(res["count"], 1)
+
+    def test_restore_fact_rejects_archived(self):
+        r = mcp.remember_fact({"text": "archived cannot be restored via decay", "source": "t"})
+        fid = r["id"]
+        mcp.forget_fact({"id": fid})
+        res = mcp.restore_fact({"id": fid})
+        self.assertIn("error", res)
+
+    def test_activity_day_registered_on_call(self):
+        from datetime import date
+        mcp._register_activity_day()
+        con = __import__("sqlite3").connect(self.db)
+        n = con.execute("SELECT COUNT(*) FROM activity_days WHERE day=?",
+                        [date.today().isoformat()]).fetchone()[0]
+        con.close()
+        self.assertEqual(n, 1)

@@ -57,6 +57,26 @@ it create/reset/archive/backup semantics.
 - `backup_workspace {workspace}` — JSON export of all its facts (incl.
   archived) to `backups/workspace-<name>-<ts>.json`
 
+### v0.7 — automatic decay (2026-08-17)
+
+Facts age only on **active days** — days with at least one memory-mcp call
+(`activity_days` table) — so user downtime never ages them. Score =
+`importance * 0.95^active_days` since the last search hit (or creation).
+
+- `active` (score ≥ 0.25): normal search/recall participant.
+- `degraded` (score < 0.25): hidden from plain search; reachable via
+  entity-graph/session chains; revived after `DECAY_REVIVE_HITS` (default 3)
+  matching searches.
+- `forgotten` (score ≤ 0.1): excluded everywhere; visible only via
+  `list_forgotten {limit?}` and `restore_fact {id}` (manual return to active).
+- `decay_sweep {}` — full lifecycle recompute + report; run manually or via
+  cron (the stdio server does not live between sessions). `strong` and
+  `confirmed` facts never decay.
+- Params: `DECAY_RATE` (0.95), `DECAY_ARCHIVE` (0.25), `DECAY_FORGET` (0.1),
+  `DECAY_REVIVE_HITS` (3). Search hits refresh `last_accessed_at` /
+  `access_count` on active facts only (chained access does not keep stale
+  facts alive).
+
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
 Covers the agent needs that motivated the Semantica evaluation (decision
@@ -141,7 +161,7 @@ resolved source/server/target are printed before writing).
 
 ## Agent skill
 
-- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 41 MCP tools:
+- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 44 MCP tools:
   when to search facts before researching, how to record decisions with
   rationale for precedent lookup, graph/provenance/conflict usage, semantic
   search, and shared-store conventions. Compatible with the `SKILL.md` format

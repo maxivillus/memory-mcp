@@ -328,7 +328,8 @@ def search_semantic(con, query, limit=20, threshold=0.0, workspace=""):
     params = [workspace] if workspace else []
     rows = con.execute(
         "SELECT e.fact_id, e.vec, e.model, f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong "
-        "FROM fact_embeddings e JOIN facts f ON f.id=e.fact_id WHERE f.archived=0" + ws_clause,
+        "FROM fact_embeddings e JOIN facts f ON f.id=e.fact_id "
+        "WHERE f.archived=0 AND f.lifecycle='active'" + ws_clause,
         params).fetchall()
     scored = []
     for r in rows:
