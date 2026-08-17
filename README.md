@@ -24,6 +24,38 @@ pipeline into the server for runtimes that have no client patches.
 - `stats {}` — totals by trust/domain plus v0.3 counts (entities/relations/decisions/evidence)
 - `export {}` — all facts incl. archived (migration/backup)
 
+### v0.6 — database & workspace management (2026-08-17)
+
+Named databases are separate SQLite files under `databases/` (sibling of the
+active DB); backups land in `backups/`. The active store (`MEMORY_MCP_DB`) can
+be backed up but never archived/deleted through these tools. Workspaces are
+named access scopes registered in the `workspaces` table of the active DB —
+`workspace` in fact tools remains an access-scope filter; the registry gives
+it create/reset/archive/backup semantics.
+
+- `create_database {name}` — new SQLite database (full schema); rejects the
+  active store's name, duplicates, and invalid names
+  (1-64 chars of `[A-Za-z0-9._-]`, no `..`)
+- `list_databases {}` — active + named databases, archived flag
+- `archive_database {name, hard?, confirm?}` — soft (default): rename to
+  `<name>.db.archived`, data preserved, reversible by renaming back;
+  `hard:true` deletes the file permanently (requires `confirm:true`)
+- `backup_database {name?}` — SQLite online backup to `backups/` (default:
+  active store; named incl. archived databases)
+- `delete_database {name, confirm:true}` — permanent file delete; active
+  store protected
+- `create_workspace {workspace}` — register a workspace (idempotent;
+  re-registering reactivates an archived/reset workspace)
+- `list_workspaces {status?}` — registry rows with active fact counts
+- `reset_workspace {workspace, hard?, confirm?}` — soft (default): archive
+  all its facts (`archived=1`, reversible), status='reset'; `hard:true`
+  deletes the facts permanently (requires `confirm:true`)
+- `archive_workspace {workspace, hard?, confirm?}` — soft (default): archive
+  all its facts, status='archived'; `hard:true` deletes permanently
+  (requires `confirm:true`)
+- `backup_workspace {workspace}` — JSON export of all its facts (incl.
+  archived) to `backups/workspace-<name>-<ts>.json`
+
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
 Covers the agent needs that motivated the Semantica evaluation (decision
