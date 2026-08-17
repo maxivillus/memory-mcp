@@ -117,9 +117,9 @@ cascading and no delete tool existed for them. Now:
 
 ### v0.9 — session-scoped database isolation (2026-08-17)
 
-External-audit follow-up (NTL-604 handoff, item 1): `workspace` is an access
-scope, not physical isolation — scoped reads include the shared pool. For
-real isolation use a named database:
+Database isolation: `workspace` is an access scope, not physical isolation —
+scoped reads include the shared pool. For real isolation use a named
+database:
 
 - `select_database {name}` — session-level switch: ALL subsequent tools
   (facts, graph, decisions, evidence, backup, export, workspaces) operate on
@@ -138,9 +138,8 @@ records afterwards).
 
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
-Covers the agent needs that motivated the Semantica evaluation (decision
-rationale, precedent search, evidence lineage) with zero new dependencies —
-just SQLite + FTS5.
+Covers decision rationale, precedent search and evidence lineage with zero
+new dependencies — just SQLite + FTS5.
 
 - `remember_entity {name, type?, aliases?}` — upsert entity node
 - `remember_relation {subject, predicate, object, source_fact_id?}` — edge
@@ -188,9 +187,9 @@ migrate in place):
 
 ## Integration
 
-- Host: `~/.local/bin/memory-mcp` wrapper → this script; registered in
-  `~/.reasonix/config.toml` (`[[plugins]]`), `~/.jcode/mcp.json`,
-  `~/.codex/config.toml` (`[mcp_servers.memory-mcp]`).
+- Host: wrapper script → this script; register it as an MCP server in your
+  runtime's config (e.g. `[mcp_servers.memory-mcp]` in a Codex-style
+  `config.toml`).
 - Docker runtimes: script bind-mounted read-only to `/opt/memory-mcp`,
   DB dir to `/opt/memory-shared` (rw); env `MEMORY_MCP_DB=/opt/memory-shared/facts.db`.
   The shared dir must be writable by the container uid (e.g. 1001 for codex-daemon).
