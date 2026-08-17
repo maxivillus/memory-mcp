@@ -114,8 +114,11 @@ kept); hard mode physically deletes and requires confirm: true.
   re-registering reactivates an archived/reset one); list_workspaces shows
   status + active fact counts.
 - reset_workspace {workspace, hard?, confirm?} / archive_workspace
-  {workspace, hard?, confirm?} — soft: archive the workspace's facts
-  (archived=1, reversible); hard: true deletes them (requires confirm: true).
+  {workspace, hard?, confirm?} — soft: hide the whole workspace (facts get
+  archived=1; graph/decisions/evidence become unreadable and unwritable);
+  hard: true purges facts, evidence, graph and decisions in one transaction
+  (per-table counts in the response; requires confirm: true). Reactivate an
+  archived/reset workspace with create_workspace before writing again.
 - backup_workspace {workspace} — JSON export of all its facts (incl.
   archived) to backups/workspace-<name>-<ts>.json.
 - Names are validated: 1-64 chars of [A-Za-z0-9._-], no '..' — never pass

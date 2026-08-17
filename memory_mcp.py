@@ -140,10 +140,10 @@ CREATE TABLE IF NOT EXISTS entities (
 );
 CREATE TABLE IF NOT EXISTS relations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  subject_id INTEGER NOT NULL REFERENCES entities(id),
+  subject_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
   predicate TEXT NOT NULL,
-  object_id INTEGER NOT NULL REFERENCES entities(id),
-  source_fact_id INTEGER,
+  object_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  source_fact_id INTEGER REFERENCES facts(id) ON DELETE SET NULL,
   workspace_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   UNIQUE(subject_id, predicate, object_id)
@@ -182,7 +182,7 @@ CREATE TRIGGER IF NOT EXISTS decisions_au AFTER UPDATE ON decisions BEGIN
 END;
 CREATE TABLE IF NOT EXISTS evidence (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  fact_id INTEGER NOT NULL REFERENCES facts(id),
+  fact_id INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,
   source_ref TEXT NOT NULL,
   source_checksum TEXT NOT NULL DEFAULT '',
   fetched_at TEXT NOT NULL DEFAULT '',
@@ -278,9 +278,12 @@ def _open_db(path):
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA busy_timeout=5000")
     con.execute("PRAGMA foreign_keys=ON")
+    preexisting_fts = _existing_fts_tables(con)
     con.executescript(_SCHEMA)
     con.executescript(_EMBED_SCHEMA)
     _migrate_facts(con)
+    _migrate_fks(con)
+    _migrate_fts(con, preexisting_fts)
     return con
 
 
@@ -343,10 +346,99 @@ def _migrate_facts(con):
     con.commit()
 
 
+def _migrate_fks(con):
+    """v0.8 migration: rebuild `evidence` and `relations` with ON DELETE
+    CASCADE (relations.source_fact_id -> SET NULL) so child rows can never
+    block a parent delete with a FOREIGN KEY error. Idempotent: skips tables
+    whose stored DDL already carries the clause (fresh DBs get it from
+    _SCHEMA). Rebuild pattern matches _migrate_facts (atomic executescript,
+    foreign_keys toggled off around the swap)."""
+    def _has_cascade(table, needle):
+        row = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                          [table]).fetchone()
+        return bool(row and row["sql"] and needle in row["sql"])
+
+    if not _has_cascade("evidence", "ON DELETE CASCADE"):
+        con.executescript(
+            "PRAGMA foreign_keys=OFF;\n"
+            "BEGIN;\n"
+            "CREATE TABLE evidence_new (\n"
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+            "  fact_id INTEGER NOT NULL REFERENCES facts(id) ON DELETE CASCADE,\n"
+            "  source_ref TEXT NOT NULL,\n"
+            "  source_checksum TEXT NOT NULL DEFAULT '',\n"
+            "  fetched_at TEXT NOT NULL DEFAULT '',\n"
+            "  created_at TEXT NOT NULL,\n"
+            "  UNIQUE(fact_id, source_ref)\n"
+            ");\n"
+            "INSERT INTO evidence_new (id, fact_id, source_ref, source_checksum, fetched_at, created_at)\n"
+            "  SELECT id, fact_id, source_ref, source_checksum, fetched_at, created_at FROM evidence;\n"
+            "DROP TABLE evidence;\n"
+            "ALTER TABLE evidence_new RENAME TO evidence;\n"
+            "CREATE INDEX IF NOT EXISTS evidence_fact_idx ON evidence(fact_id);\n"
+            "COMMIT;\n"
+            "PRAGMA foreign_keys=ON;\n")
+    if not _has_cascade("relations", "ON DELETE CASCADE"):
+        con.executescript(
+            "PRAGMA foreign_keys=OFF;\n"
+            "BEGIN;\n"
+            "CREATE TABLE relations_new (\n"
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+            "  subject_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,\n"
+            "  predicate TEXT NOT NULL,\n"
+            "  object_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,\n"
+            "  source_fact_id INTEGER REFERENCES facts(id) ON DELETE SET NULL,\n"
+            "  workspace_id TEXT NOT NULL DEFAULT '',\n"
+            "  created_at TEXT NOT NULL,\n"
+            "  UNIQUE(subject_id, predicate, object_id)\n"
+            ");\n"
+            "INSERT INTO relations_new (id, subject_id, predicate, object_id, source_fact_id, workspace_id, created_at)\n"
+            "  SELECT id, subject_id, predicate, object_id, source_fact_id, workspace_id, created_at FROM relations;\n"
+            "DROP TABLE relations;\n"
+            "ALTER TABLE relations_new RENAME TO relations;\n"
+            "CREATE INDEX IF NOT EXISTS relations_subject_idx ON relations(subject_id);\n"
+            "CREATE INDEX IF NOT EXISTS relations_object_idx ON relations(object_id);\n"
+            "COMMIT;\n"
+            "PRAGMA foreign_keys=ON;\n")
+    con.commit()
+
+
+def _existing_fts_tables(con):
+    """FTS5 shadow tables that already exist in the store (before _SCHEMA)."""
+    rows = con.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                       "AND name IN ('facts_fts', 'decisions_fts')").fetchall()
+    return {r["name"] for r in rows}
+
+
+def _migrate_fts(con, preexisting):
+    """Rebuild the FTS index of any content table whose FTS5 shadow was
+    created by this open (i.e. the database predates it). A content= FTS
+    table created over existing rows starts with an EMPTY index, and the
+    AFTER DELETE trigger then fails with SQLITE_CORRUPT ('database disk
+    image is malformed') on the first row delete — FTS5's 'delete' command
+    requires the entry to be indexed. NOTE: COUNT(*) on a content= FTS table
+    counts CONTENT rows, so a count comparison cannot detect the empty
+    index; pre-_SCHEMA existence is the reliable signal."""
+    for fts in ("facts_fts", "decisions_fts"):
+        if fts in preexisting:
+            continue
+        try:
+            con.execute("INSERT INTO %s(%s) VALUES('rebuild')" % (fts, fts))
+        except sqlite3.OperationalError as e:
+            # Mirrors the _open_db convention: full detail to stderr, and
+            # leave the client-visible error to the failing tool (the AFTER
+            # DELETE trigger surfaces SQLITE_CORRUPT with a clear message).
+            print(f"memory-mcp: FTS rebuild of {fts} failed: {e}", file=sys.stderr)
+            continue
+    con.commit()
+
+
 def _graph_expand_facts(con, hit_facts, limit=10, workspace=""):
     """Entity-graph expansion: entities mentioned in the hit facts -> graph
     neighbors -> facts mentioning the neighbors. Returns dict rows (id/text/...).
     Shared by search_facts {graph=true} and compose_recall {graph=true}."""
+    if _ws_status(con, workspace) != "active":
+        return []
     ent_ws = _ws_check("entities", workspace)
     ent_params = [workspace] if workspace else []
     rows = con.execute("SELECT name FROM entities WHERE length(name) >= 3" + ent_ws,
@@ -406,6 +498,25 @@ def _ws_filter(alias, workspace):
     if workspace:
         return " AND %s.workspace_id IN (?, '')" % alias
     return " AND %s.workspace_id = ''" % alias
+
+
+def _ws_status(con, workspace):
+    """Registry status of a workspace. Implicit workspaces (no row in the
+    `workspaces` table) and the shared pool ('') count as active."""
+    if not workspace:
+        return "active"
+    row = con.execute("SELECT status FROM workspaces WHERE id=?", [workspace]).fetchone()
+    return row["status"] if row else "active"
+
+
+def _ws_inactive_error(con, workspace):
+    """Error dict when a workspace is archived/reset (all its reads and writes
+    are refused until it is reactivated); None when active."""
+    status = _ws_status(con, workspace)
+    if status != "active":
+        return {"error": "workspace %r is %s — reactivate it with create_workspace"
+                % (workspace, status)}
+    return None
 
 
 def _importance(args):
@@ -562,6 +673,13 @@ def ingest_turn(args):
     m = _mod("extract", "MEMORY_MCP_EXTRACT")
     if m is None:
         return _disabled("MEMORY_MCP_EXTRACT")
+    con = get_db()
+    try:
+        err = _ws_inactive_error(con, _workspace(args))
+        if err:
+            return err
+    finally:
+        con.close()
     return m.ingest_turn(args)
 
 
@@ -635,6 +753,9 @@ def remember_fact(args):
             "no workspace provided; add workspace=<project_id> to scope this fact to your project"
     con = get_db()
     try:
+        err = _ws_inactive_error(con, workspace)
+        if err:
+            return err
         # Workspace-scoped dedup: the same text is one fact per workspace.
         # Unscoped callers dedup within the shared pool only.
         cur = con.execute("SELECT id, created_at FROM facts WHERE sha256=?" +
@@ -894,9 +1015,12 @@ def remember_entity(args):
         return {"error": "name is required"}
     con = get_db()
     try:
+        ws = _workspace(args)
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         try:
-            eid, created = _resolve_entity(con, name, args.get("type", ""), args.get("aliases", ""),
-                                           _workspace(args))
+            eid, created = _resolve_entity(con, name, args.get("type", ""), args.get("aliases", ""), ws)
         except sqlite3.IntegrityError:
             return {"error": "entity name exists in another workspace", "name": name}
         con.commit()
@@ -914,6 +1038,9 @@ def remember_relation(args):
     con = get_db()
     try:
         ws = _workspace(args)
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         sid, _ = _resolve_entity(con, subject, workspace=ws)
         oid, _ = _resolve_entity(con, obj, workspace=ws)
         existing = con.execute(
@@ -946,6 +1073,9 @@ def search_graph(args):
     con = get_db()
     try:
         ws = _workspace(args)
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         root = con.execute("SELECT id, name, type FROM entities WHERE name=?" + _ws_check("entities", ws),
                            [name] + ([ws] if ws else [])).fetchone()
         if not root:
@@ -996,6 +1126,9 @@ def record_decision(args):
     con = get_db()
     try:
         workspace = _workspace(args)
+        err = _ws_inactive_error(con, workspace)
+        if err:
+            return err
         cur = con.execute(
             "INSERT INTO decisions (category, subject, scenario, reasoning, outcome, confidence, "
             "decision_maker, issue_ref, parent_decision_id, workspace_id, created_at, updated_at) "
@@ -1025,6 +1158,9 @@ def query_decisions(args):
     params.append(max(1, min(int(args.get("limit", 20)), 100)))
     con = get_db()
     try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         rows = [dict(r) for r in con.execute(sql, params)]
         return {"count": len(rows), "decisions": rows}
     finally:
@@ -1059,6 +1195,9 @@ def find_precedents(args):
     params.append(limit)
     con = get_db()
     try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         try:
             rows = [dict(r) for r in con.execute(sql, params)]
         except sqlite3.OperationalError:
@@ -1097,6 +1236,9 @@ def get_causal_chain(args):
     ws = _workspace(args)
     con = get_db()
     try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         chain, cur, guard = [], int(did), 0
         while cur is not None and guard < 50:
             row = con.execute(
@@ -1147,6 +1289,9 @@ def attach_evidence(args):
     ws = _workspace(args)
     con = get_db()
     try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         owner = con.execute(
             "SELECT id FROM facts WHERE id=? AND archived=0" + _ws_check("facts", ws),
             [fact_id] + ([ws] if ws else [])).fetchone()
@@ -1173,6 +1318,9 @@ def detect_conflicts(args):
     ws = _workspace(args)
     con = get_db()
     try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         result = {"text": text, "near_duplicates": [], "decision_conflicts": []}
         if terms:
             query = " OR ".join(terms)
@@ -1213,6 +1361,9 @@ def forget_fact(args):
     ws = _workspace(args)
     con = get_db()
     try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         if args.get("id"):
             cur = con.execute("UPDATE facts SET archived=1, updated_at=? WHERE id=? AND archived=0" +
                               _ws_check("facts", ws),
@@ -1238,6 +1389,9 @@ def fact_history(args):
     con = get_db()
     try:
         ws = _workspace(args)
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         chain, cur, guard = [], int(fid), 0
         while cur is not None and guard < 50:
             row = con.execute(
@@ -1287,6 +1441,9 @@ def confirm_fact(args):
     ts = now()
     con = get_db()
     try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         cur = con.execute(
             "UPDATE facts SET confirmed=1, trust='high', updated_at=? "
             "WHERE id=? AND archived=0" + _ws_check("facts", ws),
@@ -1308,6 +1465,9 @@ def fact_references(args):
     ws = _workspace(args)
     con = get_db()
     try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         fact = con.execute(
             "SELECT id, text, source, trust, strong, importance, confirmed, "
             "invalid_at, superseded_by, created_at, updated_at FROM facts WHERE id=?" +
@@ -1361,6 +1521,9 @@ def export_rdf(args):
     ws = _workspace(args)
     con = get_db()
     try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
         out = []
         out.append("@prefix prov: <http://www.w3.org/ns/prov#> .")
         out.append("@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .")
@@ -1508,6 +1671,9 @@ def stats(_args=None):
 
 
 def export_facts(_args=None):
+    # Deliberately includes archived rows and is NOT gated by workspace
+    # status: it is the migration/backup dump tool (same policy as
+    # backup_workspace), so archived/reset workspaces stay recoverable.
     con = get_db()
     try:
         ws = _workspace(_args or {})
@@ -1673,6 +1839,33 @@ def list_workspaces(args):
         con.close()
 
 
+def _purge_workspace_rows(con, name):
+    """Physically delete every row owned by a workspace across all tables, in
+    FK-safe order (children before parents), within the caller's transaction.
+    Returns per-table deleted counts (every key always present). FTS shadow
+    tables are updated by the AFTER DELETE triggers on facts/decisions."""
+    counts = {}
+    cur = con.execute("DELETE FROM evidence WHERE fact_id IN "
+                      "(SELECT id FROM facts WHERE workspace_id=?)", [name])
+    counts["evidence"] = cur.rowcount
+    cur = con.execute("DELETE FROM fact_embeddings WHERE fact_id IN "
+                      "(SELECT id FROM facts WHERE workspace_id=?)", [name])
+    counts["embeddings"] = cur.rowcount
+    cur = con.execute("DELETE FROM relations WHERE workspace_id=?", [name])
+    counts["relations"] = cur.rowcount
+    cur = con.execute("DELETE FROM entities WHERE workspace_id=?", [name])
+    counts["entities"] = cur.rowcount
+    # decisions self-link via parent_decision_id (no FK): detach chains that
+    # would dangle into the purged set, then delete the decisions.
+    con.execute("UPDATE decisions SET parent_decision_id=NULL WHERE parent_decision_id IN "
+                "(SELECT id FROM decisions WHERE workspace_id=?)", [name])
+    cur = con.execute("DELETE FROM decisions WHERE workspace_id=?", [name])
+    counts["decisions"] = cur.rowcount
+    cur = con.execute("DELETE FROM facts WHERE workspace_id=?", [name])
+    counts["facts"] = cur.rowcount
+    return counts
+
+
 def reset_workspace(args):
     name, err = _validate_name(args.get("workspace"), "workspace")
     if err:
@@ -1684,11 +1877,18 @@ def reset_workspace(args):
     try:
         ts = now()
         if hard:
-            cur = con.execute("DELETE FROM facts WHERE workspace_id=?", [name])
-            deleted = cur.rowcount
-            con.execute("DELETE FROM workspaces WHERE id=?", [name])
-            con.commit()
-            return {"workspace": name, "hard": True, "deleted_facts": deleted, "reset": True}
+            try:
+                counts = _purge_workspace_rows(con, name)
+                con.execute("DELETE FROM workspaces WHERE id=?", [name])
+                con.commit()
+            except sqlite3.DatabaseError as e:
+                # IntegrityError (FK) and OperationalError (FTS5 SQLITE_CORRUPT,
+                # lock contention) both subclass DatabaseError
+                con.rollback()
+                return {"error": f"hard reset failed: {e}", "workspace": name}
+            return {"workspace": name, "hard": True, "deleted": counts,
+                    "deleted_total": sum(counts.values()),
+                    "deleted_facts": counts["facts"], "reset": True}
         cur = con.execute("UPDATE facts SET archived=1, updated_at=? WHERE workspace_id=? AND archived=0",
                           [ts, name])
         archived = cur.rowcount
@@ -1712,13 +1912,20 @@ def archive_workspace(args):
     try:
         ts = now()
         if hard:
-            cur = con.execute("DELETE FROM facts WHERE workspace_id=?", [name])
-            deleted = cur.rowcount
-            con.execute("INSERT INTO workspaces (id, status, created_at, updated_at) VALUES (?, 'archived', ?, ?) "
-                        "ON CONFLICT(id) DO UPDATE SET status='archived', updated_at=excluded.updated_at",
-                        [name, ts, ts])
-            con.commit()
-            return {"workspace": name, "hard": True, "deleted_facts": deleted, "archived": True}
+            try:
+                counts = _purge_workspace_rows(con, name)
+                con.execute("INSERT INTO workspaces (id, status, created_at, updated_at) VALUES (?, 'archived', ?, ?) "
+                            "ON CONFLICT(id) DO UPDATE SET status='archived', updated_at=excluded.updated_at",
+                            [name, ts, ts])
+                con.commit()
+            except sqlite3.DatabaseError as e:
+                # IntegrityError (FK) and OperationalError (FTS5 SQLITE_CORRUPT,
+                # lock contention) both subclass DatabaseError
+                con.rollback()
+                return {"error": f"hard archive failed: {e}", "workspace": name}
+            return {"workspace": name, "hard": True, "deleted": counts,
+                    "deleted_total": sum(counts.values()),
+                    "deleted_facts": counts["facts"], "archived": True}
         cur = con.execute("UPDATE facts SET archived=1, updated_at=? WHERE workspace_id=? AND archived=0",
                           [ts, name])
         archived = cur.rowcount
@@ -2160,7 +2367,7 @@ TOOLS = {
         }},
     },
     "reset_workspace": {
-        "description": "Reset a workspace. Soft (default): archive all its facts (archived=1, reversible via re-remembering), status='reset'. hard:true deletes its facts permanently (requires confirm:true).",
+        "description": "Reset a workspace. Soft (default): hide all its data — facts are archived (archived=1) and graph/decisions/evidence become unreadable and unwritable — status='reset'. hard:true purges facts, evidence, graph and decisions permanently (requires confirm:true); response reports per-table deleted counts.",
         "inputSchema": {"type": "object", "properties": {
             "workspace": {"type": "string"},
             "hard": {"type": "boolean", "default": False},
@@ -2168,7 +2375,7 @@ TOOLS = {
         }, "required": ["workspace"]},
     },
     "archive_workspace": {
-        "description": "Archive a workspace. Soft (default): archive all its facts (archived=1), status='archived'. hard:true deletes its facts permanently (requires confirm:true).",
+        "description": "Archive a workspace. Soft (default): hide all its data — facts are archived (archived=1) and graph/decisions/evidence become unreadable and unwritable — status='archived'. hard:true purges facts, evidence, graph and decisions permanently (requires confirm:true); response reports per-table deleted counts.",
         "inputSchema": {"type": "object", "properties": {
             "workspace": {"type": "string"},
             "hard": {"type": "boolean", "default": False},

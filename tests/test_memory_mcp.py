@@ -762,6 +762,11 @@ class WorkspaceRecallScopingTest(unittest.TestCase):
 class WorkspaceBypassGuardTest(unittest.TestCase):
     """Isolation must hold on semantic, by-id, and export paths."""
 
+    def tearDown(self):
+        # restore env (this class enables embeddings without its own setUp)
+        for k in ("MEMORY_MCP_EMBEDDINGS", "MEMORY_MCP_EMBED_PROVIDER"):
+            os.environ.pop(k, None)
+
     def test_semantic_search_scoped(self):
         os.environ["MEMORY_MCP_EMBEDDINGS"] = "1"
         os.environ["MEMORY_MCP_EMBED_PROVIDER"] = "test"
@@ -1069,7 +1074,9 @@ class WorkspaceMgmtTest(unittest.TestCase):
         r = mcp.reset_workspace({"workspace": "gamma", "hard": True, "confirm": True})
         self.assertNotIn("error", r, r)
         self.assertTrue(r["hard"])
-        self.assertEqual(r["deleted_facts"], 1)
+        self.assertEqual(r["deleted_facts"], 1)  # backward-compat alias
+        self.assertEqual(r["deleted"]["facts"], 1)
+        self.assertEqual(r["deleted_total"], 1)
         con = mcp.get_db()
         n = con.execute("SELECT COUNT(*) FROM facts WHERE workspace_id='gamma'").fetchone()[0]
         con.close()
@@ -1297,3 +1304,192 @@ class MigrateMemoryTest(unittest.TestCase):
         self.assertEqual(f["workspace"], "proj-alpha")
         self.assertEqual(f["trust"], "high")
         self.assertIn("Alpha widget", f["text"])
+
+
+class WorkspaceCleanupTest(unittest.TestCase):
+    """v0.8: hard reset/archive purge ALL workspace rows (facts, evidence,
+    graph, decisions, embeddings) in FK-safe order — the audit follow-up that
+    previously failed with FOREIGN KEY constraint failed. Soft mode hides
+    graph/decisions too and refuses writes until reactivation."""
+
+    def _seed(self, ws):
+        """Fact + evidence + entity/relation + decision + synthetic embedding
+        row (table always exists) — every table a hard purge must cover."""
+        self.assertNotIn("error", mcp.create_workspace({"workspace": ws}))
+        r = mcp.remember_fact({"text": "cleanup probe fact for " + ws,
+                               "source": "test", "workspace": ws})
+        self.assertNotIn("error", r, r)
+        fid = r["id"]
+        self.assertNotIn("error", mcp.attach_evidence(
+            {"fact_id": fid, "source_ref": "audit://" + ws, "workspace": ws}))
+        self.assertNotIn("error", mcp.remember_entity(
+            {"name": "ent-" + ws, "workspace": ws}))
+        self.assertNotIn("error", mcp.remember_relation(
+            {"subject": "ent-" + ws, "predicate": "pings",
+             "object": "ent2-" + ws, "workspace": ws}))
+        self.assertNotIn("error", mcp.record_decision(
+            {"scenario": "cleanup probe decision for " + ws, "workspace": ws}))
+        con = mcp.get_db()
+        try:
+            con.execute("INSERT OR IGNORE INTO fact_embeddings (fact_id, vec, model, updated_at) "
+                        "VALUES (?, ?, ?, ?)", (fid, b"\x00\x01", "test", mcp.now()))
+            con.commit()
+        finally:
+            con.close()
+        return fid
+
+    def _table_counts(self, ws):
+        con = mcp.get_db()
+        try:
+            out = {}
+            for t, col in (("facts", "workspace_id"), ("entities", "workspace_id"),
+                           ("relations", "workspace_id"), ("decisions", "workspace_id")):
+                out[t] = con.execute("SELECT COUNT(*) FROM %s WHERE %s=?" % (t, col),
+                                     [ws]).fetchone()[0]
+            out["evidence"] = con.execute(
+                "SELECT COUNT(*) FROM evidence WHERE fact_id IN "
+                "(SELECT id FROM facts WHERE workspace_id=?)", [ws]).fetchone()[0]
+            out["embeddings"] = con.execute(
+                "SELECT COUNT(*) FROM fact_embeddings WHERE fact_id IN "
+                "(SELECT id FROM facts WHERE workspace_id=?)", [ws]).fetchone()[0]
+            return out
+        finally:
+            con.close()
+
+    _ZERO = {"facts": 0, "entities": 0, "relations": 0,
+             "decisions": 0, "evidence": 0, "embeddings": 0}
+
+    def test_hard_reset_purges_everything(self):
+        ws = "cleanup-hard-reset"
+        self._seed(ws)
+        res = mcp.reset_workspace({"workspace": ws, "hard": True, "confirm": True})
+        self.assertNotIn("error", res, res)
+        self.assertEqual(res["deleted_total"], sum(res["deleted"].values()))
+        self.assertEqual(self._table_counts(ws), self._ZERO)
+        # reads agree with the purge (shared-pool rows may remain)
+        hits = mcp.search_facts({"query": "cleanup probe", "workspace": ws})
+        self.assertFalse(any(ws in f["text"] for f in hits["facts"]))
+        decs = mcp.query_decisions({"workspace": ws, "limit": 100})
+        self.assertFalse(any("cleanup probe decision for " + ws in d["scenario"]
+                             for d in decs["decisions"]))
+        # registry row removed -> implicit active again
+        con = mcp.get_db()
+        try:
+            self.assertIsNone(con.execute("SELECT status FROM workspaces WHERE id=?",
+                                          [ws]).fetchone())
+        finally:
+            con.close()
+
+    def test_hard_archive_purges_but_keeps_row(self):
+        ws = "cleanup-hard-archive"
+        self._seed(ws)
+        res = mcp.archive_workspace({"workspace": ws, "hard": True, "confirm": True})
+        self.assertNotIn("error", res, res)
+        self.assertEqual(res["deleted_total"], sum(res["deleted"].values()))
+        self.assertEqual(self._table_counts(ws), self._ZERO)
+        con = mcp.get_db()
+        try:
+            row = con.execute("SELECT status FROM workspaces WHERE id=?", [ws]).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["status"], "archived")
+        finally:
+            con.close()
+
+    def test_soft_reset_hides_all_and_blocks_writes(self):
+        ws = "cleanup-soft-reset"
+        self._seed(ws)
+        res = mcp.reset_workspace({"workspace": ws})
+        self.assertNotIn("error", res, res)
+        self.assertEqual(mcp.search_facts({"query": "cleanup probe", "workspace": ws})["count"], 0)
+        self.assertIn("error", mcp.query_decisions({"workspace": ws}))
+        self.assertIn("error", mcp.find_precedents(
+            {"scenario": "cleanup probe decision", "workspace": ws}))
+        self.assertIn("error", mcp.search_graph({"entity": "ent-" + ws, "workspace": ws}))
+        self.assertIn("error", mcp.get_causal_chain({"decision_id": 1, "workspace": ws}))
+        self.assertIn("error", mcp.export_rdf({"workspace": ws}))
+        self.assertIn("error", mcp.detect_conflicts({"text": "cleanup probe", "workspace": ws}))
+        self.assertIn("error", mcp.fact_history({"id": 1, "workspace": ws}))
+        self.assertIn("error", mcp.fact_references({"id": 1, "workspace": ws}))
+        # writes refused
+        self.assertIn("error", mcp.remember_fact({"text": "late write", "workspace": ws}))
+        self.assertIn("error", mcp.ingest_turn({"text": "late ingest", "workspace": ws}))
+        self.assertIn("error", mcp.record_decision({"scenario": "late", "workspace": ws}))
+        self.assertIn("error", mcp.remember_relation(
+            {"subject": "x-" + ws, "predicate": "q", "object": "y-" + ws, "workspace": ws}))
+        self.assertIn("error", mcp.remember_entity({"name": "z-" + ws, "workspace": ws}))
+        self.assertIn("error", mcp.attach_evidence(
+            {"fact_id": 1, "source_ref": "z", "workspace": ws}))
+        self.assertIn("error", mcp.forget_fact({"id": 1, "workspace": ws}))
+        self.assertIn("error", mcp.confirm_fact({"id": 1, "workspace": ws}))
+
+    def test_soft_archive_hides_graph_and_decisions(self):
+        ws = "cleanup-soft-archive"
+        self._seed(ws)
+        res = mcp.archive_workspace({"workspace": ws})
+        self.assertNotIn("error", res, res)
+        self.assertEqual(mcp.search_facts({"query": "cleanup probe", "workspace": ws})["count"], 0)
+        self.assertIn("error", mcp.query_decisions({"workspace": ws}))
+        self.assertIn("error", mcp.search_graph({"entity": "ent-" + ws, "workspace": ws}))
+
+    def test_reactivation_unblocks_writes(self):
+        ws = "cleanup-reactivate"
+        self._seed(ws)
+        mcp.archive_workspace({"workspace": ws})
+        self.assertIn("error", mcp.remember_fact({"text": "blocked", "workspace": ws}))
+        res = mcp.create_workspace({"workspace": ws})
+        self.assertTrue(res.get("reactivated"), res)
+        out = mcp.remember_fact({"text": "after reactivation " + ws,
+                                 "source": "t", "workspace": ws})
+        self.assertNotIn("error", out, out)
+    def test_old_schema_store_purges_after_migration(self):
+        """A store that predates the FTS tables and cascading FKs (graph-era
+        data, no facts_fts/decisions_fts/workspaces) must still hard-purge:
+        _migrate_fks + _migrate_fts bring it to the current schema on open,
+        and the FTS 'delete' trigger must not fail with SQLITE_CORRUPT."""
+        import sqlite3 as _sqlite3
+        db = os.path.join(tempfile.mkdtemp(prefix="mcp-oldws-"), "old.db")
+        con = _sqlite3.connect(db)
+        con.executescript("""
+CREATE TABLE facts (id INTEGER PRIMARY KEY AUTOINCREMENT, sha256 TEXT NOT NULL, text TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '', project TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT '',
+  trust TEXT NOT NULL DEFAULT 'medium', strong INTEGER NOT NULL DEFAULT 0, importance REAL NOT NULL DEFAULT 0.5,
+  invalid_at TEXT NOT NULL DEFAULT '', superseded_by INTEGER, confirmed INTEGER NOT NULL DEFAULT 0,
+  workspace_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  archived INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE entities (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, type TEXT NOT NULL DEFAULT '',
+  aliases TEXT NOT NULL DEFAULT '', workspace_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE relations (id INTEGER PRIMARY KEY AUTOINCREMENT, subject_id INTEGER NOT NULL REFERENCES entities(id),
+  predicate TEXT NOT NULL, object_id INTEGER NOT NULL REFERENCES entities(id), source_fact_id INTEGER,
+  workspace_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, UNIQUE(subject_id, predicate, object_id));
+CREATE TABLE decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL DEFAULT '',
+  subject TEXT NOT NULL DEFAULT '', scenario TEXT NOT NULL, reasoning TEXT NOT NULL DEFAULT '',
+  outcome TEXT NOT NULL DEFAULT '', confidence REAL, decision_maker TEXT NOT NULL DEFAULT '',
+  issue_ref TEXT NOT NULL DEFAULT '', parent_decision_id INTEGER, workspace_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE evidence (id INTEGER PRIMARY KEY AUTOINCREMENT, fact_id INTEGER NOT NULL REFERENCES facts(id),
+  source_ref TEXT NOT NULL, source_checksum TEXT NOT NULL DEFAULT '', fetched_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL, UNIQUE(fact_id, source_ref));
+INSERT INTO facts (sha256, text, workspace_id, created_at, updated_at) VALUES ('a', 'old fact', 'ws-old', 't', 't');
+INSERT INTO evidence (fact_id, source_ref, created_at) VALUES (1, 'old://ref', 't');
+INSERT INTO entities (name, workspace_id, created_at, updated_at) VALUES ('e1', 'ws-old', 't', 't');
+INSERT INTO entities (name, workspace_id, created_at, updated_at) VALUES ('e2', 'ws-old', 't', 't');
+INSERT INTO relations (subject_id, predicate, object_id, workspace_id, created_at) VALUES (1, 'p', 2, 'ws-old', 't');
+INSERT INTO decisions (scenario, workspace_id, created_at, updated_at) VALUES ('old decision', 'ws-old', 't', 't');
+""")
+        con.close()
+        old = mcp.DB_PATH
+        try:
+            os.environ["MEMORY_MCP_DB"] = db
+            mcp.DB_PATH = db
+            r = mcp.reset_workspace({"workspace": "ws-old", "hard": True, "confirm": True})
+            self.assertNotIn("error", r, r)
+            con = mcp.get_db()
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM facts").fetchone()[0], 0)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM evidence").fetchone()[0], 0)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM entities").fetchone()[0], 0)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM relations").fetchone()[0], 0)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM decisions").fetchone()[0], 0)
+            con.close()
+        finally:
+            os.environ.pop("MEMORY_MCP_DB", None)
+            mcp.DB_PATH = old
