@@ -38,7 +38,8 @@ it create/reset/archive/backup semantics.
   (1-64 chars of `[A-Za-z0-9._-]`, no `..`)
 - `list_databases {}` — active + named databases, archived flag
 - `archive_database {name, hard?, confirm?}` — soft (default): rename to
-  `<name>.db.archived`, data preserved, reversible by renaming back;
+  `<name>.db.archived`, data preserved, reversible by renaming back; refuses
+  to clobber an existing archive (returns an error);
   `hard:true` deletes the file permanently (requires `confirm:true`)
 - `backup_database {name?}` — SQLite online backup to `backups/` (default:
   active store; named incl. archived databases)
@@ -140,7 +141,7 @@ resolved source/server/target are printed before writing).
 
 ## Agent skill
 
-- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 30 MCP tools:
+- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 41 MCP tools:
   when to search facts before researching, how to record decisions with
   rationale for precedent lookup, graph/provenance/conflict usage, semantic
   search, and shared-store conventions. Compatible with the `SKILL.md` format
