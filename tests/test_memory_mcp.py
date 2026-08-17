@@ -1267,3 +1267,33 @@ class DecayTest(unittest.TestCase):
                         [date.today().isoformat()]).fetchone()[0]
         con.close()
         self.assertEqual(n, 1)
+
+
+class MigrateMemoryTest(unittest.TestCase):
+    """v0.6/v0.7: migrate_memory.load_facts maps workspace to the project slug."""
+
+    def setUp(self):
+        import shutil as _shutil
+        self.tmpdir = tempfile.mkdtemp(prefix="mcp-migrate-")
+        self._shutil = __import__("shutil")
+        import migrate_memory as _mig
+        self._old_src, self._old_slug = _mig.SRC_DIR, _mig.PROJECT_SLUG
+        with open(os.path.join(self.tmpdir, "alpha-fact.md"), "w", encoding="utf-8") as f:
+            f.write("---\ntitle: Alpha widget\nmetadata:\n  trust: high\n  type: project\n---\n\nBody text here.\n")
+
+    def tearDown(self):
+        import migrate_memory as _mig
+        _mig.SRC_DIR, _mig.PROJECT_SLUG = self._old_src, self._old_slug
+        self._shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_load_facts_sets_workspace_to_project_slug(self):
+        import migrate_memory as mig
+        mig.SRC_DIR = self.tmpdir
+        mig.PROJECT_SLUG = "proj-alpha"
+        facts = mig.load_facts()
+        self.assertEqual(len(facts), 1)
+        f = facts[0]
+        self.assertEqual(f["project"], "proj-alpha")
+        self.assertEqual(f["workspace"], "proj-alpha")
+        self.assertEqual(f["trust"], "high")
+        self.assertIn("Alpha widget", f["text"])
