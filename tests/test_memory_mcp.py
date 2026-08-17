@@ -1774,4 +1774,16 @@ class CategoryIndexTest(unittest.TestCase):
             self.assertIn("importance", f)
             self.assertIn("updated_at", f)
             self.assertEqual(f["category"], "docker")
+    def test_dedup_preserves_explicit_category(self):
+        self._fact("docker-образ пересобран", category="infra", workspace="cat-ws")
+        # re-remember the same text WITHOUT args: rules would say "docker",
+        # but the stored explicit choice must survive
+        self._fact("docker-образ пересобран", workspace="cat-ws")
+        rows = mcp.list_facts({"workspace": "cat-ws"})["facts"]
+        self.assertEqual(rows[0]["category"], "infra")
+        # explicit refresh on re-remember still works
+        self._fact("docker-образ пересобран", category="runtimes", workspace="cat-ws")
+        rows = mcp.list_facts({"workspace": "cat-ws"})["facts"]
+        self.assertEqual(rows[0]["category"], "runtimes")
+
 

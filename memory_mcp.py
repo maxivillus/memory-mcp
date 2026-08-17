@@ -888,7 +888,10 @@ def remember_fact(args):
             if "importance" in args:
                 sets.append("importance=?")
                 params.append(importance)
-            if cat_id is not None:
+            # Refresh the category only when the caller asked for one
+            # explicitly — rules must not overwrite a stored explicit choice.
+            if cat_id is not None and (
+                    (args.get("category") or "").strip() or (args.get("domain") or "").strip()):
                 sets.append("category_id=?")
                 params.append(cat_id)
             con.execute("UPDATE facts SET %s WHERE id=?" % ", ".join(sets),
