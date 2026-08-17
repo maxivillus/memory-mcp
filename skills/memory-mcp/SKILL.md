@@ -12,7 +12,7 @@ metadata:
 
 # Shared Agent Memory (memory-mcp)
 
-Available to runtime agents as the `mcp__memory-mcp__*` tools (30 tools).
+Available to runtime agents as the `mcp__memory-mcp__*` tools (41 tools).
 One shared store across all runtimes: a fact or decision written in one
 session is visible to every later session.
 
@@ -94,6 +94,33 @@ session is visible to every later session.
   only the shared pool (legacy facts). `remember_fact` warns when
   `workspace` is missing — always pass it.
 
+## Database & workspace management (v0.6)
+
+Separate databases are extra SQLite stores for isolation or migration;
+workspaces are named access scopes in the active store. The active store
+(MEMORY_MCP_DB) can be backed up but never archived or deleted through
+these tools. Soft operations are reversible (facts get archived=1, data is
+kept); hard mode physically deletes and requires confirm: true.
+
+- create_database {name} — new named database (separate SQLite file under
+  databases/); list_databases shows active + named + archived.
+- backup_database {name?} — online backup to backups/ (default: the active
+  store; a named or archived database can be backed up too).
+- archive_database {name, hard?, confirm?} — soft: rename to
+  <name>.db.archived (reversible); hard: true deletes the file (requires
+  confirm: true). Refuses to clobber an existing archive.
+- delete_database {name, confirm: true} — permanent file delete.
+- create_workspace {workspace} — register a workspace (idempotent;
+  re-registering reactivates an archived/reset one); list_workspaces shows
+  status + active fact counts.
+- reset_workspace {workspace, hard?, confirm?} / archive_workspace
+  {workspace, hard?, confirm?} — soft: archive the workspace's facts
+  (archived=1, reversible); hard: true deletes them (requires confirm: true).
+- backup_workspace {workspace} — JSON export of all its facts (incl.
+  archived) to backups/workspace-<name>-<ts>.json.
+- Names are validated: 1-64 chars of [A-Za-z0-9._-], no '..' — never pass
+  unvalidated input to the file-touching tools.
+
 ## Conventions
 
 - Use consistent `project`/`domain` scopes so queries and the index stay
@@ -102,4 +129,5 @@ session is visible to every later session.
 - The store is a shared read-model: agents may write facts/decisions/evidence,
   but must not delete or mutate records owned by another agent without a
   strong reason.
+
 
