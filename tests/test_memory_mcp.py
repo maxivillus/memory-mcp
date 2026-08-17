@@ -1631,3 +1631,147 @@ class DatabaseIsolationTest(unittest.TestCase):
         # recovering: select the active store back
         self.assertNotIn("error", mcp.reset_database({}))
         self.assertNotIn("error", mcp.search_facts({"query": "anything"}))
+
+
+class CategoryIndexTest(unittest.TestCase):
+    """v0.10: topic categories — rule-based assignment at write time, card
+    catalog (list_categories), shelf lookup (search_index snippets), LLM batch
+    refinement (categorize_pending), category-aware reads, purge coverage."""
+
+    def setUp(self):
+        self._old_db = mcp.DB_PATH
+        self.tmpdir = tempfile.mkdtemp(prefix="mcp-cat-")
+        self.db = os.path.join(self.tmpdir, "active.db")
+        os.environ["MEMORY_MCP_DB"] = self.db
+        mcp.DB_PATH = self.db
+        mcp._SELECTED_DB[0] = None
+        self._env = {k: os.environ.pop(k, None)
+                     for k in ("MEMORY_MCP_CATEGORIZE", "MEMORY_MCP_LLM_PROVIDER",
+                     "MEMORY_MCP_EMBEDDINGS", "MEMORY_MCP_EMBED_PROVIDER")}
+
+    def tearDown(self):
+        import shutil as _shutil
+        os.environ.pop("MEMORY_MCP_DB", None)
+        mcp.DB_PATH = self._old_db
+        mcp._SELECTED_DB[0] = None
+        for k, v in self._env.items():
+            if v is not None:
+                os.environ[k] = v
+        _shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _fact(self, text, **kw):
+        r = mcp.remember_fact({"text": text, "source": "test", **kw})
+        self.assertNotIn("error", r, r)
+        return r
+
+    def test_rule_based_and_explicit_category(self):
+        self._fact("Пересобрал docker-образ и пересоздал контейнер", workspace="cat-ws")
+        self._fact("summarize_index отдаёт категории", workspace="cat-ws")
+        self._fact("полностью невнятный текст про зебр", workspace="cat-ws")
+        self._fact("тоже про зебр, но явная категория", category="animals", workspace="cat-ws")
+        cats = mcp.list_categories({"workspace": "cat-ws"})["categories"]
+        by_name = {c["name"]: c for c in cats}
+        self.assertEqual(by_name["docker"]["active_facts"], 1)
+        self.assertEqual(by_name["memory-mcp"]["active_facts"], 1)
+        self.assertEqual(by_name["animals"]["active_facts"], 1)
+        # no-match fact stays uncategorized
+        rows = mcp.list_facts({"workspace": "cat-ws"})["facts"]
+        by_text = {f["text"]: f["category"] for f in rows}
+        self.assertIsNone(by_text["полностью невнятный текст про зебр"])
+
+    def test_search_index_groups_and_caps(self):
+        self._fact("docker-образ reasonix пересобран", workspace="cat-ws")
+        self._fact("docker-compose пересоздан", workspace="cat-ws")
+        self._fact("summarize_index линии с категориями", workspace="cat-ws")
+        self._fact("очень длинный факт " + "слово " * 60, workspace="cat-ws")
+        r = mcp.search_index({"query": "docker OR compose OR факт OR длинный",
+                              "workspace": "cat-ws", "limit": 10})
+        self.assertNotIn("error", r, r)
+        groups = {g["category"]: g["facts"] for g in r["groups"]}
+        self.assertEqual(len(groups["docker"]), 2)
+        self.assertIn("(uncategorized)", groups)
+        # snippets only — full text never leaks
+        for g in r["groups"]:
+            for f in g["facts"]:
+                self.assertNotIn("text", f)
+                self.assertLessEqual(len(f["snippet"]), 125)
+        # category filter
+        r2 = mcp.search_index({"query": "docker", "category": "docker", "workspace": "cat-ws"})
+        self.assertEqual(r2["count"], 2)
+        r3 = mcp.search_index({"query": "docker", "category": "memory-mcp", "workspace": "cat-ws"})
+        self.assertEqual(r3["count"], 0)
+        # max_chars caps output
+        r4 = mcp.search_index({"query": "docker OR compose OR факт", "max_chars": 200,
+                               "workspace": "cat-ws"})
+        self.assertTrue(r4["truncated"] or r4["shown"] < r4["count"])
+
+    def test_categorize_pending_gate_and_llm(self):
+        r = mcp.categorize_pending({"workspace": "cat-ws"})
+        self.assertIn("error", r)  # disabled without MEMORY_MCP_CATEGORIZE
+        os.environ["MEMORY_MCP_CATEGORIZE"] = "1"
+        os.environ["MEMORY_MCP_LLM_PROVIDER"] = "test"
+        self._fact("непонятный факт про дампы", workspace="cat-ws")
+        self._fact("непонятный факт про лаги", workspace="cat-ws")
+        r = mcp.categorize_pending({"workspace": "cat-ws", "limit": 10})
+        self.assertNotIn("error", r, r)
+        self.assertEqual(r["categorized"], 2, r)
+        rows = mcp.list_facts({"workspace": "cat-ws"})["facts"]
+        cats = {f["category"] for f in rows}
+        self.assertTrue(all(c and c.startswith("llm-") for c in cats), cats)
+        # idempotent: nothing left to categorize
+        r2 = mcp.categorize_pending({"workspace": "cat-ws"})
+        self.assertEqual(r2["count"], 0)
+
+    def test_workspace_isolation_and_purge(self):
+        self._fact("docker-факт в ws-a", workspace="cat-a")
+        self._fact("docker-факт в ws-b", workspace="cat-b")
+        cats_a = {c["name"] for c in mcp.list_categories({"workspace": "cat-a"})["categories"]}
+        self.assertEqual(cats_a, {"docker"})
+        # hard reset purges categories
+        r = mcp.reset_workspace({"workspace": "cat-a", "hard": True, "confirm": True})
+        self.assertNotIn("error", r, r)
+        self.assertEqual(r["deleted"]["categories"], 1)
+        self.assertEqual(mcp.list_categories({"workspace": "cat-a"})["count"], 0)
+        # ws-b untouched
+        self.assertEqual(len(mcp.list_categories({"workspace": "cat-b"})["categories"]), 1)
+
+    def test_migration_adds_category_id(self):
+        import sqlite3 as _sqlite3
+        db = os.path.join(self.tmpdir, "old.db")
+        con = _sqlite3.connect(db)
+        con.execute("CREATE TABLE facts (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "sha256 TEXT NOT NULL, text TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', "
+                    "project TEXT NOT NULL DEFAULT '', domain TEXT NOT NULL DEFAULT '', "
+                    "trust TEXT NOT NULL DEFAULT 'medium', strong INTEGER NOT NULL DEFAULT 0, "
+                    "importance REAL NOT NULL DEFAULT 0.5, invalid_at TEXT NOT NULL DEFAULT '', "
+                    "superseded_by INTEGER, confirmed INTEGER NOT NULL DEFAULT 0, "
+                    "workspace_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, "
+                    "updated_at TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, "
+                    "last_accessed_at TEXT NOT NULL DEFAULT '', access_count INTEGER NOT NULL DEFAULT 0, "
+                    "revival_count INTEGER NOT NULL DEFAULT 0, lifecycle TEXT NOT NULL DEFAULT 'active')")
+        con.commit()
+        con.close()
+        os.environ["MEMORY_MCP_DB"] = db
+        mcp.DB_PATH = db
+        con = mcp.get_db()
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
+        self.assertIn("category_id", cols)
+        cats = [r["name"] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='categories'")]
+        self.assertEqual(cats, ["categories"])
+        con.close()
+    def test_search_index_semantic_path(self):
+        # embeddings enabled BEFORE writes so fact_embeddings rows exist
+        os.environ["MEMORY_MCP_EMBEDDINGS"] = "1"
+        os.environ["MEMORY_MCP_EMBED_PROVIDER"] = "test"
+        self._fact("docker-образ reasonix пересобран", workspace="cat-ws")
+        self._fact("docker-compose пересоздан", workspace="cat-ws")
+        r = mcp.search_index({"query": "docker", "semantic": True, "workspace": "cat-ws"})
+        self.assertNotIn("error", r, r)
+        groups = {g["category"]: g["facts"] for g in r["groups"]}
+        self.assertEqual(len(groups.get("docker", [])), 2, groups)
+        for f in groups["docker"]:
+            self.assertIn("importance", f)
+            self.assertIn("updated_at", f)
+            self.assertEqual(f["category"], "docker")
+

@@ -11,13 +11,15 @@ pipeline into the server for runtimes that have no client patches.
 
 ## Tools
 
-- `remember_fact {text, source?, project?, domain?, trust?, strong?}` — upsert
-  (dedup by sha256 of text). `add_fact` is an alias for the same operation.
-- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?}` —
+- `remember_fact {text, source?, project?, domain?, category?, trust?, strong?}` —
+  upsert (dedup by sha256 of text). Category auto-assigned at write time
+  (explicit `category` > legacy `domain` > keyword rules > uncategorized).
+  `add_fact` is an alias for the same operation.
+- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?}` —
   FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors
-- `list_facts {project?, domain?, limit?}` — recent non-archived facts
-- `summarize_index {project?, domain?, trust_min?, strong_only?, limit?, max_chars?}` —
-  compact one-line-per-fact index (`#id trust! [domain] text`), freshest first,
+- `list_facts {project?, domain?, category?, limit?}` — recent non-archived facts
+- `summarize_index {project?, domain?, category?, trust_min?, strong_only?, limit?, max_chars?}` —
+  compact one-line-per-fact index (`#id trust! [category] [domain] text`), freshest first,
   description clipped at 120 chars, total capped at `max_chars` (default 4000,
   cut at line boundary) — mirrors the reasonix index-cap for prompt budgets
 - `forget_fact {id | sha256}` — soft delete (archived=1)
@@ -136,6 +138,33 @@ and `list_workspaces` reports the same counts per workspace — so a hard
 cleanup is verifiable end-to-end (every scoped query returns 0 synthetic
 records afterwards).
 
+### v0.10 — topic categories: the library flow (2026-08-17)
+
+Accessing memory like a library: never dump everything — ask the librarian
+first, then go to the shelf, then take the book. Three tiers:
+
+- `list_categories {query?}` — the card catalog: topic categories with
+  active/total fact counts, most-used first.
+- `search_index {query, category?, limit?, max_chars?, semantic?}` — the
+  shelf lookup: one-line snippets (≤120 chars) of matching facts **grouped by
+  category**, capped at `max_chars` (default 2000). Full texts are never
+  returned here.
+- `get_provenance {fact_id | sha256}` — the book: full fact + evidence,
+  loaded only for facts chosen from the index.
+
+Categorization is hybrid (A4): at write time `remember_fact` assigns a
+category instantly — explicit `category` arg > legacy `domain` arg > keyword
+rules (`_CATEGORY_RULES`) > uncategorized (NULL). The background half is
+`categorize_pending {limit?}` — an LLM batch that assigns categories to
+uncategorized facts, reusing existing category names when they fit (enabled
+with `MEMORY_MCP_CATEGORIZE=1`; provider via `MEMORY_MCP_LLM_*`, see
+Environment). Categories are workspace-scoped (`categories` table,
+`facts.category_id` with `ON DELETE SET NULL` on fresh stores; additive
+`_migrate_categories` for existing ones). Every read (`search_facts`,
+`list_facts`, `summarize_index`) now carries the `category` of each fact and
+accepts a `category` filter; `summarize_index` lines include `[category]`
+tags.
+
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
 Covers decision rationale, precedent search and evidence lineage with zero
@@ -175,6 +204,14 @@ migrate in place):
   + `decisions_fts` FTS5 (scenario/reasoning/category) with triggers
 - `evidence(id, fact_id → facts, source_ref, source_checksum, fetched_at,
   created_at, UNIQUE(fact_id, source_ref))`
+
+v0.10 additions (additive — `_migrate_categories` adds `facts.category_id`
+to existing DBs):
+
+- `categories(id, name, workspace_id, created_at, updated_at,
+  UNIQUE(name, workspace_id))`
+- `facts.category_id → categories(id) ON DELETE SET NULL` (fresh/rebuild DDL;
+  plain column on migrated stores)
 
 ## Environment
 
