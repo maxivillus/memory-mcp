@@ -1107,7 +1107,8 @@ class WorkspaceMgmtTest(unittest.TestCase):
         p = os.path.join(self.tmpdir, "backups", r["backup"])
         self.assertTrue(os.path.exists(p))
         data = json.load(open(p, encoding="utf-8"))
-        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["counts"]["facts"], 1)
+        self.assertEqual(data["counts"]["evidence"], 0)
         self.assertEqual(data["facts"][0]["text"], "back me up")
         r = mcp.backup_workspace({"workspace": "nonexistent"})
         self.assertIn("error", r)
@@ -1493,3 +1494,140 @@ INSERT INTO decisions (scenario, workspace_id, created_at, updated_at) VALUES ('
         finally:
             os.environ.pop("MEMORY_MCP_DB", None)
             mcp.DB_PATH = old
+
+
+class DatabaseIsolationTest(unittest.TestCase):
+    """v0.9: session-level database selection — select_database points ALL
+    tools at a named DB (active store stays protected); full workspace
+    read-back (backup_workspace/list_workspaces) covers graph/decisions."""
+
+    def setUp(self):
+        self._old_db = mcp.DB_PATH
+        self.tmpdir = tempfile.mkdtemp(prefix="mcp-dbiso-")
+        self.db = os.path.join(self.tmpdir, "active.db")
+        os.environ["MEMORY_MCP_DB"] = self.db
+        mcp.DB_PATH = self.db
+        mcp._SELECTED_DB[0] = None
+
+    def tearDown(self):
+        import shutil as _shutil
+        os.environ.pop("MEMORY_MCP_DB", None)
+        mcp.DB_PATH = self._old_db
+        mcp._SELECTED_DB[0] = None
+        _shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _seed_temp_workspace(self, ws="iso-ws"):
+        """Fact + evidence + entity/relation + 2-decision chain in the temp DB."""
+        mcp.create_workspace({"workspace": ws})
+        f = mcp.remember_fact({"text": "iso fact for " + ws, "source": "t", "workspace": ws})
+        self.assertNotIn("error", f, f)
+        fid = f["id"]
+        self.assertNotIn("error", mcp.attach_evidence(
+            {"fact_id": fid, "source_ref": "iso://1", "workspace": ws}))
+        self.assertNotIn("error", mcp.remember_entity({"name": "iso-ent-" + ws, "workspace": ws}))
+        self.assertNotIn("error", mcp.remember_relation(
+            {"subject": "iso-ent-" + ws, "predicate": "p",
+             "object": "iso-ent2-" + ws, "workspace": ws}))
+        d1 = mcp.record_decision({"scenario": "iso decision 1 for " + ws, "workspace": ws})
+        self.assertNotIn("error", d1, d1)
+        d2 = mcp.record_decision({"scenario": "iso decision 2 for " + ws,
+                                  "parent_decision_id": d1["id"], "workspace": ws})
+        self.assertNotIn("error", d2, d2)
+        return fid, d2["id"]
+
+    def test_select_database_isolates_all_tools(self):
+        r = mcp.create_database({"name": "iso-tmp"})
+        self.assertNotIn("error", r, r)
+        sel = mcp.select_database({"name": "iso-tmp"})
+        self.assertNotIn("error", sel, sel)
+        self.assertTrue(sel["selected"] and not sel["active"])
+        self.assertEqual(mcp.current_database({})["database"], "iso-tmp")
+        # list_databases marks the selection
+        dbs = mcp.list_databases({})["databases"]
+        self.assertTrue([d for d in dbs if d["name"] == "iso-tmp"][0]["selected"])
+        self.assertFalse([d for d in dbs if d["name"] == "active"][0]["selected"])
+
+        fid, d2id = self._seed_temp_workspace()
+        # scope/precedent/causal/provenance/export all see the temp DB
+        self.assertEqual(mcp.search_facts({"query": "iso fact", "workspace": "iso-ws"})["count"], 1)
+        self.assertEqual(mcp.query_decisions({"workspace": "iso-ws"})["count"], 2)
+        self.assertEqual(mcp.get_causal_chain({"decision_id": d2id, "workspace": "iso-ws"})["count"], 2)
+        self.assertEqual(len(mcp.get_provenance(
+            {"fact_id": fid, "workspace": "iso-ws"})["evidence"]), 1)
+        self.assertNotIn("error", mcp.export_rdf({"workspace": "iso-ws"}))
+        # concurrent dedup works in the temp DB
+        again = mcp.remember_fact({"text": "iso fact for iso-ws", "source": "t",
+                                   "workspace": "iso-ws"})
+        self.assertTrue(again["dedup"])
+
+        # active store stays untouched
+        mcp.reset_database({})
+        self.assertEqual(mcp.current_database({})["active"], True)
+        self.assertEqual(mcp.search_facts({"query": "iso fact", "workspace": "iso-ws"})["count"], 0)
+        self.assertEqual(mcp.query_decisions({"workspace": "iso-ws"})["count"], 0)
+
+        # back to temp: hard reset twice (idempotent), nothing left
+        mcp.select_database({"name": "iso-tmp"})
+        r1 = mcp.reset_workspace({"workspace": "iso-ws", "hard": True, "confirm": True})
+        self.assertNotIn("error", r1, r1)
+        r2 = mcp.reset_workspace({"workspace": "iso-ws", "hard": True, "confirm": True})
+        self.assertNotIn("error", r2, r2)
+        self.assertEqual(sum(r2["deleted"].values()), 0)
+        # every scoped query returns 0 after cleanup
+        self.assertEqual(mcp.search_facts({"query": "iso fact", "workspace": "iso-ws"})["count"], 0)
+        self.assertEqual(mcp.query_decisions({"workspace": "iso-ws"})["count"], 0)
+
+        # delete the temp DB (must not be selected anymore)
+        mcp.reset_database({})
+        d = mcp.delete_database({"name": "iso-tmp", "confirm": True})
+        self.assertNotIn("error", d, d)
+        self.assertFalse(os.path.exists(mcp._db_file("iso-tmp")))
+
+    def test_delete_archive_selected_database_refused(self):
+        mcp.create_database({"name": "iso-lock"})
+        mcp.select_database({"name": "iso-lock"})
+        self.assertIn("error", mcp.delete_database({"name": "iso-lock", "confirm": True}))
+        self.assertIn("error", mcp.archive_database({"name": "iso-lock"}))
+        mcp.reset_database({})
+        self.assertNotIn("error", mcp.delete_database({"name": "iso-lock", "confirm": True}))
+
+    def test_backup_and_list_workspace_cover_graph(self):
+        mcp.create_workspace({"workspace": "iso-bk"})
+        f = mcp.remember_fact({"text": "bk fact", "source": "t", "workspace": "iso-bk"})
+        self.assertNotIn("error", f, f)
+        self.assertNotIn("error", mcp.attach_evidence(
+            {"fact_id": f["id"], "source_ref": "bk://1", "workspace": "iso-bk"}))
+        self.assertNotIn("error", mcp.remember_entity({"name": "bk-ent", "workspace": "iso-bk"}))
+        self.assertNotIn("error", mcp.record_decision(
+            {"scenario": "bk decision", "workspace": "iso-bk"}))
+        lst = [w for w in mcp.list_workspaces({})["workspaces"] if w["id"] == "iso-bk"][0]
+        self.assertEqual(lst["facts"], 1)
+        self.assertEqual(lst["entities"], 1)
+        self.assertEqual(lst["decisions"], 1)
+        self.assertEqual(lst["evidence"], 1)
+        bk = mcp.backup_workspace({"workspace": "iso-bk"})
+        self.assertNotIn("error", bk, bk)
+        self.assertEqual(bk["counts"], {"facts": 1, "entities": 1, "relations": 0,
+                                        "decisions": 1, "evidence": 1})
+        # the JSON on disk carries the same counts + rows
+        import json as _json
+        with open(os.path.join(os.path.dirname(mcp.DB_PATH), "backups",
+                               os.path.basename(bk["backup"]))) as fh:
+            data = _json.load(fh)
+        self.assertEqual(data["counts"]["evidence"], 1)
+        self.assertEqual(len(data["evidence"]), 1)
+        self.assertEqual(len(data["decisions"]), 1)
+        # backup of an empty workspace errors
+        mcp.create_workspace({"workspace": "iso-empty"})
+        self.assertIn("error", mcp.backup_workspace({"workspace": "iso-empty"}))
+
+    def test_selected_database_vanished_fails_loudly(self):
+        mcp.create_database({"name": "iso-ghost"})
+        mcp.select_database({"name": "iso-ghost"})
+        os.remove(mcp._db_file("iso-ghost"))
+        with self.assertRaises(RuntimeError) as cm:
+            mcp.search_facts({"query": "anything"})
+        self.assertIn("no longer exists", str(cm.exception))
+        # recovering: select the active store back
+        self.assertNotIn("error", mcp.reset_database({}))
+        self.assertNotIn("error", mcp.search_facts({"query": "anything"}))

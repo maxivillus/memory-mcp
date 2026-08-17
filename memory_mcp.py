@@ -42,6 +42,10 @@ def default_db_path():
 
 
 DB_PATH = os.environ.get("MEMORY_MCP_DB") or default_db_path()
+# v0.9 session-scoped database selection: `select_database` points all
+# subsequent tools at a named database (separate SQLite file); None = the
+# active store (MEMORY_MCP_DB), which stays protected from delete/archive.
+_SELECTED_DB = [None]
 VALID_TRUST = ("high", "medium", "low")
 # v0.5 rebuild DDL: same facts shape without the global UNIQUE(sha256).
 _FACTS_TABLE_DDL = """
@@ -288,7 +292,13 @@ def _open_db(path):
 
 
 def get_db():
-    return _open_db(DB_PATH)
+    if _SELECTED_DB[0] and not os.path.exists(_db_file(_SELECTED_DB[0])):
+        # sqlite3.connect would silently recreate the file as an empty store —
+        # fail loudly instead of operating on a brand-new database.
+        raise RuntimeError(
+            "selected database %r no longer exists — reset_database or "
+            "recreate it with create_database" % _SELECTED_DB[0])
+    return _open_db(_db_path())
 
 
 def _migrate_facts(con):
@@ -563,26 +573,45 @@ def _active_db_name():
     return os.path.basename(DB_PATH)
 
 
+def _active_db_label():
+    """Display label of the active store (extension stripped when .db)."""
+    n = _active_db_name()
+    return n[:-3] if n.endswith(".db") else n
+
+
+def _db_path():
+    """Path of the session-selected database, or the active store."""
+    if _SELECTED_DB[0]:
+        return _db_file(_SELECTED_DB[0])
+    return DB_PATH
+
+
+def _is_active_name(name):
+    """True when `name` refers to the active store (with or without .db)."""
+    return name + ".db" == _active_db_name() or name == _active_db_label()
+
+
 # ---- v0.7 decay support: activity days, search-hit bookkeeping ------------
 
-_LAST_ACTIVITY_DAY = [None]  # module-level cache: one INSERT per day per process
+_LAST_ACTIVITY_DAY = [None]  # (day, db_path) of the last stamp, per database
 
 
 def _register_activity_day():
     """Record "the system was online and memory was used" for today.
     Best-effort, never raises; one row per day (INSERT OR IGNORE)."""
     day = now()[:10]
-    if _LAST_ACTIVITY_DAY[0] == day:
+    path = _db_path()
+    if _LAST_ACTIVITY_DAY[0] == (day, path):
         return
     try:
-        con = sqlite3.connect(DB_PATH, timeout=10)
+        con = sqlite3.connect(path, timeout=10)
         try:
             con.execute("CREATE TABLE IF NOT EXISTS activity_days (day TEXT PRIMARY KEY)")
             con.execute("INSERT OR IGNORE INTO activity_days (day) VALUES (?)", (day,))
             con.commit()
         finally:
             con.close()
-        _LAST_ACTIVITY_DAY[0] = day
+        _LAST_ACTIVITY_DAY[0] = (day, path)
     except sqlite3.Error:
         pass
 
@@ -1695,11 +1724,47 @@ def _ts_stamp():
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
+# ---- v0.9 session-scoped database selection -------------------------------
+# A stdio MCP server lives for one session, so selection is process-scoped:
+# select_database points ALL subsequent tools at a named database. The active
+# store (MEMORY_MCP_DB) stays protected — it can be selected back at any
+# time, but never archived/deleted through these tools.
+
+def select_database(args):
+    """Session-level: point all subsequent tool calls at a named database.
+    Selecting the active store (its name) returns to the default."""
+    name, err = _validate_name(args.get("name"), "database")
+    if err:
+        return {"error": err}
+    if _is_active_name(name):
+        _SELECTED_DB[0] = None
+        return {"database": _active_db_label(), "selected": True, "active": True}
+    p = _db_file(name)
+    if not os.path.exists(p):
+        return {"error": f"database {name} not found — create it with create_database first"}
+    _SELECTED_DB[0] = name
+    return {"database": name, "selected": True, "active": False}
+
+
+def current_database(_args=None):
+    """Name of the database all tools currently operate on."""
+    sel = _SELECTED_DB[0]
+    if sel:
+        return {"database": sel, "active": False}
+    return {"database": _active_db_label(), "active": True}
+
+
+def reset_database(_args=None):
+    """Return to the active store (MEMORY_MCP_DB) for all tools."""
+    _SELECTED_DB[0] = None
+    return {"database": _active_db_label(), "selected": True, "active": True}
+
+
 def create_database(args):
     name, err = _validate_name(args.get("name"), "database")
     if err:
         return {"error": err}
-    if name + ".db" == _active_db_name():
+    if _is_active_name(name):
         return {"error": f"database {name} is the active store (MEMORY_MCP_DB)"}
     p = _db_file(name)
     if os.path.exists(p):
@@ -1714,15 +1779,17 @@ def create_database(args):
 
 def list_databases(args):
     d = _db_dir()
+    sel = _SELECTED_DB[0]
     dbs = []
     for fn in sorted(os.listdir(d)):
         if fn.endswith(".db"):
-            dbs.append({"name": fn[:-3], "active": False, "archived": False})
+            dbs.append({"name": fn[:-3], "active": False, "archived": False,
+                        "selected": sel == fn[:-3]})
         elif fn.endswith(".db.archived"):
-            dbs.append({"name": fn[:-len(".db.archived")], "active": False, "archived": True})
-    active = _active_db_name()
-    dbs.insert(0, {"name": active[:-3] if active.endswith(".db") else active,
-                   "active": True, "archived": False})
+            dbs.append({"name": fn[:-len(".db.archived")], "active": False,
+                        "archived": True, "selected": False})
+    dbs.insert(0, {"name": _active_db_label(), "active": True,
+                   "archived": False, "selected": sel is None})
     return {"databases": dbs}
 
 
@@ -1730,8 +1797,11 @@ def archive_database(args):
     name, err = _validate_name(args.get("name"), "database")
     if err:
         return {"error": err}
-    if name + ".db" == _active_db_name():
+    if _is_active_name(name):
         return {"error": f"cannot archive the active database (MEMORY_MCP_DB)"}
+    if _SELECTED_DB[0] == name:
+        return {"error": f"cannot archive database {name}: it is currently selected "
+                         "(reset_database or select the active store first)"}
     p = _db_file(name)
     if not os.path.exists(p):
         return {"error": f"database {name} not found"}
@@ -1749,8 +1819,9 @@ def archive_database(args):
 
 def backup_database(args):
     name = (args.get("name") or "").strip()
-    label = _active_db_name()
-    src = DB_PATH
+    sel = _SELECTED_DB[0]
+    label = (sel + ".db") if sel else _active_db_name()
+    src = _db_path()
     if name:
         name, err = _validate_name(name, "database")
         if err:
@@ -1784,8 +1855,11 @@ def delete_database(args):
     name, err = _validate_name(args.get("name"), "database")
     if err:
         return {"error": err}
-    if name + ".db" == _active_db_name():
+    if _is_active_name(name):
         return {"error": f"cannot delete the active database (MEMORY_MCP_DB)"}
+    if _SELECTED_DB[0] == name:
+        return {"error": f"cannot delete database {name}: it is currently selected "
+                         "(reset_database or select the active store first)"}
     if args.get("confirm") is not True:
         return {"error": "confirm: true is required to delete a database"}
     p = _db_file(name)
@@ -1827,7 +1901,12 @@ def list_workspaces(args):
     try:
         status = (args.get("status") or "").strip()
         q = ("SELECT w.id, w.status, w.created_at, w.updated_at, "
-             "(SELECT COUNT(*) FROM facts f WHERE f.workspace_id=w.id AND f.archived=0 AND f.invalid_at='') AS active_facts "
+             "(SELECT COUNT(*) FROM facts f WHERE f.workspace_id=w.id AND f.archived=0 AND f.invalid_at='') AS active_facts, "
+             "(SELECT COUNT(*) FROM facts f WHERE f.workspace_id=w.id) AS facts, "
+             "(SELECT COUNT(*) FROM entities e WHERE e.workspace_id=w.id) AS entities, "
+             "(SELECT COUNT(*) FROM relations r WHERE r.workspace_id=w.id) AS relations, "
+             "(SELECT COUNT(*) FROM decisions d WHERE d.workspace_id=w.id) AS decisions, "
+             "(SELECT COUNT(*) FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE f.workspace_id=w.id) AS evidence "
              "FROM workspaces w")
         params = []
         if status:
@@ -1944,18 +2023,35 @@ def backup_workspace(args):
         return {"error": err}
     con = get_db()
     try:
-        rows = [dict(r) for r in con.execute(
+        facts = [dict(r) for r in con.execute(
             "SELECT id, sha256, text, source, project, domain, trust, strong, importance, workspace_id, "
             "created_at, updated_at, archived FROM facts WHERE workspace_id=? ORDER BY id", [name])]
+        entities = [dict(r) for r in con.execute(
+            "SELECT id, name, type, aliases, workspace_id, created_at, updated_at "
+            "FROM entities WHERE workspace_id=? ORDER BY id", [name])]
+        relations = [dict(r) for r in con.execute(
+            "SELECT id, subject_id, predicate, object_id, source_fact_id, workspace_id, created_at "
+            "FROM relations WHERE workspace_id=? ORDER BY id", [name])]
+        decisions = [dict(r) for r in con.execute(
+            "SELECT id, category, subject, scenario, reasoning, outcome, confidence, decision_maker, "
+            "issue_ref, parent_decision_id, workspace_id, created_at, updated_at "
+            "FROM decisions WHERE workspace_id=? ORDER BY id", [name])]
+        evidence = [dict(r) for r in con.execute(
+            "SELECT e.id, e.fact_id, e.source_ref, e.source_checksum, e.fetched_at, e.created_at "
+            "FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE f.workspace_id=? ORDER BY e.id", [name])]
     finally:
         con.close()
-    if not rows:
-        return {"error": f"workspace {name} has no facts"}
+    counts = {"facts": len(facts), "entities": len(entities), "relations": len(relations),
+              "decisions": len(decisions), "evidence": len(evidence)}
+    if sum(counts.values()) == 0:
+        return {"error": f"workspace {name} has no data"}
     dest = os.path.join(_backup_dir(), f"workspace-{name}-{_ts_stamp()}.json")
     with open(dest, "w", encoding="utf-8") as f:
-        json.dump({"workspace": name, "exported_at": now(), "count": len(rows), "facts": rows},
+        json.dump({"workspace": name, "exported_at": now(), "counts": counts,
+                   "facts": facts, "entities": entities, "relations": relations,
+                   "decisions": decisions, "evidence": evidence},
                   f, ensure_ascii=False, indent=2)
-    return {"workspace": name, "backup": os.path.basename(dest), "count": len(rows)}
+    return {"workspace": name, "backup": os.path.basename(dest), "counts": counts}
 
 
 TOOLS = {
@@ -2342,17 +2438,31 @@ TOOLS = {
         }, "required": ["name"]},
     },
     "backup_database": {
-        "description": "Backup a database (active by default, or a named one incl. archived) to backups/ via SQLite online backup API.",
+        "description": "Backup a database (the selected or active store by default, or a named one incl. archived) to backups/ via SQLite online backup API.",
         "inputSchema": {"type": "object", "properties": {
-            "name": {"type": "string", "description": "optional; defaults to the active store"},
+            "name": {"type": "string", "description": "optional; defaults to the selected/active store"},
         }},
     },
     "delete_database": {
-        "description": "Permanently delete a named database file (requires confirm:true). The active database cannot be deleted.",
+        "description": "Permanently delete a named database file (requires confirm:true). The active database and a currently selected one cannot be deleted.",
         "inputSchema": {"type": "object", "properties": {
             "name": {"type": "string"},
             "confirm": {"type": "boolean", "default": False},
         }, "required": ["name", "confirm"]},
+    },
+    "select_database": {
+        "description": "Session-level: point all subsequent tools at a named database (create it with create_database first). Selecting the active store's name returns to the default. The active store (MEMORY_MCP_DB) stays protected.",
+        "inputSchema": {"type": "object", "properties": {
+            "name": {"type": "string"},
+        }, "required": ["name"]},
+    },
+    "current_database": {
+        "description": "Name of the database all tools currently operate on (the active store or a selected named database).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    "reset_database": {
+        "description": "Return to the active store (MEMORY_MCP_DB) for all tools.",
+        "inputSchema": {"type": "object", "properties": {}},
     },
     "create_workspace": {
         "description": "Register a workspace (named access scope) in the active database's workspaces registry. Re-registering reactivates an archived/reset workspace.",
@@ -2361,7 +2471,7 @@ TOOLS = {
         }, "required": ["workspace"]},
     },
     "list_workspaces": {
-        "description": "List registered workspaces with their status (active/archived/reset) and active fact counts.",
+        "description": "List registered workspaces with their status (active/archived/reset) and full data counts: active_facts, facts, entities, relations, decisions, evidence.",
         "inputSchema": {"type": "object", "properties": {
             "status": {"type": "string", "enum": ["active", "archived", "reset"]},
         }},
@@ -2383,7 +2493,7 @@ TOOLS = {
         }, "required": ["workspace"]},
     },
     "backup_workspace": {
-        "description": "Export all facts of a workspace (including archived) as JSON to backups/workspace-<name>-<ts>.json.",
+        "description": "Export ALL workspace data (facts incl. archived, entities, relations, decisions, evidence) as JSON with per-table counts to backups/workspace-<name>-<ts>.json.",
         "inputSchema": {"type": "object", "properties": {
             "workspace": {"type": "string"},
         }, "required": ["workspace"]},
@@ -2444,6 +2554,9 @@ HANDLERS = {
     "archive_database": archive_database,
     "backup_database": backup_database,
     "delete_database": delete_database,
+    "select_database": select_database,
+    "current_database": current_database,
+    "reset_database": reset_database,
     "create_workspace": create_workspace,
     "list_workspaces": list_workspaces,
     "reset_workspace": reset_workspace,

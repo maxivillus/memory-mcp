@@ -42,12 +42,19 @@ it create/reset/archive/backup semantics.
   to clobber an existing archive (returns an error);
   `hard:true` deletes the file permanently (requires `confirm:true`)
 - `backup_database {name?}` — SQLite online backup to `backups/` (default:
-  active store; named incl. archived databases)
+  the selected or active store; named incl. archived databases)
 - `delete_database {name, confirm:true}` — permanent file delete; active
-  store protected
+  store and a currently selected database are protected
+- `select_database {name}` — session-level: point ALL subsequent tools at a
+  named database (create it with `create_database` first); selecting the
+  active store's name returns to the default. The active store is never
+  archived/deleted through these tools
+- `current_database {}` — name of the database all tools currently operate
+  on; `reset_database {}` returns to the active store
 - `create_workspace {workspace}` — register a workspace (idempotent;
   re-registering reactivates an archived/reset workspace)
-- `list_workspaces {status?}` — registry rows with active fact counts
+- `list_workspaces {status?}` — registry rows with full data counts
+  (active_facts, facts, entities, relations, decisions, evidence)
 - `reset_workspace {workspace, hard?, confirm?}` — soft (default): hide all
   its data (facts get `archived=1`; graph/decisions/evidence become
   unreadable and unwritable), status='reset'; `hard:true` purges facts,
@@ -56,8 +63,9 @@ it create/reset/archive/backup semantics.
 - `archive_workspace {workspace, hard?, confirm?}` — soft (default): hide all
   its data, status='archived'; `hard:true` purges facts, evidence, graph and
   decisions permanently (requires `confirm:true`; per-table deleted counts)
-- `backup_workspace {workspace}` — JSON export of all its facts (incl.
-  archived) to `backups/workspace-<name>-<ts>.json`
+- `backup_workspace {workspace}` — JSON export of ALL workspace data (facts
+  incl. archived, entities, relations, decisions, evidence) with per-table
+  counts to `backups/workspace-<name>-<ts>.json`
 
 ### v0.7 — automatic decay (2026-08-17)
 
@@ -106,6 +114,27 @@ cascading and no delete tool existed for them. Now:
   FTS tables get their index rebuilt by `_migrate_fts` on open — otherwise
   the FTS5 `delete` trigger fails with SQLITE_CORRUPT on the first row
   delete (FTS5's `delete` command requires the entry to be indexed).
+
+### v0.9 — session-scoped database isolation (2026-08-17)
+
+External-audit follow-up (NTL-604 handoff, item 1): `workspace` is an access
+scope, not physical isolation — scoped reads include the shared pool. For
+real isolation use a named database:
+
+- `select_database {name}` — session-level switch: ALL subsequent tools
+  (facts, graph, decisions, evidence, backup, export, workspaces) operate on
+  the named database file until `reset_database {}` (or selecting the active
+  store's name). The active store (`MEMORY_MCP_DB`) is never archived or
+  deleted through these tools, and a currently selected database cannot be
+  archived/deleted either.
+- `current_database {}` — reports the active selection; `list_databases`
+  marks the selected one.
+
+Full workspace read-back (handoff item 3): `backup_workspace` now exports
+facts + entities + relations + decisions + evidence with per-table counts,
+and `list_workspaces` reports the same counts per workspace — so a hard
+cleanup is verifiable end-to-end (every scoped query returns 0 synthetic
+records afterwards).
 
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 

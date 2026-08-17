@@ -96,11 +96,14 @@ session is visible to every later session.
 
 ## Database & workspace management (v0.6)
 
-Separate databases are extra SQLite stores for isolation or migration;
-workspaces are named access scopes in the active store. The active store
-(MEMORY_MCP_DB) can be backed up but never archived or deleted through
-these tools. Soft operations are reversible (facts get archived=1, data is
-kept); hard mode physically deletes and requires confirm: true.
+Separate databases are extra SQLite stores for real isolation (workspace is
+only an access scope); `select_database {name}` points ALL tools at a named
+database for the rest of the session (`current_database {}` / `reset_database
+{}` return to the active store). Workspaces are named access scopes in the
+active store. The active store (MEMORY_MCP_DB) can be backed up but never
+archived or deleted through these tools. Soft operations are reversible
+(facts get archived=1, data is kept); hard mode physically deletes and
+requires confirm: true.
 
 - create_database {name} — new named database (separate SQLite file under
   databases/); list_databases shows active + named + archived.
@@ -109,18 +112,25 @@ kept); hard mode physically deletes and requires confirm: true.
 - archive_database {name, hard?, confirm?} — soft: rename to
   <name>.db.archived (reversible); hard: true deletes the file (requires
   confirm: true). Refuses to clobber an existing archive.
-- delete_database {name, confirm: true} — permanent file delete.
+- delete_database {name, confirm: true} — permanent file delete; the active
+  store and a currently selected database are protected.
+- select_database {name} — session-level: all subsequent tools operate on
+  the named database (create it with create_database first); selecting the
+  active store's name returns to the default. reset_database {} / 
+  current_database {} manage the selection; list_databases marks it.
 - create_workspace {workspace} — register a workspace (idempotent;
   re-registering reactivates an archived/reset one); list_workspaces shows
-  status + active fact counts.
+  status + full data counts (facts, entities, relations, decisions,
+  evidence).
 - reset_workspace {workspace, hard?, confirm?} / archive_workspace
   {workspace, hard?, confirm?} — soft: hide the whole workspace (facts get
   archived=1; graph/decisions/evidence become unreadable and unwritable);
   hard: true purges facts, evidence, graph and decisions in one transaction
   (per-table counts in the response; requires confirm: true). Reactivate an
   archived/reset workspace with create_workspace before writing again.
-- backup_workspace {workspace} — JSON export of all its facts (incl.
-  archived) to backups/workspace-<name>-<ts>.json.
+- backup_workspace {workspace} — JSON export of ALL workspace data (facts
+  incl. archived, entities, relations, decisions, evidence) with per-table
+  counts to backups/workspace-<name>-<ts>.json.
 - Names are validated: 1-64 chars of [A-Za-z0-9._-], no '..' — never pass
   unvalidated input to the file-touching tools.
 
