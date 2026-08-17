@@ -2,8 +2,8 @@
 
 `ingest_turn` sends a conversation transcript to the configured LLM provider
 (see llm.py) and stores the extracted facts with provenance. This gives every
-runtime the same extraction pipeline without client-side patches — jcode,
-codex, prime-agent can call this tool instead of running their own extractor.
+runtime the same extraction pipeline without client-side patches — any client
+runtime can call this tool instead of running its own extractor.
 
 Best-effort by design: any provider failure returns an error result and never
 corrupts the store. When MEMORY_MCP_VERIFY=1, newly ingested facts are

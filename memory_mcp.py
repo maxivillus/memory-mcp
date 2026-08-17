@@ -2046,11 +2046,16 @@ def backup_workspace(args):
     if sum(counts.values()) == 0:
         return {"error": f"workspace {name} has no data"}
     dest = os.path.join(_backup_dir(), f"workspace-{name}-{_ts_stamp()}.json")
-    with open(dest, "w", encoding="utf-8") as f:
-        json.dump({"workspace": name, "exported_at": now(), "counts": counts,
-                   "facts": facts, "entities": entities, "relations": relations,
-                   "decisions": decisions, "evidence": evidence},
-                  f, ensure_ascii=False, indent=2)
+    try:
+        with open(dest, "w", encoding="utf-8") as f:
+            json.dump({"workspace": name, "exported_at": now(), "counts": counts,
+                       "facts": facts, "entities": entities, "relations": relations,
+                       "decisions": decisions, "evidence": evidence},
+                      f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        # No host paths in client-visible errors (repo rule).
+        print(f"memory-mcp: workspace backup write failed: {e}", file=sys.stderr)
+        return {"error": "workspace backup failed: backups/ is not writable or disk is full"}
     return {"workspace": name, "backup": os.path.basename(dest), "counts": counts}
 
 

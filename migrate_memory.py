@@ -97,6 +97,7 @@ def load_facts():
             "domain": meta.get("type", ""),
             "project": PROJECT_SLUG,
             "workspace": PROJECT_SLUG,
+            "source": "migration-20260815",
         })
     return facts
 
