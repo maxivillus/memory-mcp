@@ -48,12 +48,14 @@ it create/reset/archive/backup semantics.
 - `create_workspace {workspace}` — register a workspace (idempotent;
   re-registering reactivates an archived/reset workspace)
 - `list_workspaces {status?}` — registry rows with active fact counts
-- `reset_workspace {workspace, hard?, confirm?}` — soft (default): archive
-  all its facts (`archived=1`, reversible), status='reset'; `hard:true`
-  deletes the facts permanently (requires `confirm:true`)
-- `archive_workspace {workspace, hard?, confirm?}` — soft (default): archive
-  all its facts, status='archived'; `hard:true` deletes permanently
-  (requires `confirm:true`)
+- `reset_workspace {workspace, hard?, confirm?}` — soft (default): hide all
+  its data (facts get `archived=1`; graph/decisions/evidence become
+  unreadable and unwritable), status='reset'; `hard:true` purges facts,
+  evidence, graph and decisions permanently (requires `confirm:true`;
+  response reports per-table deleted counts)
+- `archive_workspace {workspace, hard?, confirm?}` — soft (default): hide all
+  its data, status='archived'; `hard:true` purges facts, evidence, graph and
+  decisions permanently (requires `confirm:true`; per-table deleted counts)
 - `backup_workspace {workspace}` — JSON export of all its facts (incl.
   archived) to `backups/workspace-<name>-<ts>.json`
 
@@ -77,6 +79,33 @@ Facts age only on **active days** — days with at least one memory-mcp call
   `DECAY_REVIVE_HITS` (3). Search hits refresh `last_accessed_at` /
   `access_count` on active facts only (chained access does not keep stale
   facts alive).
+
+### v0.8 — cascade-safe workspace cleanup (2026-08-17)
+
+External audit follow-up: hard reset/archive previously deleted only `facts`
+rows and failed with `FOREIGN KEY constraint failed` because `evidence`
+(child of facts) and `relations` (child of entities) were not deleted
+cascading and no delete tool existed for them. Now:
+
+- `hard:true` on `reset_workspace` / `archive_workspace` purges **all**
+  workspace rows in FK-safe order — `evidence`, `fact_embeddings`,
+  `relations`, `entities`, `decisions` (parent chains detached first),
+  `facts` — atomically in one transaction; the response reports per-table
+  deleted counts. `reset` also removes the workspace registry row; `archive`
+  keeps it with status `archived`.
+- Soft reset/archive now hides the whole workspace, not just facts: reads of
+  decisions/graph (`query_decisions`, `find_precedents`, `get_causal_chain`,
+  `search_graph`, `export_rdf`, graph expansion) return an error and all
+  writes (`remember_fact`, `ingest_turn`, `remember_entity`,
+  `remember_relation`, `record_decision`, `attach_evidence`) are refused
+  until the workspace is reactivated with `create_workspace`.
+- Schema hardening: `evidence.fact_id` and `relations.subject_id/object_id`
+  now carry `ON DELETE CASCADE` (`relations.source_fact_id` → `SET NULL`);
+  existing databases are migrated by `_migrate_fks` (idempotent table
+  rebuild, same pattern as the v0.5 facts rebuild). Stores that predate the
+  FTS tables get their index rebuilt by `_migrate_fts` on open — otherwise
+  the FTS5 `delete` trigger fails with SQLITE_CORRUPT on the first row
+  delete (FTS5's `delete` command requires the entry to be indexed).
 
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
