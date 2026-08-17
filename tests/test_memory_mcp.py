@@ -1104,3 +1104,19 @@ class WorkspaceMgmtTest(unittest.TestCase):
         self.assertEqual(data["facts"][0]["text"], "back me up")
         r = mcp.backup_workspace({"workspace": "nonexistent"})
         self.assertIn("error", r)
+
+    def test_archive_database_soft_does_not_clobber_existing_archive(self):
+        import shutil as _shutil
+        mcp.create_database({"name": "twice"})
+        p = os.path.join(self.tmpdir, "databases", "twice.db")
+        # pre-existing archive must not be silently overwritten
+        with open(p + ".archived", "w", encoding="utf-8") as f:
+            f.write("previous archive")
+        r = mcp.archive_database({"name": "twice"})
+        self.assertIn("error", r, r)
+        with open(p + ".archived", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "previous archive")
+        # hard mode still works
+        r = mcp.archive_database({"name": "twice", "hard": True, "confirm": True})
+        self.assertNotIn("error", r, r)
+        self.assertTrue(r["deleted"])

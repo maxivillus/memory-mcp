@@ -1473,6 +1473,9 @@ def archive_database(args):
             return {"error": "confirm: true is required for hard archive (permanent delete)"}
         os.remove(p)
         return {"archived": name, "hard": True, "deleted": True}
+    if os.path.exists(p + ".archived"):
+        return {"error": f"an archived copy of database {name} already exists; "
+                         "remove or restore it first, or use hard:true"}
     os.rename(p, p + ".archived")
     return {"archived": name, "hard": False, "deleted": False}
 
