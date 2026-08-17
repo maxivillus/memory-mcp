@@ -43,7 +43,6 @@ def default_db_path():
 
 DB_PATH = os.environ.get("MEMORY_MCP_DB") or default_db_path()
 VALID_TRUST = ("high", "medium", "low")
-
 # v0.5 rebuild DDL: same facts shape without the global UNIQUE(sha256).
 _FACTS_TABLE_DDL = """
 CREATE TABLE facts_new (
@@ -62,42 +61,11 @@ CREATE TABLE facts_new (
   workspace_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  archived INTEGER NOT NULL DEFAULT 0
-);
-"""
-
-_FTS_TRIGGERS_DDL = """
-CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
-  INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
-END;
-CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
-  INSERT INTO facts_fts(facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
-END;
-CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
-  INSERT INTO facts_fts(facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
-  INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
-END;
-"""
-
-# v0.5 rebuild DDL: same facts shape without the global UNIQUE(sha256).
-_FACTS_TABLE_DDL = """
-CREATE TABLE facts_new (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  sha256 TEXT NOT NULL,
-  text TEXT NOT NULL,
-  source TEXT NOT NULL DEFAULT '',
-  project TEXT NOT NULL DEFAULT '',
-  domain TEXT NOT NULL DEFAULT '',
-  trust TEXT NOT NULL DEFAULT 'medium' CHECK (trust IN ('high','medium','low')),
-  strong INTEGER NOT NULL DEFAULT 0,
-  importance REAL NOT NULL DEFAULT 0.5,
-  invalid_at TEXT NOT NULL DEFAULT '',
-  superseded_by INTEGER,
-  confirmed INTEGER NOT NULL DEFAULT 0,
-  workspace_id TEXT NOT NULL DEFAULT '',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  archived INTEGER NOT NULL DEFAULT 0
+  archived INTEGER NOT NULL DEFAULT 0,
+  last_accessed_at TEXT NOT NULL DEFAULT '',
+  access_count INTEGER NOT NULL DEFAULT 0,
+  revival_count INTEGER NOT NULL DEFAULT 0,
+  lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active','degraded','forgotten'))
 );
 """
 
@@ -140,7 +108,11 @@ CREATE TABLE IF NOT EXISTS facts (
   workspace_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  archived INTEGER NOT NULL DEFAULT 0
+  archived INTEGER NOT NULL DEFAULT 0,
+  last_accessed_at TEXT NOT NULL DEFAULT '',
+  access_count INTEGER NOT NULL DEFAULT 0,
+  revival_count INTEGER NOT NULL DEFAULT 0,
+  lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active','degraded','forgotten'))
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
   text, content='facts', content_rowid='id'
@@ -229,6 +201,13 @@ CREATE TABLE IF NOT EXISTS workspaces (
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived','reset')),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+-- v0.7 (2026-08-17): activity days — one row per day with at least one
+-- tools/call (proxy for "the system was online and memory was used").
+-- Decay counts only these days, so user downtime never ages facts.
+CREATE TABLE IF NOT EXISTS activity_days (
+  day TEXT PRIMARY KEY
 );
 """
 
@@ -322,6 +301,15 @@ def _migrate_facts(con):
             con.execute("ALTER TABLE facts ADD COLUMN %s %s" % (name, decl))
     if "workspace_id" not in existing:
         con.execute("ALTER TABLE facts ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''")
+    # v0.7 decay columns (existing databases get plain defaults; the CHECK
+    # constraint lives in the DDL for fresh/rebuild paths).
+    for name, decl in (
+            ("last_accessed_at", "TEXT NOT NULL DEFAULT ''"),
+            ("access_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("revival_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("lifecycle", "TEXT NOT NULL DEFAULT 'active'")):
+        if name not in existing:
+            con.execute("ALTER TABLE facts ADD COLUMN %s %s" % (name, decl))
     for table in ("decisions", "entities", "relations"):
         try:
             cols = {r["name"] for r in con.execute("PRAGMA table_info(%s)" % table)}
@@ -333,7 +321,8 @@ def _migrate_facts(con):
     if "sqlite_autoindex_facts_1" in indexes:
         # legacy global UNIQUE(sha256) present -> rebuild
         cols = ("id, sha256, text, source, project, domain, trust, strong, importance, "
-                "invalid_at, superseded_by, confirmed, workspace_id, created_at, updated_at, archived")
+                "invalid_at, superseded_by, confirmed, workspace_id, created_at, updated_at, archived, "
+                "last_accessed_at, access_count, revival_count, lifecycle")
         con.executescript(
             "PRAGMA foreign_keys=OFF;\n"
             "BEGIN;\n"
@@ -462,6 +451,85 @@ def _active_db_name():
     return os.path.basename(DB_PATH)
 
 
+# ---- v0.7 decay support: activity days, search-hit bookkeeping ------------
+
+_LAST_ACTIVITY_DAY = [None]  # module-level cache: one INSERT per day per process
+
+
+def _register_activity_day():
+    """Record "the system was online and memory was used" for today.
+    Best-effort, never raises; one row per day (INSERT OR IGNORE)."""
+    day = now()[:10]
+    if _LAST_ACTIVITY_DAY[0] == day:
+        return
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=10)
+        try:
+            con.execute("CREATE TABLE IF NOT EXISTS activity_days (day TEXT PRIMARY KEY)")
+            con.execute("INSERT OR IGNORE INTO activity_days (day) VALUES (?)", (day,))
+            con.commit()
+        finally:
+            con.close()
+        _LAST_ACTIVITY_DAY[0] = day
+    except sqlite3.Error:
+        pass
+
+
+def _decay_param(name, default):
+    try:
+        return type(default)(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _mark_hits(con, rows):
+    """Search hits (facts actually returned by search tools): refresh the
+    active ones. Degraded/forgotten facts reached via chains are NOT hits —
+    chained access must not keep stale facts alive."""
+    ts = now()
+    ids = [r["id"] for r in rows if isinstance(r, dict) and r.get("id")]
+    if not ids:
+        return
+    con.executemany(
+        "UPDATE facts SET last_accessed_at=?, access_count=access_count+1 "
+        "WHERE id=? AND lifecycle='active' AND archived=0",
+        [(ts, fid) for fid in ids])
+    con.commit()
+
+
+def _revive_degraded(con, query, ws):
+    """Degraded facts matching the query count as "attempts to remember":
+    revival_count++ per matching search; at DECAY_REVIVE_HITS they go back
+    to active (visible from the next search). Forgotten facts stay out."""
+    n = _decay_param("DECAY_REVIVE_HITS", 3)
+    params = [query]
+    sql = ("SELECT f.id FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
+           "WHERE facts_fts MATCH ? AND f.archived=0 AND f.invalid_at='' "
+           "AND f.lifecycle='degraded'" + _ws_filter("f", ws))
+    if ws:
+        params.append(ws)
+    try:
+        ids = [r["id"] for r in con.execute(sql, params)]
+    except sqlite3.OperationalError:
+        phrase = '"' + query.replace('"', '""') + '"'
+        ids = [r["id"] for r in con.execute(
+            sql.replace("facts_fts MATCH ?", "facts_fts MATCH ?", 1), [phrase] + params[1:])]
+    if not ids:
+        return 0
+    con.executemany(
+        "UPDATE facts SET revival_count=revival_count+1, updated_at=? WHERE id=?",
+        [(now(), fid) for fid in ids])
+    revived = 0
+    for fid in ids:
+        row = con.execute("SELECT revival_count FROM facts WHERE id=?", [fid]).fetchone()
+        if row and row["revival_count"] >= n:
+            con.execute("UPDATE facts SET lifecycle='active', revival_count=0, updated_at=? WHERE id=?",
+                        (now(), fid))
+            revived += 1
+    con.commit()
+    return revived
+
+
 def _emb():
     """Lazy handle to the optional embeddings module, or None when disabled
     (MEMORY_MCP_EMBEDDINGS != 1) or unavailable."""
@@ -508,6 +576,29 @@ def sweep_freshness(args):
     if m is None:
         return _disabled("MEMORY_MCP_RECALL")
     return m.sweep_freshness(args)
+
+
+def decay_sweep(args):
+    """v0.7: recompute fact lifecycle by active-day decay (no env gate —
+    decay is core behavior, parameters via DECAY_* env vars)."""
+    try:
+        return __import__("decay").decay_sweep(args)
+    except ImportError:
+        return {"error": "decay module not available"}
+
+
+def list_forgotten(args):
+    try:
+        return __import__("decay").list_forgotten(args)
+    except ImportError:
+        return {"error": "decay module not available"}
+
+
+def restore_fact(args):
+    try:
+        return __import__("decay").restore_fact(args)
+    except ImportError:
+        return {"error": "decay module not available"}
 
 
 def consolidate(args):
@@ -594,7 +685,7 @@ def search_facts(args):
            "f.importance, f.confirmed, f.invalid_at, f.created_at, "
            "bm25(facts_fts) AS rank "
            "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
-           "WHERE facts_fts MATCH ? AND f.archived=0")
+           "WHERE facts_fts MATCH ? AND f.archived=0 AND f.lifecycle='active'")
     ws = _workspace(args)
     params = [query]
     sql += _ws_filter("f", ws)
@@ -630,6 +721,7 @@ def search_facts(args):
             phrase = '"' + query.replace('"', '""') + '"'
             rows = [dict(r) for r in con.execute(sql.replace("facts_fts MATCH ?", "facts_fts MATCH ?", 1),
                                                  [phrase] + params[1:])]
+        _revive_degraded(con, query, ws)
         graph = []
         if args.get("graph") and rows:
             graph = _graph_expand_facts(con, rows, limit * 2, ws)
@@ -645,9 +737,12 @@ def search_facts(args):
         emb = _emb()
         if emb is not None and args.get("semantic"):
             if rows:
-                return emb.hybrid_rerank(con, query, rows, limit=limit, workspace=ws)
-            # No lexical hits: fall back to semantic ranking alone.
-            return emb.search_semantic(con, query, limit=limit, workspace=ws)
+                res = emb.hybrid_rerank(con, query, rows, limit=limit, workspace=ws)
+            else:
+                # No lexical hits: fall back to semantic ranking alone.
+                res = emb.search_semantic(con, query, limit=limit, workspace=ws)
+            rows = res.get("facts", []) if isinstance(res, dict) else res or []
+        _mark_hits(con, rows)
         result = {"count": len(rows), "facts": rows}
         if args.get("graph"):
             result["graph"] = len(graph)
@@ -671,7 +766,11 @@ def search_semantic(args):
     ws = _workspace(args)
     con = get_db()
     try:
-        return emb.search_semantic(con, query, limit=limit, threshold=threshold, workspace=ws)
+        res = emb.search_semantic(con, query, limit=limit, threshold=threshold, workspace=ws)
+        rows = res.get("facts", []) if isinstance(res, dict) else res or []
+        _revive_degraded(con, query, ws)
+        _mark_hits(con, rows)
+        return res
     finally:
         con.close()
 
@@ -691,7 +790,7 @@ def embed_backfill(args):
 def list_facts(args):
     limit = max(1, min(int(args.get("limit", 50)), 500))
     sql = ("SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
-           "created_at, updated_at FROM facts WHERE archived=0 AND invalid_at=''")
+           "created_at, updated_at FROM facts WHERE archived=0 AND invalid_at='' AND lifecycle='active'")
     ws = _workspace(args)
     params = []
     sql += _ws_filter("facts", ws)
@@ -722,7 +821,7 @@ def summarize_index(args):
     limit = max(1, min(int(args.get("limit", 200)), 500))
     max_chars = max(int(args.get("max_chars", 4000)), 200)
     sql = ("SELECT id, text, project, domain, trust, strong, updated_at "
-           "FROM facts WHERE archived=0 AND invalid_at=''")
+           "FROM facts WHERE archived=0 AND invalid_at='' AND lifecycle='active'")
     ws = _workspace(args)
     params = []
     sql += _ws_filter("facts", ws)
@@ -747,7 +846,7 @@ def summarize_index(args):
     try:
         ws = _workspace(args)
         ws_params = [ws] if ws else []
-        total = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at=''" +
+        total = con.execute("SELECT COUNT(*) FROM facts WHERE archived=0 AND invalid_at='' AND lifecycle='active'" +
                             _ws_check("facts", ws), ws_params).fetchone()[0]
         rows = [dict(r) for r in con.execute(sql, params)]
     finally:
@@ -1078,7 +1177,7 @@ def detect_conflicts(args):
             query = " OR ".join(terms)
             sql = ("SELECT f.id, f.text, f.source, f.project, f.trust, f.strong, bm25(facts_fts) AS rank "
                    "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
-                   "WHERE facts_fts MATCH ? AND f.archived=0 AND f.invalid_at=''" +
+                   "WHERE facts_fts MATCH ? AND f.archived=0 AND f.invalid_at='' AND f.lifecycle='active'" +
                    _ws_check("f", ws) +
                    " ORDER BY rank LIMIT 10")
             try:
@@ -2080,6 +2179,22 @@ TOOLS = {
             "workspace": {"type": "string"},
         }, "required": ["workspace"]},
     },
+    "decay_sweep": {
+        "description": "v0.7: recompute fact lifecycle by active-day decay. Score = importance * 0.95^active_days (days with system activity since last search hit). score < 0.25 -> degraded (hidden from plain search, reachable via chains, revived after N matching searches); score <= 0.1 -> forgotten (visible only via list_forgotten/restore_fact). strong/confirmed never decay. User downtime does not count.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    "list_forgotten": {
+        "description": "Direct review of forgotten facts (lifecycle=forgotten) — the only way to see them besides restore_fact.",
+        "inputSchema": {"type": "object", "properties": {
+            "limit": {"type": "integer", "default": 50},
+        }},
+    },
+    "restore_fact": {
+        "description": "Manually bring a forgotten/degraded fact back to lifecycle=active (resets revival_count, stamps last_accessed_at).",
+        "inputSchema": {"type": "object", "properties": {
+            "id": {"type": "integer"},
+        }, "required": ["id"]},
+    },
 }
 
 HANDLERS = {
@@ -2125,6 +2240,9 @@ HANDLERS = {
     "reset_workspace": reset_workspace,
     "archive_workspace": archive_workspace,
     "backup_workspace": backup_workspace,
+    "decay_sweep": decay_sweep,
+    "list_forgotten": list_forgotten,
+    "restore_fact": restore_fact,
 }
 
 
@@ -2153,6 +2271,7 @@ def main():
         elif msg.get("method") == "tools/call":
             params = msg.get("params", {})
             name, args = params.get("name"), params.get("arguments", {}) or {}
+            _register_activity_day()
             try:
                 result = HANDLERS[name](args) if name in HANDLERS else {"error": f"unknown tool {name}"}
                 reply = {"jsonrpc": "2.0", "id": msg.get("id"),

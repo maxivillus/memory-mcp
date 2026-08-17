@@ -12,7 +12,7 @@ metadata:
 
 # Shared Agent Memory (memory-mcp)
 
-Available to runtime agents as the `mcp__memory-mcp__*` tools (41 tools).
+Available to runtime agents as the `mcp__memory-mcp__*` tools (44 tools).
 One shared store across all runtimes: a fact or decision written in one
 session is visible to every later session.
 
@@ -121,6 +121,22 @@ kept); hard mode physically deletes and requires confirm: true.
 - Names are validated: 1-64 chars of [A-Za-z0-9._-], no '..' — never pass
   unvalidated input to the file-touching tools.
 
+## Automatic decay (v0.7)
+
+Facts age only on ACTIVE days — days with at least one memory-mcp call
+(activity_days table) — so user downtime (no sessions, no calls) never ages
+them. Score = importance x 0.95^active_days since the last search hit.
+
+- active (score >= 0.25): normal participant in search/recall.
+- degraded (score < 0.25): hidden from plain search results; still reachable
+  through entity-graph/session chains; returns to active after 3 matching
+  searches (attempts to remember). Do not expect it in search until revived.
+- forgotten (score <= 0.1): excluded from all search; see it only via
+  list_forgotten, bring it back with restore_fact.
+- strong and confirmed facts never decay.
+- decay_sweep runs the lifecycle recompute (manually or by cron); search
+  hits refresh last_accessed_at on active facts only.
+
 ## Conventions
 
 - Use consistent `project`/`domain` scopes so queries and the index stay
@@ -129,5 +145,6 @@ kept); hard mode physically deletes and requires confirm: true.
 - The store is a shared read-model: agents may write facts/decisions/evidence,
   but must not delete or mutate records owned by another agent without a
   strong reason.
+
 
 
