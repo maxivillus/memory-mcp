@@ -29,7 +29,7 @@ Tools:
   attach_evidence {fact_id, source_ref, source_checksum?, fetched_at?}
   detect_conflicts {text}
 """
-import hashlib, json, os, sqlite3, sys
+import hashlib, json, os, re, sqlite3, sys
 from datetime import datetime, timezone
 
 def default_db_path():
@@ -221,6 +221,15 @@ CREATE INDEX IF NOT EXISTS relations_subject_idx ON relations(subject_id);
 CREATE INDEX IF NOT EXISTS relations_object_idx ON relations(object_id);
 CREATE INDEX IF NOT EXISTS evidence_fact_idx ON evidence(fact_id);
 CREATE INDEX IF NOT EXISTS decisions_parent_idx ON decisions(parent_decision_id);
+
+-- v0.6 (2026-08-17): workspace registry — named access scopes with
+-- create/reset/archive semantics (soft by default, hard via confirm).
+CREATE TABLE IF NOT EXISTS workspaces (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived','reset')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 """
 
 # Optional semantic search (embeddings.py) — created here so the schema is
@@ -267,8 +276,8 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def get_db():
-    dbdir = os.path.dirname(DB_PATH) or "."
+def _open_db(path):
+    dbdir = os.path.dirname(path) or "."
     try:
         os.makedirs(dbdir, exist_ok=True)
     except OSError as e:
@@ -279,9 +288,9 @@ def get_db():
             "cannot open the fact store: DB directory is not writable; "
             "set MEMORY_MCP_DB to a writable path (e.g. a rw bind-mount)")
     try:
-        con = sqlite3.connect(DB_PATH, timeout=10)
+        con = sqlite3.connect(path, timeout=10)
     except sqlite3.DatabaseError as e:
-        print(f"memory-mcp: cannot open DB {DB_PATH!r}: {e}", file=sys.stderr)
+        print(f"memory-mcp: cannot open DB {path!r}: {e}", file=sys.stderr)
         raise RuntimeError(
             "cannot open the fact store: DB file is not accessible or corrupt; "
             "set MEMORY_MCP_DB to a writable path (e.g. a rw bind-mount)")
@@ -294,6 +303,10 @@ def get_db():
     con.executescript(_EMBED_SCHEMA)
     _migrate_facts(con)
     return con
+
+
+def get_db():
+    return _open_db(DB_PATH)
 
 
 def _migrate_facts(con):
@@ -411,6 +424,42 @@ def _importance(args):
         return max(0.0, min(1.0, float(args.get("importance", 0.5))))
     except (TypeError, ValueError):
         return 0.5
+
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _validate_name(name, kind):
+    """Validate a database/workspace name: 1-64 chars of [A-Za-z0-9._-],
+    no path separators, no '..' (repository rule: no host paths)."""
+    name = (name or "").strip()
+    if not name:
+        return None, f"{kind} name is required"
+    if ".." in name or not _NAME_RE.match(name):
+        return None, f"invalid {kind} name {name!r}: use 1-64 chars of [A-Za-z0-9._-], no '..'"
+    return name, ""
+
+
+def _db_dir():
+    """Directory of named databases — sibling of the active DB file."""
+    d = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "databases")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _backup_dir():
+    """Directory of backups — sibling of the active DB file."""
+    d = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _db_file(name):
+    return os.path.join(_db_dir(), name + ".db")
+
+
+def _active_db_name():
+    return os.path.basename(DB_PATH)
 
 
 def _emb():
@@ -1370,6 +1419,234 @@ def export_facts(_args=None):
         con.close()
 
 
+# ---- database management (v0.6, 2026-08-17) -------------------------------
+# Named databases are separate SQLite files under <dbdir>/databases/,
+# siblings of the active DB (MEMORY_MCP_DB). The active DB itself can be
+# backed up but never archived/deleted through these tools.
+
+def _ts_stamp():
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def create_database(args):
+    name, err = _validate_name(args.get("name"), "database")
+    if err:
+        return {"error": err}
+    if name + ".db" == _active_db_name():
+        return {"error": f"database {name} is the active store (MEMORY_MCP_DB)"}
+    p = _db_file(name)
+    if os.path.exists(p):
+        return {"error": f"database {name} already exists"}
+    try:
+        con = _open_db(p)
+        con.close()
+    except RuntimeError as e:
+        return {"error": str(e)}
+    return {"created": name, "file": "databases/" + name + ".db"}
+
+
+def list_databases(args):
+    d = _db_dir()
+    dbs = []
+    for fn in sorted(os.listdir(d)):
+        if fn.endswith(".db"):
+            dbs.append({"name": fn[:-3], "active": False, "archived": False})
+        elif fn.endswith(".db.archived"):
+            dbs.append({"name": fn[:-len(".db.archived")], "active": False, "archived": True})
+    active = _active_db_name()
+    dbs.insert(0, {"name": active[:-3] if active.endswith(".db") else active,
+                   "active": True, "archived": False})
+    return {"databases": dbs}
+
+
+def archive_database(args):
+    name, err = _validate_name(args.get("name"), "database")
+    if err:
+        return {"error": err}
+    if name + ".db" == _active_db_name():
+        return {"error": f"cannot archive the active database (MEMORY_MCP_DB)"}
+    p = _db_file(name)
+    if not os.path.exists(p):
+        return {"error": f"database {name} not found"}
+    if args.get("hard"):
+        if args.get("confirm") is not True:
+            return {"error": "confirm: true is required for hard archive (permanent delete)"}
+        os.remove(p)
+        return {"archived": name, "hard": True, "deleted": True}
+    os.rename(p, p + ".archived")
+    return {"archived": name, "hard": False, "deleted": False}
+
+
+def backup_database(args):
+    name = (args.get("name") or "").strip()
+    label = _active_db_name()
+    src = DB_PATH
+    if name:
+        name, err = _validate_name(name, "database")
+        if err:
+            return {"error": err}
+        p = _db_file(name)
+        if os.path.exists(p):
+            src = p
+            label = name + ".db"
+        elif os.path.exists(p + ".archived"):
+            src = p + ".archived"
+            label = name + ".db.archived"
+        else:
+            return {"error": f"database {name} not found"}
+    dest = os.path.join(_backup_dir(), label + "." + _ts_stamp() + ".db")
+    try:
+        src_con = sqlite3.connect(src, timeout=10)
+        try:
+            dst_con = sqlite3.connect(dest)
+            try:
+                src_con.backup(dst_con)
+            finally:
+                dst_con.close()
+        finally:
+            src_con.close()
+    except sqlite3.DatabaseError as e:
+        return {"error": f"backup failed: {e}"}
+    return {"database": label, "backup": os.path.basename(dest), "size": os.path.getsize(dest)}
+
+
+def delete_database(args):
+    name, err = _validate_name(args.get("name"), "database")
+    if err:
+        return {"error": err}
+    if name + ".db" == _active_db_name():
+        return {"error": f"cannot delete the active database (MEMORY_MCP_DB)"}
+    if args.get("confirm") is not True:
+        return {"error": "confirm: true is required to delete a database"}
+    p = _db_file(name)
+    if not os.path.exists(p):
+        return {"error": f"database {name} not found"}
+    os.remove(p)
+    return {"deleted": name}
+
+
+# ---- workspace management (v0.6, 2026-08-17) ------------------------------
+# Workspaces are named access scopes registered in the `workspaces` table of
+# the active DB. Soft reset/archive mark the workspace's facts archived
+# (reversible); hard mode (confirm: true) physically deletes the facts.
+
+def create_workspace(args):
+    name, err = _validate_name(args.get("workspace"), "workspace")
+    if err:
+        return {"error": err}
+    con = get_db()
+    try:
+        ts = now()
+        row = con.execute("SELECT status FROM workspaces WHERE id=?", [name]).fetchone()
+        if row:
+            if row["status"] != "active":
+                con.execute("UPDATE workspaces SET status='active', updated_at=? WHERE id=?", [ts, name])
+                con.commit()
+                return {"workspace": name, "created": False, "reactivated": True}
+            return {"workspace": name, "created": False}
+        con.execute("INSERT INTO workspaces (id, status, created_at, updated_at) VALUES (?, 'active', ?, ?)",
+                    [name, ts, ts])
+        con.commit()
+        return {"workspace": name, "created": True}
+    finally:
+        con.close()
+
+
+def list_workspaces(args):
+    con = get_db()
+    try:
+        status = (args.get("status") or "").strip()
+        q = ("SELECT w.id, w.status, w.created_at, w.updated_at, "
+             "(SELECT COUNT(*) FROM facts f WHERE f.workspace_id=w.id AND f.archived=0 AND f.invalid_at='') AS active_facts "
+             "FROM workspaces w")
+        params = []
+        if status:
+            q += " WHERE w.status=?"
+            params.append(status)
+        rows = [dict(r) for r in con.execute(q + " ORDER BY w.id", params)]
+        return {"count": len(rows), "workspaces": rows}
+    finally:
+        con.close()
+
+
+def reset_workspace(args):
+    name, err = _validate_name(args.get("workspace"), "workspace")
+    if err:
+        return {"error": err}
+    hard = args.get("hard") is True
+    if hard and args.get("confirm") is not True:
+        return {"error": "confirm: true is required for hard reset (permanent delete)"}
+    con = get_db()
+    try:
+        ts = now()
+        if hard:
+            cur = con.execute("DELETE FROM facts WHERE workspace_id=?", [name])
+            deleted = cur.rowcount
+            con.execute("DELETE FROM workspaces WHERE id=?", [name])
+            con.commit()
+            return {"workspace": name, "hard": True, "deleted_facts": deleted, "reset": True}
+        cur = con.execute("UPDATE facts SET archived=1, updated_at=? WHERE workspace_id=? AND archived=0",
+                          [ts, name])
+        archived = cur.rowcount
+        con.execute("INSERT INTO workspaces (id, status, created_at, updated_at) VALUES (?, 'reset', ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET status='reset', updated_at=excluded.updated_at",
+                    [name, ts, ts])
+        con.commit()
+        return {"workspace": name, "hard": False, "archived_facts": archived, "reset": True}
+    finally:
+        con.close()
+
+
+def archive_workspace(args):
+    name, err = _validate_name(args.get("workspace"), "workspace")
+    if err:
+        return {"error": err}
+    hard = args.get("hard") is True
+    if hard and args.get("confirm") is not True:
+        return {"error": "confirm: true is required for hard archive (permanent delete)"}
+    con = get_db()
+    try:
+        ts = now()
+        if hard:
+            cur = con.execute("DELETE FROM facts WHERE workspace_id=?", [name])
+            deleted = cur.rowcount
+            con.execute("INSERT INTO workspaces (id, status, created_at, updated_at) VALUES (?, 'archived', ?, ?) "
+                        "ON CONFLICT(id) DO UPDATE SET status='archived', updated_at=excluded.updated_at",
+                        [name, ts, ts])
+            con.commit()
+            return {"workspace": name, "hard": True, "deleted_facts": deleted, "archived": True}
+        cur = con.execute("UPDATE facts SET archived=1, updated_at=? WHERE workspace_id=? AND archived=0",
+                          [ts, name])
+        archived = cur.rowcount
+        con.execute("INSERT INTO workspaces (id, status, created_at, updated_at) VALUES (?, 'archived', ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET status='archived', updated_at=excluded.updated_at",
+                    [name, ts, ts])
+        con.commit()
+        return {"workspace": name, "hard": False, "archived_facts": archived, "archived": True}
+    finally:
+        con.close()
+
+
+def backup_workspace(args):
+    name, err = _validate_name(args.get("workspace"), "workspace")
+    if err:
+        return {"error": err}
+    con = get_db()
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, sha256, text, source, project, domain, trust, strong, importance, workspace_id, "
+            "created_at, updated_at, archived FROM facts WHERE workspace_id=? ORDER BY id", [name])]
+    finally:
+        con.close()
+    if not rows:
+        return {"error": f"workspace {name} has no facts"}
+    dest = os.path.join(_backup_dir(), f"workspace-{name}-{_ts_stamp()}.json")
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump({"workspace": name, "exported_at": now(), "count": len(rows), "facts": rows},
+                  f, ensure_ascii=False, indent=2)
+    return {"workspace": name, "backup": os.path.basename(dest), "count": len(rows)}
+
+
 TOOLS = {
     # NOTE: add_fact exists as a HANDLERS alias for remember_fact (agents
     # guess the name) but is intentionally NOT advertised in the schema —
@@ -1735,6 +2012,71 @@ TOOLS = {
         "description": "Export all facts (including archived) as JSON — for migration/backup.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    "create_database": {
+        "description": "Create a new named database (separate SQLite file under databases/). The active store (MEMORY_MCP_DB) cannot be recreated.",
+        "inputSchema": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Database name: 1-64 chars of [A-Za-z0-9._-], no '..'"},
+        }, "required": ["name"]},
+    },
+    "list_databases": {
+        "description": "List all databases (active + named, including archived ones).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    "archive_database": {
+        "description": "Archive a named database. Soft (default): rename to <name>.db.archived — data preserved, reversible by renaming back. hard:true deletes the file permanently (requires confirm:true). The active database cannot be archived.",
+        "inputSchema": {"type": "object", "properties": {
+            "name": {"type": "string"},
+            "hard": {"type": "boolean", "default": False},
+            "confirm": {"type": "boolean", "default": False, "description": "required for hard mode"},
+        }, "required": ["name"]},
+    },
+    "backup_database": {
+        "description": "Backup a database (active by default, or a named one incl. archived) to backups/ via SQLite online backup API.",
+        "inputSchema": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "optional; defaults to the active store"},
+        }},
+    },
+    "delete_database": {
+        "description": "Permanently delete a named database file (requires confirm:true). The active database cannot be deleted.",
+        "inputSchema": {"type": "object", "properties": {
+            "name": {"type": "string"},
+            "confirm": {"type": "boolean", "default": False},
+        }, "required": ["name", "confirm"]},
+    },
+    "create_workspace": {
+        "description": "Register a workspace (named access scope) in the active database's workspaces registry. Re-registering reactivates an archived/reset workspace.",
+        "inputSchema": {"type": "object", "properties": {
+            "workspace": {"type": "string", "description": "Workspace id: 1-64 chars of [A-Za-z0-9._-], no '..'"},
+        }, "required": ["workspace"]},
+    },
+    "list_workspaces": {
+        "description": "List registered workspaces with their status (active/archived/reset) and active fact counts.",
+        "inputSchema": {"type": "object", "properties": {
+            "status": {"type": "string", "enum": ["active", "archived", "reset"]},
+        }},
+    },
+    "reset_workspace": {
+        "description": "Reset a workspace. Soft (default): archive all its facts (archived=1, reversible via re-remembering), status='reset'. hard:true deletes its facts permanently (requires confirm:true).",
+        "inputSchema": {"type": "object", "properties": {
+            "workspace": {"type": "string"},
+            "hard": {"type": "boolean", "default": False},
+            "confirm": {"type": "boolean", "default": False, "description": "required for hard mode"},
+        }, "required": ["workspace"]},
+    },
+    "archive_workspace": {
+        "description": "Archive a workspace. Soft (default): archive all its facts (archived=1), status='archived'. hard:true deletes its facts permanently (requires confirm:true).",
+        "inputSchema": {"type": "object", "properties": {
+            "workspace": {"type": "string"},
+            "hard": {"type": "boolean", "default": False},
+            "confirm": {"type": "boolean", "default": False, "description": "required for hard mode"},
+        }, "required": ["workspace"]},
+    },
+    "backup_workspace": {
+        "description": "Export all facts of a workspace (including archived) as JSON to backups/workspace-<name>-<ts>.json.",
+        "inputSchema": {"type": "object", "properties": {
+            "workspace": {"type": "string"},
+        }, "required": ["workspace"]},
+    },
 }
 
 HANDLERS = {
@@ -1770,6 +2112,16 @@ HANDLERS = {
     "list_sessions": list_sessions,
     "stats": stats,
     "export": export_facts,
+    "create_database": create_database,
+    "list_databases": list_databases,
+    "archive_database": archive_database,
+    "backup_database": backup_database,
+    "delete_database": delete_database,
+    "create_workspace": create_workspace,
+    "list_workspaces": list_workspaces,
+    "reset_workspace": reset_workspace,
+    "archive_workspace": archive_workspace,
+    "backup_workspace": backup_workspace,
 }
 
 

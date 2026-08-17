@@ -7,3 +7,6 @@ data/
 # Python
 __pycache__/
 *.pyc
+
+# Private audit notes — never publish
+audit-*.md

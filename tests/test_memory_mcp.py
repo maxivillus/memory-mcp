@@ -8,6 +8,7 @@ Run:  python3 -m unittest discover -s tests -v
 """
 
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -919,3 +920,187 @@ class MigrationAndDedupTest(unittest.TestCase):
         r3 = mcp.remember_fact({"text": "shared text across workspaces", "source": "t",
                                 "workspace": "ws-one"})
         self.assertTrue(r3["dedup"])
+
+
+class DatabaseMgmtTest(unittest.TestCase):
+    """v0.6: create/list/archive/backup/delete database (separate SQLite files)."""
+
+    def setUp(self):
+        import shutil as _shutil
+        self._old_db = mcp.DB_PATH
+        # Use a temp dir so databases//backups/ live there, not in /tmp root.
+        self.tmpdir = tempfile.mkdtemp(prefix="mcp-dbmgmt-")
+        self.db = os.path.join(self.tmpdir, "active.db")
+        os.environ["MEMORY_MCP_DB"] = self.db
+        mcp.DB_PATH = self.db
+        # Reset module caches that embed DB_PATH at import time.
+        for mod in ("embeddings",):
+            pass
+
+    def tearDown(self):
+        import shutil as _shutil
+        os.environ.pop("MEMORY_MCP_DB", None)
+        mcp.DB_PATH = self._old_db
+        _shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_create_database_ok(self):
+        r = mcp.create_database({"name": "proj-a"})
+        self.assertNotIn("error", r, r)
+        self.assertTrue(r["created"])
+        p = os.path.join(self.tmpdir, "databases", "proj-a.db")
+        self.assertTrue(os.path.exists(p))
+        dbs = mcp.list_databases({})["databases"]
+        self.assertTrue(any(d["name"] == "proj-a" and not d["active"] for d in dbs))
+
+    def test_create_database_rejects_active_name_and_invalid(self):
+        r = mcp.create_database({"name": "active"})
+        self.assertIn("error", r)  # active.db basename without suffix
+        r = mcp.create_database({"name": "a/b"})
+        self.assertIn("error", r)
+        r = mcp.create_database({"name": ".."})
+        self.assertIn("error", r)
+        r = mcp.create_database({"name": "x" * 65})
+        self.assertIn("error", r)
+
+    def test_create_database_duplicate(self):
+        mcp.create_database({"name": "dup"})
+        r = mcp.create_database({"name": "dup"})
+        self.assertIn("error", r)
+
+    def test_archive_database_soft_and_hard(self):
+        mcp.create_database({"name": "oldproj"})
+        r = mcp.archive_database({"name": "oldproj"})
+        self.assertNotIn("error", r, r)
+        self.assertFalse(r["hard"])
+        self.assertFalse(r["deleted"])
+        self.assertTrue(os.path.exists(os.path.join(self.tmpdir, "databases", "oldproj.db.archived")))
+        dbs = mcp.list_databases({})["databases"]
+        entry = [d for d in dbs if d["name"] == "oldproj"][0]
+        self.assertTrue(entry["archived"])
+        # hard requires confirm
+        mcp.create_database({"name": "doomed"})
+        r = mcp.archive_database({"name": "doomed", "hard": True})
+        self.assertIn("error", r)
+        r = mcp.archive_database({"name": "doomed", "hard": True, "confirm": True})
+        self.assertNotIn("error", r, r)
+        self.assertTrue(r["deleted"])
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "databases", "doomed.db")))
+
+    def test_archive_active_blocked(self):
+        r = mcp.archive_database({"name": "active"})
+        self.assertIn("error", r)
+
+    def test_backup_database_active_and_named(self):
+        mcp.remember_fact({"text": "fact for backup test", "source": "t"})
+        r = mcp.backup_database({})
+        self.assertNotIn("error", r, r)
+        self.assertTrue(r["backup"].startswith("active.db."))
+        p = os.path.join(self.tmpdir, "backups", r["backup"])
+        self.assertTrue(os.path.exists(p))
+        import sqlite3 as _sq
+        c = _sq.connect(p)
+        n = c.execute("SELECT COUNT(*) FROM facts WHERE text='fact for backup test'").fetchone()[0]
+        c.close()
+        self.assertEqual(n, 1)
+        # named (incl. archived) backup
+        mcp.create_database({"name": "namedb"})
+        r = mcp.backup_database({"name": "namedb"})
+        self.assertNotIn("error", r, r)
+        self.assertTrue(r["backup"].startswith("namedb.db."))
+
+    def test_delete_database(self):
+        mcp.create_database({"name": "gone"})
+        r = mcp.delete_database({"name": "gone"})
+        self.assertIn("error", r)  # no confirm
+        r = mcp.delete_database({"name": "gone", "confirm": True})
+        self.assertNotIn("error", r, r)
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "databases", "gone.db")))
+        r = mcp.delete_database({"name": "active", "confirm": True})
+        self.assertIn("error", r)
+
+
+class WorkspaceMgmtTest(unittest.TestCase):
+    """v0.6: create/list/reset/archive/backup workspace (registry in active DB)."""
+
+    def setUp(self):
+        self._old_db = mcp.DB_PATH
+        self.tmpdir = tempfile.mkdtemp(prefix="mcp-wsmgmt-")
+        self.db = os.path.join(self.tmpdir, "active.db")
+        os.environ["MEMORY_MCP_DB"] = self.db
+        mcp.DB_PATH = self.db
+
+    def tearDown(self):
+        import shutil as _shutil
+        os.environ.pop("MEMORY_MCP_DB", None)
+        mcp.DB_PATH = self._old_db
+        _shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_create_and_list_workspace(self):
+        r = mcp.create_workspace({"workspace": "alpha"})
+        self.assertNotIn("error", r, r)
+        self.assertTrue(r["created"])
+        r = mcp.create_workspace({"workspace": "alpha"})
+        self.assertFalse(r["created"])  # idempotent
+        mcp.remember_fact({"text": "alpha owns this", "source": "t", "workspace": "alpha"})
+        lst = mcp.list_workspaces({})["workspaces"]
+        alpha = [w for w in lst if w["id"] == "alpha"][0]
+        self.assertEqual(alpha["status"], "active")
+        self.assertEqual(alpha["active_facts"], 1)
+
+    def test_create_workspace_invalid(self):
+        self.assertIn("error", mcp.create_workspace({"workspace": "a/b"}))
+        self.assertIn("error", mcp.create_workspace({"workspace": ""}))
+
+    def test_reset_workspace_soft(self):
+        mcp.remember_fact({"text": "reset me soft", "source": "t", "workspace": "beta"})
+        r = mcp.reset_workspace({"workspace": "beta"})
+        self.assertNotIn("error", r, r)
+        self.assertFalse(r["hard"])
+        self.assertEqual(r["archived_facts"], 1)
+        hits = mcp.search_facts({"query": "reset me soft", "workspace": "beta"})
+        self.assertEqual(hits["count"], 0)  # archived -> not searchable
+        st = [w for w in mcp.list_workspaces({})["workspaces"] if w["id"] == "beta"][0]
+        self.assertEqual(st["status"], "reset")
+
+    def test_reset_workspace_hard(self):
+        mcp.remember_fact({"text": "reset me hard", "source": "t", "workspace": "gamma"})
+        r = mcp.reset_workspace({"workspace": "gamma", "hard": True})
+        self.assertIn("error", r)  # confirm required
+        r = mcp.reset_workspace({"workspace": "gamma", "hard": True, "confirm": True})
+        self.assertNotIn("error", r, r)
+        self.assertTrue(r["hard"])
+        self.assertEqual(r["deleted_facts"], 1)
+        con = mcp.get_db()
+        n = con.execute("SELECT COUNT(*) FROM facts WHERE workspace_id='gamma'").fetchone()[0]
+        con.close()
+        self.assertEqual(n, 0)
+        self.assertEqual([w for w in mcp.list_workspaces({})["workspaces"] if w["id"] == "gamma"], [])
+
+    def test_archive_workspace_soft_and_reactivate(self):
+        mcp.remember_fact({"text": "archive me", "source": "t", "workspace": "delta"})
+        r = mcp.archive_workspace({"workspace": "delta"})
+        self.assertNotIn("error", r, r)
+        self.assertEqual(r["archived_facts"], 1)
+        hits = mcp.search_facts({"query": "archive me", "workspace": "delta"})
+        self.assertEqual(hits["count"], 0)
+        st = [w for w in mcp.list_workspaces({})["workspaces"] if w["id"] == "delta"][0]
+        self.assertEqual(st["status"], "archived")
+        # re-registering reactivates the workspace
+        r = mcp.create_workspace({"workspace": "delta"})
+        self.assertTrue(r.get("reactivated"))
+        st = [w for w in mcp.list_workspaces({})["workspaces"] if w["id"] == "delta"][0]
+        self.assertEqual(st["status"], "active")
+
+    def test_backup_workspace_json(self):
+        mcp.remember_fact({"text": "back me up", "source": "t", "workspace": "eps"})
+        mcp.archive_workspace({"workspace": "eps"})  # archived facts included
+        r = mcp.backup_workspace({"workspace": "eps"})
+        self.assertNotIn("error", r, r)
+        self.assertTrue(r["backup"].startswith("workspace-eps-"))
+        p = os.path.join(self.tmpdir, "backups", r["backup"])
+        self.assertTrue(os.path.exists(p))
+        data = json.load(open(p, encoding="utf-8"))
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["facts"][0]["text"], "back me up")
+        r = mcp.backup_workspace({"workspace": "nonexistent"})
+        self.assertIn("error", r)
