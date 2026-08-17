@@ -6,7 +6,9 @@ under `~/.reasonix/projects/`; override with MEMORY_MIGRATE_SRC).
 Target: memory-mcp server (spawned once, remember_fact batch).
 Mapping: text = title: description + body; trust = metadata.trust; domain = metadata.type;
 project = source project slug; workspace = same slug (scoped to the project, not the shared
-pool); source = migration-20260815; strong = false.
+pool); source = migration-20260815; strong = false. Category (v0.10) is assigned by the
+server's remember_fact from the `domain` arg (legacy-domain precedence), so migrated facts
+land in the metadata.type category automatically.
 """
 import json
 import os

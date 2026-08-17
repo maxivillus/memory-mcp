@@ -32,6 +32,9 @@ services:
       MEMORY_MCP_EXTRACT: "1"
       MEMORY_MCP_RECALL: "1"
       MEMORY_MCP_VERIFY: "1"
+      # v0.10: LLM batch category refinement for uncategorized facts
+      # (categorize_pending; provider shared with extract/verify)
+      MEMORY_MCP_CATEGORIZE: "1"
       MEMORY_MCP_LLM_PROVIDER: ollama
       MEMORY_MCP_LLM_URL: http://ollama:11434
       MEMORY_MCP_LLM_MODEL: qwen2.5:14b
@@ -59,7 +62,8 @@ printf '%s\n' \
 ```
 
 Expect `{"result":{"content":[{"type":"text","text":"{...\"index\":...}"}]}}`
-with one `#<id> trust [domain] text` line per fact.
+with one `#<id> trust [category] [domain] text` line per fact (v0.10:
+`[category]` tags are included when a fact has one).
 
 ## 3. Register as an MCP server (MCP-native runtimes)
 
