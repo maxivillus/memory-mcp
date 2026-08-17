@@ -12,7 +12,7 @@ metadata:
 
 # Shared Agent Memory (memory-mcp)
 
-Available to runtime agents as the `mcp__memory-mcp__*` tools (44 tools).
+Available to runtime agents as the `mcp__memory-mcp__*` tools (50 tools).
 One shared store across all runtimes: a fact or decision written in one
 session is visible to every later session.
 
@@ -36,9 +36,20 @@ session is visible to every later session.
   `compose_recall {session_expand}` adds same-session context.
 - `compose_recall {graph=true}` — entity-graph as a third recall source.
 
-- `remember_fact {text, source?, project?, domain?, trust?, strong?}` — store a
-  durable fact (upsert, dedup by sha256). Use `strong=true` for
+- `remember_fact {text, source?, project?, domain?, category?, trust?, strong?}` —
+  store a durable fact (upsert, dedup by sha256). Use `strong=true` for
   user-confirmed facts, `trust=high` for verified facts, default `medium`.
+  Category is auto-assigned at write time: explicit `category` arg > legacy
+  `domain` > keyword rules; unmatched facts stay uncategorized until
+  `categorize_pending` (LLM batch) refines them.
+- **Library flow (v0.10): never read memory as one dump.** Tier 1 —
+  `list_categories {query?}`: the card catalog (topics with fact counts).
+  Tier 2 — `search_index {query, category?, max_chars?}`: the shelf — short
+  snippets (≤120 chars) of matching facts grouped by category, full texts are
+  NOT returned. Tier 3 — `get_provenance {fact_id}`: the book — load the full
+  fact only after picking it from the index. `summarize_index` remains the
+  compact freshest-first index for prompt budgets, now with `[category]`
+  tags and a `category` filter.
 - Before researching something, `search_facts` the store first — a fresh
   distinctive fact can skip heuristic research (fact gate).
 - `search_facts` with `semantic=true` merges lexical (FTS5/BM25) and embedding

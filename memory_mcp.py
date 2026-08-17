@@ -69,7 +69,8 @@ CREATE TABLE facts_new (
   last_accessed_at TEXT NOT NULL DEFAULT '',
   access_count INTEGER NOT NULL DEFAULT 0,
   revival_count INTEGER NOT NULL DEFAULT 0,
-  lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active','degraded','forgotten'))
+  lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active','degraded','forgotten')),
+  category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL
 );
 """
 
@@ -96,6 +97,18 @@ _FACT_EXTRA_COLUMNS = {
 }
 
 _SCHEMA = """
+-- v0.10 (2026-08-17): topic categories — the "card catalog". Auto-assigned at
+-- write time (explicit arg > legacy domain > keyword rules), refined in
+-- batches by categorize_pending (LLM). Created before facts so the FK
+-- reference resolves.
+CREATE TABLE IF NOT EXISTS categories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  workspace_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(name, workspace_id)
+);
 CREATE TABLE IF NOT EXISTS facts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sha256 TEXT NOT NULL,
@@ -116,7 +129,8 @@ CREATE TABLE IF NOT EXISTS facts (
   last_accessed_at TEXT NOT NULL DEFAULT '',
   access_count INTEGER NOT NULL DEFAULT 0,
   revival_count INTEGER NOT NULL DEFAULT 0,
-  lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active','degraded','forgotten'))
+  lifecycle TEXT NOT NULL DEFAULT 'active' CHECK (lifecycle IN ('active','degraded','forgotten')),
+  category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
   text, content='facts', content_rowid='id'
@@ -288,6 +302,7 @@ def _open_db(path):
     _migrate_facts(con)
     _migrate_fks(con)
     _migrate_fts(con, preexisting_fts)
+    _migrate_categories(con)
     return con
 
 
@@ -299,6 +314,17 @@ def get_db():
             "selected database %r no longer exists — reset_database or "
             "recreate it with create_database" % _SELECTED_DB[0])
     return _open_db(_db_path())
+
+
+def _migrate_categories(con):
+    """v0.10 additive migration: `facts.category_id` column (plain INTEGER on
+    migrated stores — the FK + ON DELETE SET NULL live in the fresh/rebuild
+    DDL). The `categories` table itself is created by _SCHEMA before this
+    runs; UNIQUE(name, workspace_id) comes from its DDL."""
+    existing = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
+    if "category_id" not in existing:
+        con.execute("ALTER TABLE facts ADD COLUMN category_id INTEGER")
+    con.commit()
 
 
 def _migrate_facts(con):
@@ -763,6 +789,66 @@ def verify_facts(args):
     return m.verify_facts(args)
 
 
+# v0.10 rule-based categorization: ordered (regex, category) pairs evaluated
+# on the lowercased fact text. First match wins; no match leaves the fact
+# uncategorized (NULL) until categorize_pending (LLM batch) refines it.
+# Explicit `category` / legacy `domain` args override rules entirely.
+_CATEGORY_RULES = [
+    (r"memory-mcp|memory_mcp|facts\.db|summarize_index|search_facts|compose_recall|recall\b", "memory-mcp"),
+    (r"правило|директива|обязательн", "rules"),
+    (r"skill|скил", "skills"),
+    (r"card|карточк|issue|ntl-\d", "issues"),
+    (r"docker|compose|контейнер|container|dockerfile|образ", "docker"),
+    (r"reasonix|jcode|codex|claude|multica|daemon|runtime", "runtimes"),
+    (r"git|gitea|commit|push|репозитор", "git"),
+    (r"vpn|tardis|proxy|socks|privoxy|tunnel", "network"),
+    (r"ollama|llm\b|model|модел|embed|token", "llm"),
+    (r"test|unittest|qa\b|тест", "testing"),
+    (r"sqlite|fts5?|database|баз", "database"),
+]
+
+
+def _categorize_by_rules(text):
+    """First matching rule on the lowercased text, or '' (uncategorized)."""
+    low = text.lower()
+    for pattern, cat in _CATEGORY_RULES:
+        if re.search(pattern, low):
+            return cat
+    return ""
+
+
+def _resolve_category(con, name, workspace):
+    """Idempotent get-or-create of a workspace-scoped category; returns id.
+    Category names are capped at 64 chars (they are interpolated into the LLM
+    prompt by categorize_pending — treat as untrusted data)."""
+    name = (name or "").strip()[:64]
+    if not name:
+        return None
+    ts = now()
+    row = con.execute("SELECT id FROM categories WHERE name=? AND workspace_id=?",
+                      [name, workspace]).fetchone()
+    if row:
+        return row["id"]
+    con.execute("INSERT OR IGNORE INTO categories (name, workspace_id, created_at, updated_at) "
+                "VALUES (?,?,?,?)", [name, workspace, ts, ts])
+    return con.execute("SELECT id FROM categories WHERE name=? AND workspace_id=?",
+                       [name, workspace]).fetchone()["id"]
+
+
+def _categorize_fact(con, args, text, workspace):
+    """Category for a new fact: explicit `category` arg > legacy `domain` arg
+    > keyword rules; '' (uncategorized) when nothing matches — refined later
+    by categorize_pending."""
+    cat = (args.get("category") or "").strip()
+    if not cat:
+        cat = (args.get("domain") or "").strip()
+    if not cat:
+        cat = _categorize_by_rules(text)
+    if not cat:
+        return None
+    return _resolve_category(con, cat, workspace)
+
+
 def remember_fact(args):
     text = (args.get("text") or "").strip()
     if not text:
@@ -785,6 +871,9 @@ def remember_fact(args):
         err = _ws_inactive_error(con, workspace)
         if err:
             return err
+        # v0.10: resolve the topic category once, before the dedup branch, so
+        # re-remembering with an explicit category also refreshes it.
+        cat_id = _categorize_fact(con, args, text, workspace)
         # Workspace-scoped dedup: the same text is one fact per workspace.
         # Unscoped callers dedup within the shared pool only.
         cur = con.execute("SELECT id, created_at FROM facts WHERE sha256=?" +
@@ -799,6 +888,9 @@ def remember_fact(args):
             if "importance" in args:
                 sets.append("importance=?")
                 params.append(importance)
+            if cat_id is not None:
+                sets.append("category_id=?")
+                params.append(cat_id)
             con.execute("UPDATE facts SET %s WHERE id=?" % ", ".join(sets),
                         params + [row["id"]])
             con.commit()
@@ -808,11 +900,11 @@ def remember_fact(args):
                 out["warning"] = warning
             return out
         cur = con.execute(
-            "INSERT INTO facts (sha256, text, source, project, domain, trust, strong, importance, workspace_id, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO facts (sha256, text, source, project, domain, trust, strong, importance, workspace_id, created_at, updated_at, category_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (sha, text, args.get("source", ""), args.get("project", ""),
              args.get("domain", ""), trust, 1 if args.get("strong") else 0,
-             importance, workspace, ts, ts))
+             importance, workspace, ts, ts, cat_id))
         con.commit()
         fid = cur.lastrowid
         emb = _emb()
@@ -834,8 +926,9 @@ def search_facts(args):
     limit = max(1, min(int(args.get("limit", 20)), 100))
     sql = ("SELECT f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong, "
            "f.importance, f.confirmed, f.invalid_at, f.created_at, "
-           "bm25(facts_fts) AS rank "
+           "c.name AS category, bm25(facts_fts) AS rank "
            "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
+           "LEFT JOIN categories c ON c.id = f.category_id "
            "WHERE facts_fts MATCH ? AND f.archived=0 AND f.lifecycle='active'")
     ws = _workspace(args)
     params = [query]
@@ -861,6 +954,9 @@ def search_facts(args):
     if args.get("domain"):
         sql += " AND f.domain=?"
         params.append(args["domain"])
+    if args.get("category"):
+        sql += " AND c.name=?"
+        params.append(args["category"])
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
     con = get_db()
@@ -940,20 +1036,25 @@ def embed_backfill(args):
 
 def list_facts(args):
     limit = max(1, min(int(args.get("limit", 50)), 500))
-    sql = ("SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
-           "created_at, updated_at FROM facts WHERE archived=0 AND invalid_at='' AND lifecycle='active'")
+    sql = ("SELECT f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong, f.importance, f.confirmed, "
+           "f.created_at, f.updated_at, c.name AS category "
+           "FROM facts f LEFT JOIN categories c ON c.id = f.category_id "
+           "WHERE f.archived=0 AND f.invalid_at='' AND f.lifecycle='active'")
     ws = _workspace(args)
     params = []
-    sql += _ws_filter("facts", ws)
+    sql += _ws_filter("f", ws)
     if ws:
         params.append(ws)
     if args.get("project"):
-        sql += " AND project=?"
+        sql += " AND f.project=?"
         params.append(args["project"])
     if args.get("domain"):
-        sql += " AND domain=?"
+        sql += " AND f.domain=?"
         params.append(args["domain"])
-    sql += " ORDER BY updated_at DESC LIMIT ?"
+    if args.get("category"):
+        sql += " AND c.name=?"
+        params.append(args["category"])
+    sql += " ORDER BY f.updated_at DESC LIMIT ?"
     params.append(limit)
     con = get_db()
     try:
@@ -971,11 +1072,13 @@ def summarize_index(args):
     """
     limit = max(1, min(int(args.get("limit", 200)), 500))
     max_chars = max(int(args.get("max_chars", 4000)), 200)
-    sql = ("SELECT id, text, project, domain, trust, strong, updated_at "
-           "FROM facts WHERE archived=0 AND invalid_at='' AND lifecycle='active'")
+    sql = ("SELECT f.id, f.text, f.project, f.domain, f.trust, f.strong, f.updated_at, "
+           "c.name AS category "
+           "FROM facts f LEFT JOIN categories c ON c.id = f.category_id "
+           "WHERE f.archived=0 AND f.invalid_at='' AND f.lifecycle='active'")
     ws = _workspace(args)
     params = []
-    sql += _ws_filter("facts", ws)
+    sql += _ws_filter("f", ws)
     if ws:
         params.append(ws)
     if args.get("project"):
@@ -991,7 +1094,10 @@ def summarize_index(args):
         params += allowed
     if args.get("strong_only"):
         sql += " AND strong=1"
-    sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+    if args.get("category"):
+        sql += " AND c.name=?"
+        params.append(args["category"])
+    sql += " ORDER BY f.updated_at DESC, f.id DESC LIMIT ?"
     params.append(limit)
     con = get_db()
     try:
@@ -1009,7 +1115,8 @@ def summarize_index(args):
             text = text[:117] + "..."
         tag = r["trust"] + ("!" if r["strong"] else "")
         dom = f" [{r['domain']}]" if r["domain"] else ""
-        lines.append(f"#{r['id']} {tag}{dom} {text}")
+        cat = f" [{r['category']}]" if r["category"] else ""
+        lines.append(f"#{r['id']} {tag}{cat}{dom} {text}")
     joined = "\n".join(lines)
     truncated = len(joined) > max_chars
     if truncated:
@@ -1019,6 +1126,185 @@ def summarize_index(args):
         joined = joined[:cut]
     return {"count": len(lines), "total": total, "chars": len(joined),
             "truncated": truncated, "index": joined}
+
+
+def _snippet(text, limit=120):
+    """Short reference: whitespace-collapsed text, trimmed at a word boundary."""
+    t = " ".join(text.split())
+    if len(t) <= limit:
+        return t
+    cut = t[:limit]
+    i = cut.rfind(" ")
+    return (cut[:i] if i > 60 else cut) + "…"
+
+
+def list_categories(args):
+    """v0.10: the card catalog — topic categories with active/total fact
+    counts, most-used first. `query` filters category names."""
+    ws = _workspace(args)
+    con = get_db()
+    try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
+        q = (args.get("query") or "").strip()
+        sql = ("SELECT c.id, c.name, c.workspace_id, "
+               "(SELECT COUNT(*) FROM facts f WHERE f.category_id=c.id AND f.archived=0 "
+               " AND f.invalid_at='' AND f.lifecycle='active'"
+               + _ws_filter("f", ws) + ") AS active_facts, "
+               "(SELECT COUNT(*) FROM facts f WHERE f.category_id=c.id) AS facts "
+               "FROM categories c WHERE 1=1" + _ws_filter("c", ws))
+        params = []
+        if ws:
+            params += [ws, ws]
+        if q:
+            sql += " AND c.name LIKE ?"
+            params.append(f"%{q}%")
+        sql += " ORDER BY active_facts DESC, c.name LIMIT 200"
+        rows = [dict(r) for r in con.execute(sql, params)]
+        return {"count": len(rows), "categories": rows}
+    finally:
+        con.close()
+
+
+def search_index(args):
+    """v0.10: short reference by search vector — one-line snippets of matching
+    facts grouped by category, capped at max_chars. The library shelf lookup:
+    list_categories (catalog) -> search_index (shelf) -> get_provenance (book).
+    Full texts are NOT returned here."""
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"error": "query is required"}
+    limit = max(1, min(int(args.get("limit", 30)), 100))
+    max_chars = max(int(args.get("max_chars", 2000)), 200)
+    sql = ("SELECT f.id, f.text, f.source, f.trust, f.strong, f.importance, f.updated_at, "
+           "c.name AS category, bm25(facts_fts) AS rank "
+           "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
+           "LEFT JOIN categories c ON c.id = f.category_id "
+           "WHERE facts_fts MATCH ? AND f.archived=0 AND f.lifecycle='active' AND f.invalid_at=''")
+    ws = _workspace(args)
+    params = [query]
+    sql += _ws_filter("f", ws)
+    if ws:
+        params.append(ws)
+    if args.get("category"):
+        sql += " AND c.name=?"
+        params.append(args["category"])
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(limit)
+    con = get_db()
+    try:
+        try:
+            rows = [dict(r) for r in con.execute(sql, params)]
+        except sqlite3.OperationalError:
+            phrase = '"' + query.replace('"', '""') + '"'
+            rows = [dict(r) for r in con.execute(sql, [phrase] + params[1:])]
+        emb = _emb()
+        if emb is not None and args.get("semantic"):
+            if rows:
+                res = emb.hybrid_rerank(con, query, rows, limit=limit, workspace=ws)
+            else:
+                res = emb.search_semantic(con, query, limit=limit, workspace=ws)
+            rows = res.get("facts", []) if isinstance(res, dict) else res or []
+            if rows:
+                # Semantic rerank rows carry only id/text/score — rehydrate the
+                # category and display fields from the store (FTS rows already
+                # have them; this also protects against key loss in the merge).
+                ids = [r["id"] for r in rows]
+                ph = ",".join("?" * len(ids))
+                meta = {r["id"]: dict(r) for r in con.execute(
+                    "SELECT f.id, c.name AS category, f.importance, f.updated_at, "
+                    "f.trust, f.strong FROM facts f LEFT JOIN categories c ON c.id=f.category_id "
+                    "WHERE f.id IN (%s)" % ph, ids)}
+                for r in rows:
+                    m2 = meta.get(r["id"], {})
+                    r["category"] = m2.get("category")
+                    r["importance"] = m2.get("importance", 0.5)
+                    r["updated_at"] = m2.get("updated_at", "")
+                    r["trust"] = m2.get("trust", "medium")
+                    r["strong"] = m2.get("strong", 0)
+        # group snippets by category, preserving rank order; respect max_chars
+        groups, order, used = {}, [], 0
+        shown, truncated = 0, False
+        for r in rows:
+            cat = r.get("category") or "(uncategorized)"
+            cost = len(cat) + 24 + min(len(r["text"]), 120)
+            if groups and used + cost > max_chars:
+                truncated = True
+                break
+            used += cost
+            if cat not in groups:
+                groups[cat] = []
+                order.append(cat)
+            groups[cat].append({
+                "id": r["id"], "category": cat, "snippet": _snippet(r["text"]),
+                "trust": r["trust"], "strong": r["strong"], "importance": r["importance"],
+                "updated_at": r["updated_at"]})
+            shown += 1
+        return {"count": len(rows), "shown": shown, "truncated": truncated,
+                "groups": [{"category": c, "facts": groups[c]} for c in order]}
+    except sqlite3.OperationalError as e:
+        # No host paths in client-visible errors (repo rule); detail to stderr.
+        print(f"memory-mcp: search_index query failed: {e}", file=sys.stderr)
+        return {"error": "search_index query failed", "groups": []}
+    finally:
+        con.close()
+
+
+def categorize_pending(args):
+    """v0.10: LLM batch refinement (the background half of hybrid
+    categorization) — assigns categories to facts with none, reusing existing
+    category names when they fit. Enabled with MEMORY_MCP_CATEGORIZE=1;
+    provider comes from llm.py (MEMORY_MCP_LLM_*). Rule-based categories from
+    remember_fact stay as the instant fallback."""
+    if not os.environ.get("MEMORY_MCP_CATEGORIZE"):
+        return {"error": "categorize_pending is disabled (set MEMORY_MCP_CATEGORIZE=1)"}
+    limit = max(1, min(int(args.get("limit", 20)), 100))
+    ws = _workspace(args)
+    con = get_db()
+    try:
+        err = _ws_inactive_error(con, ws)
+        if err:
+            return err
+        sql = ("SELECT f.id, f.text, f.source FROM facts f "
+               "WHERE f.category_id IS NULL AND f.archived=0 AND f.invalid_at='' "
+               "AND f.lifecycle='active'" + _ws_filter("f", ws))
+        params = [ws] if ws else []
+        sql += " ORDER BY f.updated_at DESC LIMIT ?"
+        params.append(limit)
+        rows = [dict(r) for r in con.execute(sql, params)]
+        if not rows:
+            return {"count": 0, "categorized": 0, "errors": 0}
+        existing = [r["name"] for r in con.execute(
+            "SELECT name FROM categories c WHERE 1=1" + _ws_filter("c", ws),
+            [ws] if ws else [])]
+        try:
+            import llm
+        except ImportError:
+            return {"error": "llm module not available"}
+        categorized, errors = 0, 0
+        for r in rows:
+            try:
+                label = (llm.category_for(r["text"], existing) or "").strip()
+            except Exception:
+                errors += 1
+                continue
+            if not label:
+                errors += 1
+                continue
+            cid = _resolve_category(con, label, ws)
+            if cid is None:
+                errors += 1
+                continue
+            con.execute("UPDATE facts SET category_id=?, updated_at=? WHERE id=?",
+                        [cid, now(), r["id"]])
+            # Commit per fact: LLM calls can take tens of seconds and must not
+            # hold the SQLite write lock for the whole batch.
+            con.commit()
+            categorized += 1
+        return {"count": len(rows), "categorized": categorized, "errors": errors}
+    finally:
+        con.close()
 
 
 def _resolve_entity(con, name, etype="", aliases="", workspace=""):
@@ -1942,6 +2228,8 @@ def _purge_workspace_rows(con, name):
     counts["decisions"] = cur.rowcount
     cur = con.execute("DELETE FROM facts WHERE workspace_id=?", [name])
     counts["facts"] = cur.rowcount
+    cur = con.execute("DELETE FROM categories WHERE workspace_id=?", [name])
+    counts["categories"] = cur.rowcount
     return counts
 
 
@@ -2071,7 +2359,8 @@ TOOLS = {
                 "text": {"type": "string", "description": "Fact text"},
                 "source": {"type": "string", "description": "Origin: session/issue/run"},
                 "project": {"type": "string", "description": "Project scope"},
-                "domain": {"type": "string", "description": "Category/tag"},
+                "domain": {"type": "string", "description": "Legacy free tag; used as category when `category` is absent"},
+                "category": {"type": "string", "description": "Topic category; auto-assigned by keyword rules when absent (explicit arg > domain > rules > uncategorized)"},
                 "trust": {"type": "string", "enum": list(VALID_TRUST), "default": "medium"},
                 "strong": {"type": "boolean", "default": False},
                 "importance": {"type": "number", "default": 0.5, "description": "0..1 value of the fact for retention"},
@@ -2091,6 +2380,7 @@ TOOLS = {
                 "strong_only": {"type": "boolean", "default": False},
                 "project": {"type": "string"},
                 "domain": {"type": "string"},
+                "category": {"type": "string", "description": "Topic category filter (see list_categories)"},
                 "semantic": {"type": "boolean", "default": False, "description": "Hybrid: RRF-merge FTS BM25 with embedding search (requires MEMORY_MCP_EMBEDDINGS=1)"},
                 "valid_at": {"type": "string", "description": "RFC3339: include facts that were still valid at that time (bi-temporal)"},
                 "graph": {"type": "boolean", "default": False, "description": "RRF-merge entity-graph expansion"},
@@ -2243,28 +2533,65 @@ TOOLS = {
         },
     },
     "list_facts": {
-        "description": "List recent non-archived facts (optional project/domain filter).",
+        "description": "List recent non-archived facts (optional project/domain/category filter).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {"type": "string"},
                 "domain": {"type": "string"},
+                "category": {"type": "string"},
                 "limit": {"type": "integer", "default": 50},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
         },
     },
     "summarize_index": {
-        "description": "Compact one-line-per-fact index (freshest first, capped at max_chars) — for prompt-injection budgets.",
+        "description": "Compact one-line-per-fact index (freshest first, capped at max_chars, with [category] tags) — for prompt-injection budgets.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "project": {"type": "string"},
                 "domain": {"type": "string"},
+                "category": {"type": "string"},
                 "trust_min": {"type": "string", "enum": list(VALID_TRUST)},
                 "strong_only": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "default": 200},
                 "max_chars": {"type": "integer", "default": 4000},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+            },
+        },
+    },
+    "list_categories": {
+        "description": "Card catalog: topic categories with active/total fact counts (most-used first). Optional query filters category names.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+            },
+        },
+    },
+    "search_index": {
+        "description": "Short reference by search vector: one-line snippets of matching facts grouped by category, capped at max_chars. Library shelf lookup — full texts via get_provenance.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "category": {"type": "string"},
+                "limit": {"type": "integer", "default": 30},
+                "max_chars": {"type": "integer", "default": 2000},
+                "semantic": {"type": "boolean", "default": False, "description": "Hybrid: RRF-merge FTS BM25 with embedding search (requires MEMORY_MCP_EMBEDDINGS=1)"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+            },
+            "required": ["query"],
+        },
+    },
+    "categorize_pending": {
+        "description": "LLM batch refinement: assigns topic categories to uncategorized facts (requires MEMORY_MCP_CATEGORIZE=1; provider via MEMORY_MCP_LLM_*).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 20},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
         },
@@ -2534,6 +2861,9 @@ HANDLERS = {
     "consolidate": consolidate,
     "list_facts": list_facts,
     "summarize_index": summarize_index,
+    "list_categories": list_categories,
+    "search_index": search_index,
+    "categorize_pending": categorize_pending,
     "remember_entity": remember_entity,
     "remember_relation": remember_relation,
     "search_graph": search_graph,
