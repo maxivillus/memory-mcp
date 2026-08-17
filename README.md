@@ -67,8 +67,9 @@ Facts age only on **active days** — days with at least one memory-mcp call
 - `degraded` (score < 0.25): hidden from plain search; reachable via
   entity-graph/session chains; revived after `DECAY_REVIVE_HITS` (default 3)
   matching searches.
-- `forgotten` (score ≤ 0.1): excluded everywhere; visible only via
-  `list_forgotten {limit?}` and `restore_fact {id}` (manual return to active).
+- `forgotten` (score ≤ 0.1): excluded everywhere — plain search, semantic
+  search and graph/session chains; visible only via `list_forgotten {limit?}`
+  and `restore_fact {id}` (manual return to active).
 - `decay_sweep {}` — full lifecycle recompute + report; run manually or via
   cron (the stdio server does not live between sessions). `strong` and
   `confirmed` facts never decay.

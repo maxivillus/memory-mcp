@@ -131,8 +131,9 @@ them. Score = importance x 0.95^active_days since the last search hit.
 - degraded (score < 0.25): hidden from plain search results; still reachable
   through entity-graph/session chains; returns to active after 3 matching
   searches (attempts to remember). Do not expect it in search until revived.
-- forgotten (score <= 0.1): excluded from all search; see it only via
-  list_forgotten, bring it back with restore_fact.
+- forgotten (score <= 0.1): excluded everywhere — plain search AND
+  graph/session chains; see it only via list_forgotten, bring it back
+  with restore_fact.
 - strong and confirmed facts never decay.
 - decay_sweep runs the lifecycle recompute (manually or by cron); search
   hits refresh last_accessed_at on active facts only.
@@ -145,6 +146,7 @@ them. Score = importance x 0.95^active_days since the last search hit.
 - The store is a shared read-model: agents may write facts/decisions/evidence,
   but must not delete or mutate records owned by another agent without a
   strong reason.
+
 
 
 

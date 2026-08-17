@@ -230,7 +230,8 @@ def _session_hits(hits, expand, workspace=""):
                 params.append(workspace)
             rows = con.execute(
                 "SELECT id, text, source, project, domain, trust, strong, importance, confirmed "
-                "FROM facts WHERE source=? AND archived=0 AND invalid_at=''" + ws_clause +
+                "FROM facts WHERE source=? AND archived=0 AND invalid_at='' "
+                "AND lifecycle != 'forgotten'" + ws_clause +
                 " ORDER BY importance DESC, updated_at DESC LIMIT ?",
                 params + [expand]).fetchall()
             for r in rows:

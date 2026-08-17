@@ -376,7 +376,8 @@ def _graph_expand_facts(con, hit_facts, limit=10, workspace=""):
             params.append(workspace)
         rows = con.execute(
             "SELECT id, text, source, project, domain, trust, strong, importance, confirmed "
-            "FROM facts WHERE text LIKE ? ESCAPE '\\' AND archived=0 AND invalid_at=''" +
+            "FROM facts WHERE text LIKE ? ESCAPE '\\' AND archived=0 AND invalid_at='' "
+            "AND lifecycle != 'forgotten'" +
             ws_clause + " LIMIT 5", params).fetchall()
         for r in rows:
             if r["id"] not in seen:
@@ -1439,7 +1440,8 @@ def facts_for_session(args):
     con = get_db()
     try:
         sql = ("SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
-               "created_at, updated_at FROM facts WHERE source=? AND archived=0 AND invalid_at=''")
+               "created_at, updated_at FROM facts WHERE source=? AND archived=0 AND invalid_at='' "
+               "AND lifecycle != 'forgotten'")
         ws = _workspace(args)
         params = [session_ref]
         sql += _ws_filter("facts", ws)
