@@ -340,9 +340,12 @@ activate only when set, and every failure degrades to store-only.
   (graphiti-style invalidation) only on high-confidence verdicts
   (`MEMORY_MCP_VERIFY_MIN_CONFIDENCE`, default 0.8) and attaches
   `supersedes:<old_id>` evidence to the new one.
-- **LLM provider** (shared by extract/verify): `MEMORY_MCP_LLM_PROVIDER`
+- **LLM provider** (shared by extract/verify/categorize): `MEMORY_MCP_LLM_PROVIDER`
   (ollama|openai|test), `_URL`, `_MODEL` (ollama default qwen2.5:14b), `_KEY`,
-  `_TIMEOUT` (default 60s).
+  `_TIMEOUT` (default 60s). `MEMORY_MCP_CATEGORIZE=1` enables
+  `categorize_pending` — the v0.10 LLM batch that assigns topic categories to
+  uncategorized facts (rule-based categories from `remember_fact` are the
+  instant fallback and need no env).
 
 ## Memory quality (v0.4): bi-temporal validity, importance, confirmation
 
