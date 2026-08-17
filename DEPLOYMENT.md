@@ -19,6 +19,7 @@ services:
       # server files (read-only) — clone of this repo, e.g. ./memory-mcp
       - ./memory-mcp:/opt/memory-mcp:ro
       # shared DB dir (read-write, WAL needs write access even for reads)
+      # v0.6: named databases/ and backups/ are created here automatically
       - ./memory-shared:/opt/memory-shared
     environment:
       MEMORY_MCP_CMD: /opt/memory-mcp/memory_mcp.py
