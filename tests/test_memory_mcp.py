@@ -1231,6 +1231,27 @@ class DecayTest(unittest.TestCase):
         res = mcp.search_facts({"query": "delta widget forgotten"})
         self.assertGreaterEqual(res["count"], 1)
 
+    def test_forgotten_excluded_from_graph_and_session_chains(self):
+        # strict isolation: forgotten facts must not surface via chains
+        r1 = mcp.remember_fact({"text": "alpha widget talks to beta core", "source": "sess-1",
+                                "strong": True, "importance": 1})
+        r2 = mcp.remember_fact({"text": "beta core status is unknown", "source": "sess-1",
+                                "importance": 1})
+        mcp.remember_relation({"subject": "alpha", "predicate": "connects", "object": "beta"})
+        self._add_active_days(80)
+        mcp.decay_sweep({})
+        self.assertEqual(self._lifecycle(r1["id"]), "active")   # strong protected
+        self.assertEqual(self._lifecycle(r2["id"]), "forgotten")
+        # graph chain from the active fact must not surface the forgotten one
+        res = mcp.search_facts({"query": "alpha widget talks", "graph": True, "limit": 10})
+        self.assertIn(r1["id"], [f["id"] for f in res["facts"]])
+        self.assertNotIn(r2["id"], [f["id"] for f in res["facts"]])
+        # session chain must not surface it either
+        import recall as _recall
+        hits = [{"id": r1["id"], "text": "alpha widget talks to beta core", "source": "sess-1"}]
+        got = _recall._session_hits(hits, expand=5, workspace="")
+        self.assertNotIn(r2["id"], [f["id"] for f in got])
+
     def test_restore_fact_rejects_archived(self):
         r = mcp.remember_fact({"text": "archived cannot be restored via decay", "source": "t"})
         fid = r["id"]
