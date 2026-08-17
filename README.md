@@ -151,7 +151,9 @@ migrate in place):
     failures degrade silently to native-only.
 
 `migrate_memory.py` — one-time migration of native reasonix memory facts
-(frontmatter + body) into the shared store (Phase 3). All paths are
+(frontmatter + body) into the shared store (Phase 3). Facts are scoped to
+the project workspace (`workspace = project slug`, not the shared pool).
+All paths are
 env-overridable and default to portable values: `MEMORY_MIGRATE_SRC`
 (auto-discovered first `<project>/memory` under `~/.reasonix/projects/`,
 symlinked project dirs skipped), `MEMORY_MIGRATE_PROJECT` (derived from the

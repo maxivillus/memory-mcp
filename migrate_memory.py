@@ -5,7 +5,8 @@ Source: reasonix project memory dir (auto-discovered: first `<project>/memory`
 under `~/.reasonix/projects/`; override with MEMORY_MIGRATE_SRC).
 Target: memory-mcp server (spawned once, remember_fact batch).
 Mapping: text = title: description + body; trust = metadata.trust; domain = metadata.type;
-project = source project slug; source = migration-20260815; strong = false.
+project = source project slug; workspace = same slug (scoped to the project, not the shared
+pool); source = migration-20260815; strong = false.
 """
 import json
 import os
@@ -95,6 +96,7 @@ def load_facts():
             "trust": trust,
             "domain": meta.get("type", ""),
             "project": PROJECT_SLUG,
+            "workspace": PROJECT_SLUG,
         })
     return facts
 
