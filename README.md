@@ -29,6 +29,9 @@ pipeline into the server for runtimes that have no client patches.
 - `list_context {workspace, name?, limit?}` — catalog metadata only; payloads are never returned
 - `resolve_context {ref, workspace}` — resolve metadata and parent/child lineage without payload
 - `read_context {ref, workspace, start?, end?, max_chars?}` — read one bounded slice after ACL and TTL checks
+- `search_context {query, workspace, limit?}` — search context metadata and payloads, returning metadata only
+- `chunk_context {ref, workspace, chunk_chars?, start_chunk?, max_chunks?}` — read a bounded page of numbered chunks
+- `reduce_context {name, refs, workspace, separator?, schema?, source?, checksum?, ttl_seconds?}` — create a derived ref by deterministic concatenation
 
 ### v0.6 — database & workspace management (2026-08-17)
 
@@ -181,8 +184,9 @@ executable content:
   version is a new ref.
 - `list_context` and `resolve_context` return metadata only. `read_context`
   is the only payload endpoint and enforces `start`/`end`/`max_chars` bounds.
-- `parent_refs` must resolve inside the same workspace. The catalog, reads,
-  lineage, and expiry checks all enforce workspace scope; an archived/reset
+- `parent_refs` must resolve inside the same workspace. Context operations never
+  fall back to the shared fact pool: catalog, reads, lineage, search, chunking,
+  reduction, and expiry checks enforce the explicit workspace; an archived/reset
   workspace is rejected.
 - `ttl_seconds` expires a ref without deleting its audit row. `checksum` can
   be supplied by the caller for integrity verification.
@@ -191,6 +195,18 @@ The default storage cap is 16 MiB per context. Reads default to 4000
 characters and are capped at 16000; override these operational limits with
 `MEMORY_MCP_CONTEXT_MAX_BYTES`, `MEMORY_MCP_CONTEXT_READ_CHARS`, and
 `MEMORY_MCP_CONTEXT_MAX_READ_CHARS`.
+
+### v0.12 — context search, chunking, and deterministic reduction
+
+- `search_context` searches context names, metadata, and payloads inside one
+  explicit workspace but returns metadata only; callers use `read_context` for
+  the bounded payload read.
+- `chunk_context` returns a bounded page of numbered chunks with a
+  `next_chunk` cursor. The response has its own character cap so a large
+  request cannot recreate an unbounded prompt.
+- `reduce_context` joins up to 64 existing refs into a new immutable ref,
+  records all source refs as lineage, and enforces the normal storage cap. It
+  is deterministic concatenation, not semantic model summarization.
 
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
@@ -262,6 +278,10 @@ v0.11 additions (additive — existing stores create these tables on open):
   size (default 16000).
 - `MEMORY_MCP_CONTEXT_MAX_LINEAGE` — maximum parent or child refs returned by
   one metadata/read response (default 100).
+- `MEMORY_MCP_CONTEXT_MAX_CHUNKS` — maximum chunks returned by one
+  `chunk_context` request (default 32).
+- `MEMORY_MCP_CONTEXT_MAX_CHUNK_RESPONSE_CHARS` — aggregate character cap for
+  one `chunk_context` response (default 65536).
 - Journal mode WAL, busy_timeout 5000 (multi-writer: host + containers).
 
 ## Integration
@@ -300,7 +320,7 @@ resolved source/server/target are printed before writing).
 
 ## Agent skill
 
-- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the 44 MCP tools:
+- `skills/memory-mcp/SKILL.md` — agent-facing playbook for the MCP tools:
   when to search facts before researching, how to record decisions with
   rationale for precedent lookup, graph/provenance/conflict usage, semantic
   search, and shared-store conventions. Compatible with the `SKILL.md` format
