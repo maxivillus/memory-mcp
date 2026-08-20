@@ -34,6 +34,8 @@ import math
 import os
 import urllib.request
 
+from http_security import validate_http_url
+
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
@@ -164,6 +166,7 @@ def _dot(a, b):
 # --------------------------------------------------------------------------
 
 def _http_json(url, payload, headers=None):
+    validate_http_url(url, headers)
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST",
                                  headers={"Content-Type": "application/json", **(headers or {})})

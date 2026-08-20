@@ -1492,7 +1492,8 @@ class WorkspaceMgmtTest(unittest.TestCase):
         self.assertTrue(r["backup"].startswith("workspace-eps-"))
         p = os.path.join(self.tmpdir, "backups", r["backup"])
         self.assertTrue(os.path.exists(p))
-        data = json.load(open(p, encoding="utf-8"))
+        with open(p, encoding="utf-8") as fh:
+            data = json.load(fh)
         self.assertEqual(data["counts"]["facts"], 1)
         self.assertEqual(data["counts"]["evidence"], 0)
         self.assertEqual(data["facts"][0]["text"], "back me up")
@@ -2173,3 +2174,146 @@ class CategoryIndexTest(unittest.TestCase):
         self._fact("docker-образ пересобран", category="runtimes", workspace="cat-ws")
         rows = mcp.list_facts({"workspace": "cat-ws"})["facts"]
         self.assertEqual(rows[0]["category"], "runtimes")
+
+
+class AuditRegressionTest(unittest.TestCase):
+    """Regression coverage for the security and correctness audit findings."""
+
+    def setUp(self):
+        self._old_db = mcp.DB_PATH
+        self._old_selected = mcp._SELECTED_DB[0]
+        self.tmpdir = tempfile.mkdtemp(prefix="mcp-audit-")
+        self.db = os.path.join(self.tmpdir, "active.db")
+        os.environ["MEMORY_MCP_DB"] = self.db
+        mcp.DB_PATH = self.db
+        mcp._SELECTED_DB[0] = None
+        self._env = {
+            key: os.environ.get(key)
+            for key in ("MEMORY_MCP_EXTRACT", "MEMORY_MCP_EXTRACT_MIN_CHARS",
+                        "MEMORY_MCP_RECALL", "MEMORY_MCP_ALLOW_INSECURE_HTTP")
+        }
+
+    def tearDown(self):
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        mcp.DB_PATH = self._old_db
+        mcp._SELECTED_DB[0] = self._old_selected
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_decay_review_and_restore_are_workspace_scoped(self):
+        fact = mcp.remember_fact({"text": "beta forgotten isolation marker",
+                                  "source": "test", "workspace": "beta"})
+        con = mcp.get_db()
+        con.execute("UPDATE facts SET lifecycle='forgotten' WHERE id=?", [fact["id"]])
+        con.commit()
+        con.close()
+
+        listed = mcp.list_forgotten({"workspace": "alpha"})
+        self.assertFalse(any(row["id"] == fact["id"] for row in listed["facts"]))
+        self.assertIn("error", mcp.restore_fact({"id": fact["id"], "workspace": "alpha"}))
+        restored = mcp.restore_fact({"id": fact["id"], "workspace": "beta"})
+        self.assertEqual(restored["to"], "active")
+
+    def test_entities_are_unique_per_workspace_and_legacy_tables_migrate(self):
+        first = mcp.remember_entity({"name": "same-service", "workspace": "alpha"})
+        second = mcp.remember_entity({"name": "same-service", "workspace": "beta"})
+        self.assertNotIn("error", first, first)
+        self.assertNotIn("error", second, second)
+        self.assertNotEqual(first["id"], second["id"])
+
+        old_db = os.path.join(self.tmpdir, "legacy.db")
+        import sqlite3
+        con = sqlite3.connect(old_db)
+        con.executescript("""
+        CREATE TABLE entities (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          type TEXT NOT NULL DEFAULT '',
+          aliases TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO entities(name, created_at, updated_at)
+        VALUES ('legacy-service', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        """)
+        con.commit()
+        con.close()
+        mcp.DB_PATH = old_db
+        migrated = mcp.get_db()
+        migrated.execute("UPDATE entities SET workspace_id='legacy' WHERE name='legacy-service'")
+        migrated.commit()
+        migrated.close()
+        alpha = mcp.remember_entity({"name": "legacy-service", "workspace": "alpha"})
+        beta = mcp.remember_entity({"name": "legacy-service", "workspace": "beta"})
+        self.assertNotIn("error", alpha, alpha)
+        self.assertNotIn("error", beta, beta)
+        self.assertNotEqual(alpha["id"], beta["id"])
+
+    def test_recall_metadata_cannot_inject_new_record_lines(self):
+        import recall
+        entry = recall._entry({
+            "id": 1,
+            "text": "fact line\nINJECTED_FACT_LINE",
+            "project": "scope\nINJECTED_SCOPE_LINE",
+            "domain": "type\nINJECTED_TYPE_LINE",
+            "trust": "medium\nINJECTED_TRUST_LINE",
+            "semantic_score": 0.1,
+        })
+        self.assertIn(r"scope\nINJECTED_SCOPE_LINE", entry)
+        self.assertIn(r"type\nINJECTED_TYPE_LINE", entry)
+        self.assertIn(r"trust=medium\nINJECTED_TRUST_LINE", entry)
+        self.assertNotIn("scope\nINJECTED_SCOPE_LINE".replace("\\n", "\n"), entry)
+        self.assertNotIn("fact: fact line\nINJECTED_FACT_LINE", entry)
+
+    def test_ingest_turn_preserves_model_metadata_and_scope(self):
+        from unittest.mock import patch
+        os.environ["MEMORY_MCP_EXTRACT"] = "1"
+        os.environ["MEMORY_MCP_EXTRACT_MIN_CHARS"] = "100"
+        response = {"facts": [{
+            "text": "global extracted metadata marker",
+            "type": "reference",
+            "trust": "high",
+            "strong": True,
+            "scope": "global",
+            "importance": 0.9,
+        }]}
+        with patch("extract.llm.chat_json", return_value=response):
+            result = mcp.ingest_turn({
+                "transcript": "transcript " + "x" * 120,
+                "session_ref": "audit-session",
+                "workspace": "alpha",
+                "project": "audit",
+            })
+        self.assertEqual(result["stored"], 1, result)
+        con = mcp.get_db()
+        row = con.execute(
+            "SELECT domain, trust, strong, importance, workspace_id FROM facts "
+            "WHERE text=?", ["global extracted metadata marker"]).fetchone()
+        con.close()
+        self.assertEqual(row["domain"], "reference")
+        self.assertEqual(row["trust"], "high")
+        self.assertEqual(row["strong"], 1)
+        self.assertEqual(row["importance"], 0.9)
+        self.assertEqual(row["workspace_id"], "")
+
+    def test_credential_bearing_http_requires_explicit_opt_in(self):
+        from http_security import validate_http_url
+        os.environ.pop("MEMORY_MCP_ALLOW_INSECURE_HTTP", None)
+        with self.assertRaises(RuntimeError):
+            validate_http_url("http://provider.invalid/v1",
+                              {"Authorization": "Bearer test-token"})
+        validate_http_url("http://localhost:11434", {})
+        validate_http_url("https://provider.invalid/v1",
+                          {"Authorization": "Bearer test-token"})
+        os.environ["MEMORY_MCP_ALLOW_INSECURE_HTTP"] = "1"
+        validate_http_url("http://provider.invalid/v1",
+                          {"Authorization": "Bearer test-token"})
+
+    def test_malformed_direct_handler_inputs_return_errors(self):
+        self.assertIn("error", mcp.search_facts({"query": "x", "trust_min": "bogus"}))
+        self.assertIn("error", mcp.list_facts({"limit": "not-an-int"}))
+        self.assertIn("error", mcp.search_graph({"entity": "x", "depth": "not-an-int"}))

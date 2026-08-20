@@ -38,7 +38,7 @@ session is visible to every later session.
 - `compose_recall {graph=true}` — entity-graph as a third recall source.
 
 - `remember_fact {text, source?, project?, domain?, category?, trust?, strong?}` —
-  store a durable fact (upsert, dedup by sha256). Use `strong=true` for
+  store a durable fact (upsert, dedup by sha256 within a workspace). Use `strong=true` for
   user-confirmed facts, `trust=high` for verified facts, default `medium`.
   Category is auto-assigned at write time: explicit `category` arg > legacy
   `domain` > keyword rules; unmatched facts stay uncategorized until
@@ -58,6 +58,8 @@ session is visible to every later session.
   paraphrased or cross-language recall when embeddings are enabled.
 - `summarize_index` gives a compact freshest-first index for prompt budgets.
 - `forget_fact` soft-deletes (archives) an obsolete fact.
+- Credential-bearing provider requests use HTTPS by default. Setting
+  `MEMORY_MCP_ALLOW_INSECURE_HTTP=1` is an explicit opt-in for plaintext HTTP.
 
 ## Context artifacts — put_context / list_context / resolve_context / read_context / search_context / chunk_context / reduce_context
 
@@ -166,7 +168,8 @@ session is visible to every later session.
   find_precedents, record_decision, query_decisions, ingest_turn,
   verify_facts, forget_fact, confirm_fact, fact_history,
   get_provenance, fact_references, attach_evidence, detect_conflicts,
-  consolidate, export_facts, export_rdf, stats, list_sessions). Resolve it
+  consolidate, export_facts, export_rdf, stats, list_sessions, list_forgotten,
+  restore_fact, remember_entity, remember_relation, search_graph). Resolve it
   from your task context (the project id of the card/issue you work on).
 - Context operations (`put_context`, `list_context`, `resolve_context`,
   `read_context`, `search_context`, `chunk_context`, `reduce_context`) always

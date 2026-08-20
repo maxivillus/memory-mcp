@@ -18,6 +18,8 @@ import json
 import os
 import urllib.request
 
+from http_security import validate_http_url
+
 DEFAULT_URLS = {"ollama": "http://localhost:11434", "openai": "http://localhost:8000/v1"}
 DEFAULT_MODELS = {"ollama": "qwen2.5:14b", "openai": "gpt-4o-mini", "test": "test-chat-v1"}
 MAX_RETRIES = 3
@@ -48,6 +50,7 @@ def _timeout():
 
 
 def _http_json(url, payload, headers=None):
+    validate_http_url(url, headers)
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST",
                                  headers={"Content-Type": "application/json", **(headers or {})})
