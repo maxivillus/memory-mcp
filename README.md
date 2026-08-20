@@ -25,6 +25,10 @@ pipeline into the server for runtimes that have no client patches.
 - `forget_fact {id | sha256}` — soft delete (archived=1)
 - `stats {}` — totals by trust/domain plus v0.3 counts (entities/relations/decisions/evidence)
 - `export {}` — all facts incl. archived (migration/backup)
+- `put_context {name, content, workspace, schema?, source?, checksum?, ttl_seconds?, parent_refs?}` — store an immutable named context artifact and return its `ctx_...` ref
+- `list_context {workspace, name?, limit?}` — catalog metadata only; payloads are never returned
+- `resolve_context {ref, workspace}` — resolve metadata and parent/child lineage without payload
+- `read_context {ref, workspace, start?, end?, max_chars?}` — read one bounded slice after ACL and TTL checks
 
 ### v0.6 — database & workspace management (2026-08-17)
 
@@ -56,7 +60,7 @@ it create/reset/archive/backup semantics.
 - `create_workspace {workspace}` — register a workspace (idempotent;
   re-registering reactivates an archived/reset workspace)
 - `list_workspaces {status?}` — registry rows with full data counts
-  (active_facts, facts, entities, relations, decisions, evidence)
+  (active_facts, facts, entities, relations, decisions, evidence, contexts)
 - `reset_workspace {workspace, hard?, confirm?}` — soft (default): hide all
   its data (facts get `archived=1`; graph/decisions/evidence become
   unreadable and unwritable), status='reset'; `hard:true` purges facts,
@@ -66,7 +70,7 @@ it create/reset/archive/backup semantics.
   its data, status='archived'; `hard:true` purges facts, evidence, graph and
   decisions permanently (requires `confirm:true`; per-table deleted counts)
 - `backup_workspace {workspace}` — JSON export of ALL workspace data (facts
-  incl. archived, entities, relations, decisions, evidence) with per-table
+  incl. archived, entities, relations, decisions, evidence, contexts) with per-table
   counts to `backups/workspace-<name>-<ts>.json`
 
 ### v0.7 — automatic decay (2026-08-17)
@@ -165,6 +169,29 @@ Environment). Categories are workspace-scoped (`categories` table,
 accepts a `category` filter; `summarize_index` lines include `[category]`
 tags.
 
+### v0.11 — immutable context artifacts
+
+Context artifacts provide a small, auditable handoff surface for runtime
+orchestration. The memory server stores the payload, but callers exchange a
+stable `ctx_...` ref instead of copying an unbounded transcript or injecting
+executable content:
+
+- `put_context` requires an explicit workspace, computes a SHA-256 checksum,
+  and returns metadata plus optional parent lineage. A ref is immutable; a new
+  version is a new ref.
+- `list_context` and `resolve_context` return metadata only. `read_context`
+  is the only payload endpoint and enforces `start`/`end`/`max_chars` bounds.
+- `parent_refs` must resolve inside the same workspace. The catalog, reads,
+  lineage, and expiry checks all enforce workspace scope; an archived/reset
+  workspace is rejected.
+- `ttl_seconds` expires a ref without deleting its audit row. `checksum` can
+  be supplied by the caller for integrity verification.
+
+The default storage cap is 16 MiB per context. Reads default to 4000
+characters and are capped at 16000; override these operational limits with
+`MEMORY_MCP_CONTEXT_MAX_BYTES`, `MEMORY_MCP_CONTEXT_READ_CHARS`, and
+`MEMORY_MCP_CONTEXT_MAX_READ_CHARS`.
+
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
 Covers decision rationale, precedent search and evidence lineage with zero
@@ -213,6 +240,13 @@ to existing DBs):
 - `facts.category_id → categories(id) ON DELETE SET NULL` (fresh/rebuild DDL;
   plain column on migrated stores)
 
+v0.11 additions (additive — existing stores create these tables on open):
+
+- `contexts(ref, name, content, schema_json, source, sha256, workspace_id,
+  created_at, expires_at, size_bytes)`
+- `context_lineage(parent_ref → contexts, child_ref → contexts, relation,
+  workspace_id, created_at)`
+
 ## Environment
 
 - `MEMORY_MCP_DB` — SQLite path. Default is **script-relative**: `<repo>/data/facts.db`
@@ -220,6 +254,14 @@ to existing DBs):
   The deployment stack always sets it explicitly: host wrapper
   (`~/.local/bin/memory-mcp`) → the shared host store,
   docker runtimes → `/opt/memory-shared/facts.db`.
+- `MEMORY_MCP_CONTEXT_MAX_BYTES` — maximum UTF-8 payload size per context
+  (default 16 MiB).
+- `MEMORY_MCP_CONTEXT_READ_CHARS` — default `read_context` slice size
+  (default 4000).
+- `MEMORY_MCP_CONTEXT_MAX_READ_CHARS` — hard maximum `read_context` slice
+  size (default 16000).
+- `MEMORY_MCP_CONTEXT_MAX_LINEAGE` — maximum parent or child refs returned by
+  one metadata/read response (default 100).
 - Journal mode WAL, busy_timeout 5000 (multi-writer: host + containers).
 
 ## Integration
