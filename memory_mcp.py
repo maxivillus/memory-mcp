@@ -16,6 +16,11 @@ Tools:
   forget_fact   {id|sha256}
   stats         {}
   export        {}
+  -- v0.11 immutable context artifacts --
+  put_context {name, content, workspace, schema?, source?, checksum?, ttl_seconds?, parent_refs?}
+  list_context {workspace, name?, limit?}
+  resolve_context {ref, workspace}
+  read_context {ref, workspace, start?, end?, max_chars?}
   -- v0.3 graph/decisions/provenance --
   remember_entity {name, type?, aliases?}
   remember_relation {subject, predicate, object, source_fact_id?}
@@ -30,7 +35,7 @@ Tools:
   detect_conflicts {text}
 """
 import hashlib, json, os, re, sqlite3, sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 def default_db_path():
     """Script-relative default: <repo>/data/facts.db — portable across environments.
@@ -47,6 +52,22 @@ DB_PATH = os.environ.get("MEMORY_MCP_DB") or default_db_path()
 # active store (MEMORY_MCP_DB), which stays protected from delete/archive.
 _SELECTED_DB = [None]
 VALID_TRUST = ("high", "medium", "low")
+
+
+def _env_int(name, default, minimum):
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+# Contexts are deliberately bounded at both storage and read time. The limits
+# are operational guardrails, not a substitute for the caller's workspace ACL.
+_CONTEXT_MAX_BYTES = _env_int("MEMORY_MCP_CONTEXT_MAX_BYTES", 16 * 1024 * 1024, 1)
+_CONTEXT_DEFAULT_READ_CHARS = _env_int("MEMORY_MCP_CONTEXT_READ_CHARS", 4000, 1)
+_CONTEXT_MAX_READ_CHARS = _env_int("MEMORY_MCP_CONTEXT_MAX_READ_CHARS", 16000, 1)
+_CONTEXT_MAX_LINEAGE = _env_int("MEMORY_MCP_CONTEXT_MAX_LINEAGE", 100, 1)
 # v0.5 rebuild DDL: same facts shape without the global UNIQUE(sha256).
 _FACTS_TABLE_DDL = """
 CREATE TABLE facts_new (
@@ -207,6 +228,35 @@ CREATE TABLE IF NOT EXISTS evidence (
   created_at TEXT NOT NULL,
   UNIQUE(fact_id, source_ref)
 );
+
+-- v0.11: immutable named working contexts. Full content is kept behind a
+-- bounded read API; catalog/resolve responses contain metadata only.
+CREATE TABLE IF NOT EXISTS contexts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ref TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  content TEXT NOT NULL,
+  schema_json TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  sha256 TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL DEFAULT '',
+  size_bytes INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS context_lineage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_ref TEXT NOT NULL REFERENCES contexts(ref) ON DELETE CASCADE,
+  child_ref TEXT NOT NULL REFERENCES contexts(ref) ON DELETE CASCADE,
+  relation TEXT NOT NULL DEFAULT 'derived',
+  workspace_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(parent_ref, child_ref, relation)
+);
+CREATE INDEX IF NOT EXISTS contexts_workspace_idx ON contexts(workspace_id);
+CREATE INDEX IF NOT EXISTS contexts_name_idx ON contexts(name, workspace_id);
+CREATE INDEX IF NOT EXISTS context_lineage_parent_idx ON context_lineage(parent_ref);
+CREATE INDEX IF NOT EXISTS context_lineage_child_idx ON context_lineage(child_ref);
 CREATE INDEX IF NOT EXISTS relations_subject_idx ON relations(subject_id);
 CREATE INDEX IF NOT EXISTS relations_object_idx ON relations(object_id);
 CREATE INDEX IF NOT EXISTS evidence_fact_idx ON evidence(fact_id);
@@ -575,6 +625,284 @@ def _validate_name(name, kind):
     if ".." in name or not _NAME_RE.match(name):
         return None, f"invalid {kind} name {name!r}: use 1-64 chars of [A-Za-z0-9._-], no '..'"
     return name, ""
+
+
+def _context_scope(args):
+    """Require an explicit workspace for context data-plane operations."""
+    workspace = _workspace(args)
+    if not workspace:
+        return None, {"error": "workspace is required for context operations"}
+    workspace, err = _validate_name(workspace, "workspace")
+    if err:
+        return None, {"error": err}
+    return workspace, None
+
+
+def _context_json(value):
+    """Keep schema metadata stable without accepting arbitrary DB values."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _context_metadata(row):
+    return {
+        "ref": row["ref"],
+        "name": row["name"],
+        "schema": row["schema_json"],
+        "source": row["source"],
+        "sha256": row["sha256"],
+        "workspace": row["workspace_id"],
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"],
+        "size_bytes": row["size_bytes"],
+    }
+
+
+def _context_lineage(con, ref, workspace):
+    parents = [dict(r) for r in con.execute(
+        "SELECT l.relation, p.ref, p.name FROM context_lineage l "
+        "JOIN contexts p ON p.ref=l.parent_ref "
+        "WHERE l.child_ref=? AND l.workspace_id=?" +
+        _ws_check("p", workspace) + " ORDER BY l.id LIMIT ?",
+        [ref, workspace, workspace, _CONTEXT_MAX_LINEAGE]).fetchall()]
+    children = [dict(r) for r in con.execute(
+        "SELECT l.relation, c.ref, c.name FROM context_lineage l "
+        "JOIN contexts c ON c.ref=l.child_ref "
+        "WHERE l.parent_ref=? AND l.workspace_id=?" +
+        _ws_check("c", workspace) + " ORDER BY l.id LIMIT ?",
+        [ref, workspace, workspace, _CONTEXT_MAX_LINEAGE]).fetchall()]
+    return {"parents": parents, "children": children}
+
+
+def _context_row(con, ref, workspace):
+    row = con.execute(
+        "SELECT ref, name, content, schema_json, source, sha256, workspace_id, "
+        "created_at, expires_at, size_bytes FROM contexts WHERE ref=?" +
+        _ws_check("contexts", workspace),
+        [ref, workspace]).fetchone()
+    if not row:
+        return None, None
+    if row["expires_at"] and row["expires_at"] <= now():
+        return row, {"error": "context has expired", "ref": ref}
+    return row, None
+
+
+def _context_limit(value, name, default, maximum):
+    if value is None:
+        return default, None
+    if isinstance(value, bool):
+        return None, {"error": f"{name} must be an integer"}
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None, {"error": f"{name} must be an integer"}
+    if parsed < 1 or parsed > maximum:
+        return None, {"error": f"{name} must be between 1 and {maximum}"}
+    return parsed, None
+
+
+def put_context(args):
+    """Store an immutable, named context artifact and optional parent refs."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    name = (args.get("name") or "").strip()
+    content = args.get("content")
+    if not name:
+        return {"error": "name is required"}
+    if len(name) > 128:
+        return {"error": "name must be at most 128 characters"}
+    if not isinstance(content, str) or not content:
+        return {"error": "content is required and must be a non-empty string"}
+    size_bytes = len(content.encode("utf-8"))
+    if size_bytes > _CONTEXT_MAX_BYTES:
+        return {"error": "content exceeds the context storage limit"}
+    checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    supplied_checksum = (args.get("checksum") or "").strip().lower()
+    if supplied_checksum and supplied_checksum != checksum:
+        return {"error": "checksum does not match content", "sha256": checksum}
+    parent_refs = args.get("parent_refs", [])
+    if parent_refs is None:
+        parent_refs = []
+    if not isinstance(parent_refs, list) or any(not isinstance(ref, str) or not ref.strip()
+                                                for ref in parent_refs):
+        return {"error": "parent_refs must be an array of non-empty refs"}
+    parent_refs = list(dict.fromkeys(ref.strip() for ref in parent_refs))
+    if len(parent_refs) > 64:
+        return {"error": "parent_refs may contain at most 64 refs"}
+    ttl = args.get("ttl_seconds")
+    expires_at = ""
+    if ttl is not None:
+        if isinstance(ttl, bool):
+            return {"error": "ttl_seconds must be a non-negative integer"}
+        try:
+            ttl = int(ttl)
+        except (TypeError, ValueError):
+            return {"error": "ttl_seconds must be a non-negative integer"}
+        if ttl < 0:
+            return {"error": "ttl_seconds must be a non-negative integer"}
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    created_at = now()
+    ref_seed = (name + "\0" + created_at + "\0" + os.urandom(16).hex()).encode("utf-8")
+    ref = "ctx_" + hashlib.sha256(ref_seed).hexdigest()
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        for parent_ref in parent_refs:
+            parent = con.execute(
+                "SELECT ref FROM contexts WHERE ref=?" + _ws_check("contexts", workspace),
+                [parent_ref, workspace]).fetchone()
+            if not parent:
+                return {"error": "parent context not found or not in your workspace",
+                        "parent_ref": parent_ref}
+        con.execute(
+            "INSERT INTO contexts (ref, name, content, schema_json, source, sha256, "
+            "workspace_id, created_at, expires_at, size_bytes) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (ref, name, content, _context_json(args.get("schema")),
+             (args.get("source") or "").strip(), checksum, workspace, created_at,
+             expires_at, size_bytes))
+        for parent_ref in parent_refs:
+            con.execute(
+                "INSERT INTO context_lineage (parent_ref, child_ref, relation, "
+                "workspace_id, created_at) VALUES (?,?,?,?,?)",
+                (parent_ref, ref, "derived", workspace, created_at))
+        con.commit()
+        row = con.execute(
+            "SELECT ref, name, content, schema_json, source, sha256, workspace_id, "
+            "created_at, expires_at, size_bytes FROM contexts WHERE ref=?", [ref]).fetchone()
+        return {"context": _context_metadata(row),
+                "lineage": _context_lineage(con, ref, workspace)}
+    except sqlite3.DatabaseError as e:
+        con.rollback()
+        return {"error": f"context write failed: {e}"}
+    finally:
+        con.close()
+
+
+def list_context(args):
+    """List context metadata only; content is never returned by the catalog."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    limit, err = _context_limit(args.get("limit"), "limit", 50, 100)
+    if err:
+        return err
+    name = (args.get("name") or "").strip()
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        query = (
+            "SELECT ref, name, content, schema_json, source, sha256, workspace_id, "
+            "created_at, expires_at, size_bytes FROM contexts "
+            "WHERE (expires_at='' OR expires_at>?)")
+        params = [now()]
+        if name:
+            query += " AND name=?"
+            params.append(name)
+        query += _ws_filter("contexts", workspace) + " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.extend([workspace, limit])
+        rows = con.execute(query, params).fetchall()
+        return {"count": len(rows), "contexts": [_context_metadata(row) for row in rows]}
+    finally:
+        con.close()
+
+
+def resolve_context(args):
+    """Resolve one ref to catalog metadata and bounded lineage, never content."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    ref = (args.get("ref") or "").strip()
+    if not ref:
+        return {"error": "ref is required"}
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        row, row_err = _context_row(con, ref, workspace)
+        if row_err:
+            return row_err
+        if not row:
+            return {"error": "context not found or not in your workspace", "ref": ref}
+        return {"context": _context_metadata(row),
+                "lineage": _context_lineage(con, ref, workspace)}
+    finally:
+        con.close()
+
+
+def read_context(args):
+    """Read one bounded character slice from a context ref."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    ref = (args.get("ref") or "").strip()
+    if not ref:
+        return {"error": "ref is required"}
+    start = args.get("start", 0)
+    if isinstance(start, bool):
+        return {"error": "start must be a non-negative integer"}
+    try:
+        start = int(start)
+    except (TypeError, ValueError):
+        return {"error": "start must be a non-negative integer"}
+    if start < 0:
+        return {"error": "start must be a non-negative integer"}
+    max_chars, err = _context_limit(args.get("max_chars"), "max_chars",
+                                     _CONTEXT_DEFAULT_READ_CHARS,
+                                     _CONTEXT_MAX_READ_CHARS)
+    if err:
+        return err
+    end = args.get("end")
+    if end is not None:
+        if isinstance(end, bool):
+            return {"error": "end must be a non-negative integer"}
+        try:
+            end = int(end)
+        except (TypeError, ValueError):
+            return {"error": "end must be a non-negative integer"}
+        if end < 0 or end < start:
+            return {"error": "end must be greater than or equal to start"}
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        row, row_err = _context_row(con, ref, workspace)
+        if row_err:
+            return row_err
+        if not row:
+            return {"error": "context not found or not in your workspace", "ref": ref}
+        total_chars = len(row["content"])
+        bounded_start = min(start, total_chars)
+        requested_end = total_chars if end is None else min(end, total_chars)
+        slice_end = min(requested_end, bounded_start + max_chars)
+        content = row["content"][bounded_start:slice_end]
+        context = _context_metadata(row)
+        context.update({
+            "content": content,
+            "start": bounded_start,
+            "end": slice_end,
+            "total_chars": total_chars,
+            "truncated": slice_end < total_chars,
+            "next_start": slice_end if slice_end < total_chars else None,
+        })
+        return {"context": context,
+                "lineage": _context_lineage(con, ref, workspace)}
+    finally:
+        con.close()
 
 
 def _db_dir():
@@ -2195,7 +2523,8 @@ def list_workspaces(args):
              "(SELECT COUNT(*) FROM entities e WHERE e.workspace_id=w.id) AS entities, "
              "(SELECT COUNT(*) FROM relations r WHERE r.workspace_id=w.id) AS relations, "
              "(SELECT COUNT(*) FROM decisions d WHERE d.workspace_id=w.id) AS decisions, "
-             "(SELECT COUNT(*) FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE f.workspace_id=w.id) AS evidence "
+             "(SELECT COUNT(*) FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE f.workspace_id=w.id) AS evidence, "
+             "(SELECT COUNT(*) FROM contexts c WHERE c.workspace_id=w.id) AS contexts "
              "FROM workspaces w")
         params = []
         if status:
@@ -2233,6 +2562,10 @@ def _purge_workspace_rows(con, name):
     counts["facts"] = cur.rowcount
     cur = con.execute("DELETE FROM categories WHERE workspace_id=?", [name])
     counts["categories"] = cur.rowcount
+    cur = con.execute("DELETE FROM context_lineage WHERE workspace_id=?", [name])
+    counts["context_lineage"] = cur.rowcount
+    cur = con.execute("DELETE FROM contexts WHERE workspace_id=?", [name])
+    counts["contexts"] = cur.rowcount
     return counts
 
 
@@ -2330,10 +2663,17 @@ def backup_workspace(args):
         evidence = [dict(r) for r in con.execute(
             "SELECT e.id, e.fact_id, e.source_ref, e.source_checksum, e.fetched_at, e.created_at "
             "FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE f.workspace_id=? ORDER BY e.id", [name])]
+        contexts = [dict(r) for r in con.execute(
+            "SELECT ref, name, content, schema_json, source, sha256, workspace_id, "
+            "created_at, expires_at, size_bytes FROM contexts WHERE workspace_id=? ORDER BY id", [name])]
+        context_lineage = [dict(r) for r in con.execute(
+            "SELECT parent_ref, child_ref, relation, workspace_id, created_at "
+            "FROM context_lineage WHERE workspace_id=? ORDER BY id", [name])]
     finally:
         con.close()
     counts = {"facts": len(facts), "entities": len(entities), "relations": len(relations),
-              "decisions": len(decisions), "evidence": len(evidence)}
+              "decisions": len(decisions), "evidence": len(evidence),
+              "contexts": len(contexts), "context_lineage": len(context_lineage)}
     if sum(counts.values()) == 0:
         return {"error": f"workspace {name} has no data"}
     dest = os.path.join(_backup_dir(), f"workspace-{name}-{_ts_stamp()}.json")
@@ -2341,7 +2681,8 @@ def backup_workspace(args):
         with open(dest, "w", encoding="utf-8") as f:
             json.dump({"workspace": name, "exported_at": now(), "counts": counts,
                        "facts": facts, "entities": entities, "relations": relations,
-                       "decisions": decisions, "evidence": evidence},
+                       "decisions": decisions, "evidence": evidence,
+                       "contexts": contexts, "context_lineage": context_lineage},
                       f, ensure_ascii=False, indent=2)
     except OSError as e:
         # No host paths in client-visible errors (repo rule).
@@ -2370,6 +2711,60 @@ TOOLS = {
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["text"],
+        },
+    },
+    "put_context": {
+        "description": "Store an immutable named context artifact. Returns a ref, checksum, metadata, and lineage; reads require an explicit workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "content": {"type": "string", "description": "Context payload; bounded by MEMORY_MCP_CONTEXT_MAX_BYTES"},
+                "schema": {"description": "Optional schema metadata (string or JSON value)"},
+                "source": {"type": "string", "description": "Origin: issue/run/artifact ref"},
+                "checksum": {"type": "string", "description": "Optional SHA-256 checksum to verify against content"},
+                "ttl_seconds": {"type": "integer", "minimum": 0},
+                "parent_refs": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
+                "workspace": {"type": "string", "description": "Required project/run access scope"},
+            },
+            "required": ["name", "content", "workspace"],
+        },
+    },
+    "list_context": {
+        "description": "List context metadata only. Payloads are never returned by the catalog; expired and out-of-scope refs are hidden.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 100},
+                "workspace": {"type": "string", "description": "Required project/run access scope"},
+            },
+            "required": ["workspace"],
+        },
+    },
+    "resolve_context": {
+        "description": "Resolve one context ref to metadata and bounded lineage without returning its payload.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string"},
+                "workspace": {"type": "string", "description": "Required project/run access scope"},
+            },
+            "required": ["ref", "workspace"],
+        },
+    },
+    "read_context": {
+        "description": "Read a bounded character slice from one context ref. max_chars is capped by the server.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string"},
+                "start": {"type": "integer", "minimum": 0, "default": 0},
+                "end": {"type": "integer", "minimum": 0},
+                "max_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "default": 4000},
+                "workspace": {"type": "string", "description": "Required project/run access scope"},
+            },
+            "required": ["ref", "workspace"],
         },
     },
     "search_facts": {
@@ -2854,6 +3249,10 @@ TOOLS = {
 HANDLERS = {
     "add_fact": remember_fact,
     "remember_fact": remember_fact,
+    "put_context": put_context,
+    "list_context": list_context,
+    "resolve_context": resolve_context,
+    "read_context": read_context,
     "search_facts": search_facts,
     "search_semantic": search_semantic,
     "embed_backfill": embed_backfill,

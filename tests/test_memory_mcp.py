@@ -169,6 +169,103 @@ class MemoryMCPTest(unittest.TestCase):
         self.assertTrue(any("iota queue" in f["text"] for f in exp["facts"]))
 
 
+class ContextArtifactTest(unittest.TestCase):
+    """v0.11: immutable context refs, bounded reads, lineage, and ACLs."""
+
+    def put(self, name, content, workspace="ctx-test", **kwargs):
+        args = {"name": name, "content": content, "workspace": workspace}
+        args.update(kwargs)
+        result = mcp.put_context(args)
+        self.assertNotIn("error", result, result)
+        return result
+
+    def test_catalog_resolve_and_bounded_read(self):
+        payload = "0123456789abcdefghijklmnopqrstuvwxyz"
+        result = self.put("source-slice", payload, schema={"kind": "text"},
+                          source="issue/4182")
+        ref = result["context"]["ref"]
+        self.assertTrue(ref.startswith("ctx_"))
+        self.assertEqual(result["context"]["size_bytes"], len(payload.encode("utf-8")))
+
+        catalog = mcp.list_context({"workspace": "ctx-test", "name": "source-slice"})
+        self.assertNotIn("error", catalog, catalog)
+        self.assertEqual(catalog["count"], 1)
+        self.assertNotIn("content", catalog["contexts"][0])
+
+        resolved = mcp.resolve_context({"ref": ref, "workspace": "ctx-test"})
+        self.assertNotIn("error", resolved, resolved)
+        self.assertNotIn("content", resolved["context"])
+        self.assertEqual(resolved["context"]["sha256"],
+                         __import__("hashlib").sha256(payload.encode()).hexdigest())
+
+        first = mcp.read_context({"ref": ref, "workspace": "ctx-test", "max_chars": 7})
+        self.assertNotIn("error", first, first)
+        self.assertEqual(first["context"]["content"], payload[:7])
+        self.assertTrue(first["context"]["truncated"])
+        self.assertEqual(first["context"]["next_start"], 7)
+        second = mcp.read_context({"ref": ref, "workspace": "ctx-test",
+                                   "start": first["context"]["next_start"],
+                                   "max_chars": 7})
+        self.assertEqual(second["context"]["content"], payload[7:14])
+
+    def test_lineage_and_workspace_boundary(self):
+        parent = self.put("lineage-parent", "parent payload", workspace="ctx-lineage")
+        child = self.put("lineage-child", "child payload", workspace="ctx-lineage",
+                         parent_refs=[parent["context"]["ref"]])
+        parent_ref = parent["context"]["ref"]
+        child_ref = child["context"]["ref"]
+        self.assertEqual(child["lineage"]["parents"][0]["ref"], parent_ref)
+
+        resolved_parent = mcp.resolve_context({"ref": parent_ref, "workspace": "ctx-lineage"})
+        self.assertEqual(resolved_parent["lineage"]["children"][0]["ref"], child_ref)
+        self.assertIn("error", mcp.resolve_context({"ref": parent_ref,
+                                                      "workspace": "ctx-other"}))
+        self.assertIn("error", mcp.read_context({"ref": child_ref,
+                                                   "workspace": "ctx-other"}))
+        self.assertEqual(mcp.list_context({"workspace": "ctx-other"})["count"], 0)
+        cross_workspace = mcp.put_context({"name": "cross-workspace", "content": "x",
+                                           "workspace": "ctx-other",
+                                           "parent_refs": [parent_ref]})
+        self.assertIn("error", cross_workspace)
+
+    def test_checksum_expiry_and_required_scope(self):
+        missing_scope = mcp.put_context({"name": "no-scope", "content": "x"})
+        self.assertIn("error", missing_scope)
+        mismatch = mcp.put_context({"name": "bad-checksum", "content": "x",
+                                     "workspace": "ctx-validation", "checksum": "0" * 64})
+        self.assertIn("error", mismatch)
+
+        live_a = self.put("immutable", "first", workspace="ctx-validation")
+        live_b = self.put("immutable", "second", workspace="ctx-validation")
+        self.assertNotEqual(live_a["context"]["ref"], live_b["context"]["ref"])
+        listed = mcp.list_context({"workspace": "ctx-validation", "name": "immutable"})
+        self.assertEqual(listed["count"], 2)
+
+        expired = self.put("expires-now", "temporary", workspace="ctx-validation",
+                           ttl_seconds=0)
+        expired_ref = expired["context"]["ref"]
+        self.assertIn("error", mcp.resolve_context({"ref": expired_ref,
+                                                      "workspace": "ctx-validation"}))
+        self.assertEqual(mcp.list_context({"workspace": "ctx-validation",
+                                            "name": "expires-now"})["count"], 0)
+
+    def test_backup_and_hard_reset_include_context_rows(self):
+        parent = self.put("backup-parent", "parent", workspace="ctx-cleanup")
+        self.put("backup-child", "child", workspace="ctx-cleanup",
+                 parent_refs=[parent["context"]["ref"]])
+        backup = mcp.backup_workspace({"workspace": "ctx-cleanup"})
+        self.assertNotIn("error", backup, backup)
+        self.assertEqual(backup["counts"]["contexts"], 2)
+        self.assertEqual(backup["counts"]["context_lineage"], 1)
+
+        reset = mcp.reset_workspace({"workspace": "ctx-cleanup", "hard": True,
+                                     "confirm": True})
+        self.assertNotIn("error", reset, reset)
+        self.assertEqual(reset["deleted"]["contexts"], 2)
+        self.assertEqual(reset["deleted"]["context_lineage"], 1)
+        self.assertEqual(mcp.list_context({"workspace": "ctx-cleanup"})["count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -1608,7 +1705,8 @@ class DatabaseIsolationTest(unittest.TestCase):
         bk = mcp.backup_workspace({"workspace": "iso-bk"})
         self.assertNotIn("error", bk, bk)
         self.assertEqual(bk["counts"], {"facts": 1, "entities": 1, "relations": 0,
-                                        "decisions": 1, "evidence": 1})
+                                        "decisions": 1, "evidence": 1,
+                                        "contexts": 0, "context_lineage": 0})
         # the JSON on disk carries the same counts + rows
         import json as _json
         with open(os.path.join(os.path.dirname(mcp.DB_PATH), "backups",
@@ -1785,5 +1883,3 @@ class CategoryIndexTest(unittest.TestCase):
         self._fact("docker-образ пересобран", category="runtimes", workspace="cat-ws")
         rows = mcp.list_facts({"workspace": "cat-ws"})["facts"]
         self.assertEqual(rows[0]["category"], "runtimes")
-
-
