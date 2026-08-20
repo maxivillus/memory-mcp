@@ -1227,7 +1227,9 @@ class DatabaseIsolationTest(unittest.TestCase):
         bk = mcp.backup_workspace({"workspace": "iso-bk"})
         self.assertNotIn("error", bk, bk)
         self.assertEqual(bk["counts"], {"facts": 1, "entities": 1, "relations": 0,
-                                        "decisions": 1, "evidence": 1})
+                                        "decisions": 1, "evidence": 1,
+                                        "contexts": 0, "context_lineage": 0,
+                                        "lifecycle_events": 0, "handoffs": 0})
         # the JSON on disk carries the same counts + rows
         import json as _json
         with open(os.path.join(os.path.dirname(mcp.DB_PATH), "backups",
@@ -1404,5 +1406,4 @@ class CategoryIndexTest(unittest.TestCase):
         self._fact("docker-образ пересобран", category="runtimes", workspace="cat-ws")
         rows = mcp.list_facts({"workspace": "cat-ws"})["facts"]
         self.assertEqual(rows[0]["category"], "runtimes")
-
 

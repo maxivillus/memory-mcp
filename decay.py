@@ -87,15 +87,24 @@ def decay_sweep(args):
 
 def list_forgotten(args):
     """Direct review of forgotten/inactive facts (the only way to see them)."""
-    from memory_mcp import get_db
-    limit = max(1, min(int(args.get("limit", 50)), 200))
+    from memory_mcp import _bounded_int_arg, _workspace, _ws_inactive_error, get_db
+    limit, err = _bounded_int_arg(args, "limit", 50, 1, 200)
+    if err:
+        return err
+    workspace = _workspace(args)
     con = get_db()
     try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        ws_clause = " AND workspace_id IN (?, '')" if workspace else " AND workspace_id = ''"
+        params = [workspace] if workspace else []
+        params.append(limit)
         rows = [dict(r) for r in con.execute(
             "SELECT id, text, source, project, domain, trust, importance, "
             "created_at, last_accessed_at, lifecycle "
             "FROM facts WHERE archived=0 AND invalid_at='' AND lifecycle='forgotten' "
-            "ORDER BY importance DESC, updated_at DESC LIMIT ?", [limit])]
+            + ws_clause + " ORDER BY importance DESC, updated_at DESC LIMIT ?", params)]
         return {"count": len(rows), "facts": rows}
     finally:
         con.close()
@@ -103,20 +112,28 @@ def list_forgotten(args):
 
 def restore_fact(args):
     """Manually bring a forgotten/degraded fact back to active."""
-    from memory_mcp import get_db, now
+    from memory_mcp import _workspace, _ws_inactive_error, get_db, now
     fid = args.get("id")
     if fid is None:
         return {"error": "id is required"}
+    workspace = _workspace(args)
     con = get_db()
     try:
-        row = con.execute("SELECT id, lifecycle, archived FROM facts WHERE id=?", [fid]).fetchone()
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        ws_clause = " AND facts.workspace_id IN (?, '')" if workspace else " AND facts.workspace_id = ''"
+        params = [fid] + ([workspace] if workspace else [])
+        row = con.execute("SELECT id, lifecycle, archived FROM facts WHERE id=?" + ws_clause,
+                          params).fetchone()
         if row is None:
-            return {"error": "fact not found", "id": fid}
+            return {"error": "fact not found or not in your workspace", "id": fid}
         if row["archived"]:
             return {"error": "fact is archived (soft-deleted); re-remember it instead", "id": fid}
         ts = now()
         con.execute("UPDATE facts SET lifecycle='active', revival_count=0, "
-                    "last_accessed_at=?, updated_at=? WHERE id=?", (ts, ts, fid))
+                    "last_accessed_at=?, updated_at=? WHERE id=?" + ws_clause,
+                    (ts, ts, fid) + tuple([workspace] if workspace else []))
         con.commit()
         return {"restored": fid, "from": row["lifecycle"], "to": "active"}
     finally:

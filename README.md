@@ -96,8 +96,9 @@ Facts age only on **active days** — days with at least one memory-mcp call
   entity-graph/session chains; revived after `DECAY_REVIVE_HITS` (default 3)
   matching searches.
 - `forgotten` (score ≤ 0.1): excluded everywhere — plain search, semantic
-  search and graph/session chains; visible only via `list_forgotten {limit?}`
-  and `restore_fact {id}` (manual return to active).
+  search and graph/session chains; visible only via
+  `list_forgotten {limit?, workspace?}` and `restore_fact {id, workspace?}`
+  (manual return to active).
 - `decay_sweep {}` — full lifecycle recompute + report; run manually or via
   cron (the stdio server does not live between sessions). `strong` and
   `confirmed` facts never decay.
@@ -274,14 +275,17 @@ new dependencies — just SQLite + FTS5.
 
 ## Schema
 
-`facts(id, sha256 UNIQUE, text, source, project, domain,
-trust CHECK IN ('high','medium','low'), strong, created_at, updated_at, archived)`
+`facts(id, sha256, text, source, project, domain,
+trust CHECK IN ('high','medium','low'), strong, importance, invalid_at,
+superseded_by, confirmed, workspace_id, created_at, updated_at, archived,
+last_accessed_at, access_count, revival_count, lifecycle, category_id)`
 + `facts_fts` FTS5 virtual table with insert/delete/update triggers.
 
 v0.3 additions (all additive — `CREATE TABLE IF NOT EXISTS`, existing DBs
 migrate in place):
 
-- `entities(id, name UNIQUE, type, aliases, created_at, updated_at)`
+- `entities(id, name, type, aliases, workspace_id, created_at, updated_at,
+  UNIQUE(name, workspace_id))`
 - `relations(id, subject_id → entities, predicate, object_id → entities,
   source_fact_id?, created_at, UNIQUE(subject_id, predicate, object_id))`
 - `decisions(id, category, subject, scenario, reasoning, outcome, confidence,
@@ -342,6 +346,11 @@ v0.13 additions (additive — existing stores create these tables on open):
 - `MEMORY_MCP_HANDOFF_DEFAULT_TTL` / `_MAX_TTL` — handoff TTL defaults and
   hard maximum in seconds (defaults 86400 / 604800).
 - `MEMORY_MCP_HANDOFF_MAX_CONTENT_BYTES` — handoff payload cap (default 262144).
+- `MEMORY_MCP_LLM_KEY` / `MEMORY_MCP_EMBED_KEY` — bearer tokens for
+  OpenAI-compatible providers. Credential-bearing plaintext HTTP is rejected
+  unless `MEMORY_MCP_ALLOW_INSECURE_HTTP=1` is explicitly set.
+- `MEMORY_MCP_ALLOW_INSECURE_HTTP` — explicit opt-in for plaintext HTTP when a
+  provider requires a bearer token; prefer HTTPS.
 - Journal mode WAL, busy_timeout 5000 (multi-writer: host + containers).
 
 ## Integration

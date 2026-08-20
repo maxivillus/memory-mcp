@@ -30,3 +30,4 @@ jobs:
         run: |
           mkdir -p "$MEMORY_MIGRATE_SRC"
           python -m unittest discover -s tests -v
+          python -m unittest -q test_memory_mcp

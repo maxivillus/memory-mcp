@@ -49,7 +49,10 @@ def compose_recall(args):
     turn_text = (args.get("turn_text") or "").strip()
     if not turn_text:
         return {"error": "turn_text is required"}
-    limit = max(1, min(int(args.get("limit", 8)), 20))
+    from memory_mcp import _bounded_int_arg
+    limit, err = _bounded_int_arg(args, "limit", 8, 1, 20)
+    if err:
+        return err
     budget = _budget(args.get("chars"))
 
     from memory_mcp import fts_terms, search_facts
@@ -102,7 +105,9 @@ def compose_recall(args):
     # Session expansion: sibling facts from the same session as the top hits
     # (letta/engram-style linking), appended as background context.
     session_expanded = []
-    expand = max(0, min(int(args.get("session_expand", 0)), 10))
+    expand, err = _bounded_int_arg(args, "session_expand", 0, 0, 10)
+    if err:
+        return err
     if expand and hits:
         session_expanded = _session_hits(hits, expand, ws)
 
@@ -140,14 +145,21 @@ def compose_recall(args):
 
 
 def _entry(f):
-    text = html.escape(_LOCAL_HOME.sub("<local-home>", (f.get("text") or "")))
-    title = html.escape(text.split("\n")[0][:80])
-    trust = f.get("trust") or "medium"
-    scope = f.get("project") or "project"
-    ftype = f.get("domain") or "project"
+    raw_text = _LOCAL_HOME.sub("<local-home>", str(f.get("text") or ""))
+    text = html.escape(raw_text).replace("\r", "\\r").replace("\n", "\\n")
+    title = html.escape(raw_text.splitlines()[0][:80] if raw_text else "")
+    trust = _safe_metadata(f.get("trust"), "medium")
+    scope = _safe_metadata(f.get("project"), "project")
+    ftype = _safe_metadata(f.get("domain"), "project")
     return ("- id=%s scope=%s type=%s trust=%s score=%.3f\n  title: %s\n  fact: %s\n"
             % (html.escape(str(f.get("id"))), scope, ftype, trust,
                f.get("semantic_score", 0.0), title[:120], text[:520]))
+
+
+def _safe_metadata(value, default):
+    """Keep metadata single-line and inert inside the injected recall block."""
+    value = str(value or default).replace("\r", "\\r").replace("\n", "\\n")
+    return html.escape(value[:120], quote=True)
 
 
 def _clip(entry, max_chars):
