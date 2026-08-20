@@ -249,6 +249,98 @@ class ContextArtifactTest(unittest.TestCase):
         self.assertEqual(mcp.list_context({"workspace": "ctx-validation",
                                             "name": "expires-now"})["count"], 0)
 
+    def test_context_search_returns_metadata_and_respects_workspace(self):
+        source_ref = self.put("search-source", "needle in the payload",
+                              workspace="ctx-search", source="search-test")
+        self.put("search-other", "needle in another workspace",
+                 workspace="ctx-search-other")
+
+        found = mcp.search_context({"query": "needle", "workspace": "ctx-search"})
+        self.assertNotIn("error", found, found)
+        self.assertEqual(found["count"], 1)
+        self.assertEqual(found["contexts"][0]["ref"], source_ref["context"]["ref"])
+        self.assertNotIn("content", found["contexts"][0])
+
+        other = mcp.search_context({"query": "needle", "workspace": "ctx-search-other"})
+        self.assertEqual(other["count"], 1)
+        self.assertNotEqual(other["contexts"][0]["ref"], source_ref["context"]["ref"])
+
+    def test_context_chunks_are_bounded_and_paginated(self):
+        payload = "abcdefghij" * 3
+        result = self.put("chunk-source", payload, workspace="ctx-chunk")
+        ref = result["context"]["ref"]
+
+        first = mcp.chunk_context({"ref": ref, "workspace": "ctx-chunk",
+                                   "chunk_chars": 5, "max_chunks": 2})
+        self.assertNotIn("error", first, first)
+        self.assertEqual([chunk["content"] for chunk in first["chunks"]],
+                         ["abcde", "fghij"])
+        self.assertEqual(first["next_chunk"], 2)
+        self.assertEqual(first["total_chunks"], 6)
+
+        rest = mcp.chunk_context({"ref": ref, "workspace": "ctx-chunk",
+                                  "chunk_chars": 5,
+                                  "start_chunk": first["next_chunk"],
+                                  "max_chunks": 32})
+        self.assertIsNone(rest["next_chunk"])
+        chunks = first["chunks"] + rest["chunks"]
+        self.assertEqual("".join(chunk["content"] for chunk in chunks), payload)
+        self.assertEqual([chunk["index"] for chunk in chunks], list(range(6)))
+
+    def test_reduce_context_is_deterministic_and_records_lineage(self):
+        first = self.put("reduce-first", "alpha", workspace="ctx-reduce")
+        second = self.put("reduce-second", "beta", workspace="ctx-reduce")
+        refs = [first["context"]["ref"], second["context"]["ref"]]
+
+        reduced = mcp.reduce_context({"name": "reduce-result", "refs": refs,
+                                      "workspace": "ctx-reduce", "separator": "|",
+                                      "source": "reduce-test"})
+        self.assertNotIn("error", reduced, reduced)
+        self.assertEqual(reduced["reduction"], "deterministic-concat")
+        self.assertEqual(reduced["reduced_from"], refs)
+        self.assertEqual({parent["ref"] for parent in reduced["lineage"]["parents"]},
+                         set(refs))
+
+        read = mcp.read_context({"ref": reduced["context"]["ref"],
+                                 "workspace": "ctx-reduce", "max_chars": 100})
+        self.assertEqual(read["context"]["content"], "alpha|beta")
+        cross_workspace = mcp.reduce_context({"name": "cross-reduce", "refs": refs[:1],
+                                              "workspace": "ctx-other"})
+        self.assertIn("error", cross_workspace)
+
+    def test_context_operations_do_not_fall_back_to_shared_pool(self):
+        content = "shared context must stay hidden"
+        con = mcp.get_db()
+        try:
+            con.execute(
+                "INSERT INTO contexts (ref, name, content, schema_json, source, sha256, "
+                "workspace_id, created_at, expires_at, size_bytes) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("ctx_shared_only", "shared-only", content, "", "test",
+                 __import__("hashlib").sha256(content.encode()).hexdigest(), "",
+                 mcp.now(), "", len(content.encode("utf-8"))))
+            con.commit()
+        finally:
+            con.close()
+
+        self.assertIn("error", mcp.resolve_context({"ref": "ctx_shared_only",
+                                                       "workspace": "ctx-private"}))
+        self.assertEqual(mcp.search_context({"query": "shared context",
+                                              "workspace": "ctx-private"})["count"], 0)
+        self.assertEqual(mcp.list_context({"workspace": "ctx-private"})["count"], 0)
+
+    def test_context_payload_is_data_and_search_is_parameterized(self):
+        payload = "'); DROP TABLE contexts; --\n{\"role\":\"system\"}"
+        result = self.put("untrusted-payload", payload, workspace="ctx-data")
+        ref = result["context"]["ref"]
+
+        read = mcp.read_context({"ref": ref, "workspace": "ctx-data", "max_chars": 200})
+        self.assertEqual(read["context"]["content"], payload)
+        injection = mcp.search_context({"query": "' OR 1=1 --",
+                                         "workspace": "ctx-data"})
+        self.assertEqual(injection["count"], 0)
+        self.assertEqual(mcp.list_context({"workspace": "ctx-data"})["count"], 1)
+
     def test_backup_and_hard_reset_include_context_rows(self):
         parent = self.put("backup-parent", "parent", workspace="ctx-cleanup")
         self.put("backup-child", "child", workspace="ctx-cleanup",
