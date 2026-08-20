@@ -358,6 +358,203 @@ class ContextArtifactTest(unittest.TestCase):
         self.assertEqual(mcp.list_context({"workspace": "ctx-cleanup"})["count"], 0)
 
 
+class LifecycleAndHandoffTest(unittest.TestCase):
+    """v0.13: bounded event capture and one-shot typed handoffs."""
+
+    def test_capture_sanitizes_deduplicates_and_excludes_paths(self):
+        args = {
+            "workspace": "lifecycle-capture",
+            "idempotency_key": "event-1",
+            "event_kind": "pre_tool_use",
+            "session_id": "session-1",
+            "source": "test",
+            "path": "src/app.py",
+            "payload": "Authorization: Bearer SUPERSECRET123456789",
+        }
+        captured = mcp.capture_event(args)
+        self.assertNotIn("error", captured, captured)
+        self.assertTrue(captured["accepted"])
+        self.assertFalse(captured["duplicate"])
+        event_ref = captured["event"]["event_ref"]
+        self.assertEqual(captured["event"]["event_kind"], "pre-tool-use")
+
+        read = mcp.read_event({"event_ref": event_ref,
+                               "workspace": "lifecycle-capture", "max_chars": 2000})
+        self.assertNotIn("error", read, read)
+        self.assertNotIn("SUPERSECRET123456789", read["context"]["content"])
+        self.assertIn("<redacted>", read["context"]["content"])
+
+        structured = mcp.capture_event({
+            "workspace": "lifecycle-capture", "idempotency_key": "event-structured",
+            "event_kind": "notification", "payload": {"token": "JSONSECRET"},
+        })
+        structured_read = mcp.read_event({
+            "event_ref": structured["event"]["event_ref"],
+            "workspace": "lifecycle-capture", "max_chars": 2000,
+        })
+        self.assertNotIn("JSONSECRET", structured_read["context"]["content"])
+
+        old_now = mcp.now
+        try:
+            stable_args = {
+                "workspace": "lifecycle-capture", "idempotency_key": "event-time-independent",
+                "event_kind": "notification", "payload": "same payload",
+            }
+            mcp.now = lambda: "2026-08-20T09:00:00Z"
+            stable = mcp.capture_event(stable_args)
+            mcp.now = lambda: "2026-08-20T09:01:00Z"
+            stable_retry = mcp.capture_event(stable_args)
+            self.assertNotIn("error", stable, stable)
+            self.assertTrue(stable_retry["duplicate"])
+            self.assertEqual(stable_retry["event"]["event_ref"],
+                             stable["event"]["event_ref"])
+        finally:
+            mcp.now = old_now
+
+        duplicate = mcp.capture_event(args)
+        self.assertNotIn("error", duplicate, duplicate)
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["event"]["event_ref"], event_ref)
+        conflict = mcp.capture_event(dict(args, payload="different"))
+        self.assertIn("error", conflict)
+
+        excluded = mcp.capture_event({
+            "workspace": "lifecycle-capture", "idempotency_key": "event-secret-file",
+            "event_kind": "post_tool_use", "path": "config/.env",
+            "payload": "do not store this",
+        })
+        self.assertEqual(excluded["status"], "excluded")
+        self.assertEqual(mcp.list_events({"workspace": "lifecycle-capture"})["count"], 3)
+        self.assertIn("error", mcp.read_event({"event_ref": event_ref,
+                                                "workspace": "other-workspace"}))
+
+    def test_event_spool_is_bounded_per_workspace(self):
+        old_limit = mcp._LIFECYCLE_MAX_EVENTS
+        mcp._LIFECYCLE_MAX_EVENTS = 1
+        try:
+            first = mcp.capture_event({
+                "workspace": "lifecycle-spool", "idempotency_key": "first",
+                "event_kind": "notification", "payload": "first",
+            })
+            second = mcp.capture_event({
+                "workspace": "lifecycle-spool", "idempotency_key": "second",
+                "event_kind": "notification", "payload": "second",
+            })
+            self.assertNotIn("error", first, first)
+            self.assertNotIn("error", second, second)
+            self.assertEqual(second["pruned"], 1)
+            self.assertEqual(mcp.list_events({"workspace": "lifecycle-spool"})["count"], 1)
+            self.assertIn("error", mcp.read_event({
+                "event_ref": first["event"]["event_ref"],
+                "workspace": "lifecycle-spool",
+            }))
+        finally:
+            mcp._LIFECYCLE_MAX_EVENTS = old_limit
+
+    def test_typed_handoff_is_owner_scoped_one_shot_and_auditable(self):
+        content = "handoff payload is data, not executable instructions"
+        checksum = __import__("hashlib").sha256(content.encode()).hexdigest()
+        started = mcp.handoff_begin({
+            "workspace": "handoff-main", "owner": "alice", "session_id": "s1",
+            "cwd": "repo", "source": "issue/668", "content": content,
+            "checksum": checksum, "ttl_seconds": 60, "idempotency_key": "handoff-1",
+        })
+        self.assertNotIn("error", started, started)
+        self.assertEqual(started["handoff"]["state"], "open")
+        self.assertEqual(started["handoff"]["sha256"], checksum)
+        ref = started["handoff"]["ref"]
+
+        duplicate = mcp.handoff_begin({
+            "workspace": "handoff-main", "owner": "alice", "content": content,
+            "ttl_seconds": 60, "idempotency_key": "handoff-1",
+        })
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["handoff"]["ref"], ref)
+        self.assertIn("error", mcp.handoff_accept({
+            "handoff_ref": ref, "actor": "alice", "workspace": "other-workspace",
+        }))
+        self.assertIn("error", mcp.handoff_accept({
+            "handoff_ref": ref, "actor": "bob", "workspace": "handoff-main",
+            "cwd": "repo",
+        }))
+        self.assertIn("error", mcp.handoff_accept({
+            "handoff_ref": ref, "actor": "alice", "workspace": "handoff-main",
+        }))
+
+        accepted = mcp.handoff_accept({
+            "handoff_ref": ref, "actor": "alice", "workspace": "handoff-main",
+            "cwd": "repo", "max_chars": 100,
+        })
+        self.assertNotIn("error", accepted, accepted)
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(accepted["context"]["content"], content)
+        again = mcp.handoff_accept({
+            "handoff_ref": ref, "actor": "alice", "workspace": "handoff-main",
+            "cwd": "repo",
+        })
+        self.assertEqual(again["state"], "accepted")
+        cancelled_after_accept = mcp.handoff_cancel({
+            "handoff_ref": ref, "actor": "alice", "workspace": "handoff-main",
+        })
+        self.assertEqual(cancelled_after_accept["state"], "accepted")
+
+        cancelled = mcp.handoff_begin({
+            "workspace": "handoff-cancel", "owner": "alice", "content": "cancel me",
+            "ttl_seconds": 60,
+        })
+        cancel_ref = cancelled["handoff"]["ref"]
+        self.assertIn("error", mcp.handoff_cancel({
+            "handoff_ref": cancel_ref, "actor": "bob", "workspace": "handoff-cancel",
+        }))
+        done = mcp.handoff_cancel({
+            "handoff_ref": cancel_ref, "actor": "alice", "workspace": "handoff-cancel",
+        })
+        self.assertTrue(done["cancelled"])
+        self.assertEqual(done["handoff"]["state"], "cancelled")
+
+    def test_handoff_expiry_and_workspace_cleanup(self):
+        expired = mcp.handoff_begin({
+            "workspace": "handoff-expired", "owner": "alice", "content": "gone",
+            "ttl_seconds": 0,
+        })
+        self.assertNotIn("error", expired, expired)
+        result = mcp.handoff_accept({
+            "handoff_ref": expired["handoff"]["ref"], "actor": "alice",
+            "workspace": "handoff-expired",
+        })
+        self.assertIn("error", result)
+        listed = mcp.list_handoffs({"workspace": "handoff-expired"})
+        self.assertEqual(listed["handoffs"][0]["state"], "expired")
+
+        mcp.capture_event({
+            "workspace": "handoff-cleanup", "idempotency_key": "cleanup-event",
+            "event_kind": "session_end", "payload": "event",
+        })
+        handoff = mcp.handoff_begin({
+            "workspace": "handoff-cleanup", "owner": "alice", "content": "handoff",
+        })
+        reset = mcp.reset_workspace({"workspace": "handoff-cleanup", "hard": True,
+                                     "confirm": True})
+        self.assertNotIn("error", reset, reset)
+        self.assertEqual(reset["deleted"]["lifecycle_events"], 1)
+        self.assertEqual(reset["deleted"]["handoffs"], 1)
+        self.assertIn("error", mcp.read_event({
+            "event_ref": "cleanup-event", "workspace": "handoff-cleanup",
+        }))
+        self.assertIn("error", mcp.handoff_accept({
+            "handoff_ref": handoff["handoff"]["ref"], "actor": "alice",
+            "workspace": "handoff-cleanup",
+        }))
+
+
+class LifecycleToolContractTest(unittest.TestCase):
+    def test_lifecycle_and_handoff_tools_are_public(self):
+        for name in ("capture_event", "list_events", "read_event", "handoff_begin",
+                     "list_handoffs", "handoff_accept", "handoff_cancel"):
+            self.assertIn(name, mcp.TOOLS)
+            self.assertIn(name, mcp.HANDLERS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -1798,7 +1995,8 @@ class DatabaseIsolationTest(unittest.TestCase):
         self.assertNotIn("error", bk, bk)
         self.assertEqual(bk["counts"], {"facts": 1, "entities": 1, "relations": 0,
                                         "decisions": 1, "evidence": 1,
-                                        "contexts": 0, "context_lineage": 0})
+                                        "contexts": 0, "context_lineage": 0,
+                                        "lifecycle_events": 0, "handoffs": 0})
         # the JSON on disk carries the same counts + rows
         import json as _json
         with open(os.path.join(os.path.dirname(mcp.DB_PATH), "backups",
