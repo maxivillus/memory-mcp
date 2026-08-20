@@ -21,6 +21,9 @@ Tools:
   list_context {workspace, name?, limit?}
   resolve_context {ref, workspace}
   read_context {ref, workspace, start?, end?, max_chars?}
+  search_context {query, workspace, limit?}
+  chunk_context {ref, workspace, chunk_chars?, start_chunk?, max_chunks?}
+  reduce_context {name, refs, workspace, separator?, schema?, source?, checksum?, ttl_seconds?}
   -- v0.3 graph/decisions/provenance --
   remember_entity {name, type?, aliases?}
   remember_relation {subject, predicate, object, source_fact_id?}
@@ -68,6 +71,11 @@ _CONTEXT_MAX_BYTES = _env_int("MEMORY_MCP_CONTEXT_MAX_BYTES", 16 * 1024 * 1024, 
 _CONTEXT_DEFAULT_READ_CHARS = _env_int("MEMORY_MCP_CONTEXT_READ_CHARS", 4000, 1)
 _CONTEXT_MAX_READ_CHARS = _env_int("MEMORY_MCP_CONTEXT_MAX_READ_CHARS", 16000, 1)
 _CONTEXT_MAX_LINEAGE = _env_int("MEMORY_MCP_CONTEXT_MAX_LINEAGE", 100, 1)
+_CONTEXT_MAX_CHUNKS = _env_int("MEMORY_MCP_CONTEXT_MAX_CHUNKS", 32, 1)
+_CONTEXT_MAX_CHUNK_RESPONSE_CHARS = _env_int(
+    "MEMORY_MCP_CONTEXT_MAX_CHUNK_RESPONSE_CHARS", 64 * 1024, 1)
+_CONTEXT_MAX_REDUCE_REFS = 64
+_CONTEXT_MAX_SEARCH_QUERY = 256
 # v0.5 rebuild DDL: same facts shape without the global UNIQUE(sha256).
 _FACTS_TABLE_DDL = """
 CREATE TABLE facts_new (
@@ -638,6 +646,11 @@ def _context_scope(args):
     return workspace, None
 
 
+def _context_ws_check(alias):
+    """Context data is private to its explicit workspace, never shared-pool data."""
+    return " AND %s.workspace_id = ?" % alias
+
+
 def _context_json(value):
     """Keep schema metadata stable without accepting arbitrary DB values."""
     if value is None:
@@ -670,13 +683,13 @@ def _context_lineage(con, ref, workspace):
         "SELECT l.relation, p.ref, p.name FROM context_lineage l "
         "JOIN contexts p ON p.ref=l.parent_ref "
         "WHERE l.child_ref=? AND l.workspace_id=?" +
-        _ws_check("p", workspace) + " ORDER BY l.id LIMIT ?",
+        _context_ws_check("p") + " ORDER BY l.id LIMIT ?",
         [ref, workspace, workspace, _CONTEXT_MAX_LINEAGE]).fetchall()]
     children = [dict(r) for r in con.execute(
         "SELECT l.relation, c.ref, c.name FROM context_lineage l "
         "JOIN contexts c ON c.ref=l.child_ref "
         "WHERE l.parent_ref=? AND l.workspace_id=?" +
-        _ws_check("c", workspace) + " ORDER BY l.id LIMIT ?",
+        _context_ws_check("c") + " ORDER BY l.id LIMIT ?",
         [ref, workspace, workspace, _CONTEXT_MAX_LINEAGE]).fetchall()]
     return {"parents": parents, "children": children}
 
@@ -685,7 +698,7 @@ def _context_row(con, ref, workspace):
     row = con.execute(
         "SELECT ref, name, content, schema_json, source, sha256, workspace_id, "
         "created_at, expires_at, size_bytes FROM contexts WHERE ref=?" +
-        _ws_check("contexts", workspace),
+        _context_ws_check("contexts"),
         [ref, workspace]).fetchone()
     if not row:
         return None, None
@@ -760,7 +773,7 @@ def put_context(args):
             return inactive
         for parent_ref in parent_refs:
             parent = con.execute(
-                "SELECT ref FROM contexts WHERE ref=?" + _ws_check("contexts", workspace),
+                "SELECT ref FROM contexts WHERE ref=?" + _context_ws_check("contexts"),
                 [parent_ref, workspace]).fetchone()
             if not parent:
                 return {"error": "parent context not found or not in your workspace",
@@ -811,7 +824,7 @@ def list_context(args):
         if name:
             query += " AND name=?"
             params.append(name)
-        query += _ws_filter("contexts", workspace) + " ORDER BY created_at DESC, id DESC LIMIT ?"
+        query += _context_ws_check("contexts") + " ORDER BY created_at DESC, id DESC LIMIT ?"
         params.extend([workspace, limit])
         rows = con.execute(query, params).fetchall()
         return {"count": len(rows), "contexts": [_context_metadata(row) for row in rows]}
@@ -903,6 +916,166 @@ def read_context(args):
                 "lineage": _context_lineage(con, ref, workspace)}
     finally:
         con.close()
+
+
+def search_context(args):
+    """Search context names, metadata, and payloads without returning payloads."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    query = args.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return {"error": "query is required and must be a non-empty string"}
+    query = query.strip()
+    if len(query) > _CONTEXT_MAX_SEARCH_QUERY:
+        return {"error": f"query must be at most {_CONTEXT_MAX_SEARCH_QUERY} characters"}
+    limit, err = _context_limit(args.get("limit"), "limit", 20, 100)
+    if err:
+        return err
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        rows = con.execute(
+            "SELECT ref, name, content, schema_json, source, sha256, workspace_id, "
+            "created_at, expires_at, size_bytes FROM contexts "
+            "WHERE (expires_at='' OR expires_at>?) "
+            "AND instr(lower(name || char(10) || source || char(10) || "
+            "schema_json || char(10) || content), lower(?)) > 0" +
+            _context_ws_check("contexts") +
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            [now(), query, workspace, limit]).fetchall()
+        return {"query": query, "count": len(rows),
+                "contexts": [_context_metadata(row) for row in rows]}
+    finally:
+        con.close()
+
+
+def chunk_context(args):
+    """Return a bounded sequence of chunks from one context ref."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    ref = (args.get("ref") or "").strip()
+    if not ref:
+        return {"error": "ref is required"}
+    chunk_chars, err = _context_limit(
+        args.get("chunk_chars"), "chunk_chars", _CONTEXT_DEFAULT_READ_CHARS,
+        _CONTEXT_MAX_READ_CHARS)
+    if err:
+        return err
+    start_chunk = args.get("start_chunk", 0)
+    if isinstance(start_chunk, bool):
+        return {"error": "start_chunk must be a non-negative integer"}
+    try:
+        start_chunk = int(start_chunk)
+    except (TypeError, ValueError):
+        return {"error": "start_chunk must be a non-negative integer"}
+    if start_chunk < 0:
+        return {"error": "start_chunk must be a non-negative integer"}
+    max_chunks, err = _context_limit(
+        args.get("max_chunks"), "max_chunks", 8, _CONTEXT_MAX_CHUNKS)
+    if err:
+        return err
+    # Keep the aggregate response bounded even when callers request the
+    # largest legal chunk and chunk count.
+    chunk_chars = min(chunk_chars, _CONTEXT_MAX_CHUNK_RESPONSE_CHARS)
+    max_response_chunks = max(1, _CONTEXT_MAX_CHUNK_RESPONSE_CHARS // chunk_chars)
+    max_chunks = min(max_chunks, max_response_chunks)
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        row, row_err = _context_row(con, ref, workspace)
+        if row_err:
+            return row_err
+        if not row:
+            return {"error": "context not found or not in your workspace", "ref": ref}
+        total_chars = len(row["content"])
+        total_chunks = (total_chars + chunk_chars - 1) // chunk_chars
+        bounded_start = min(start_chunk, total_chunks)
+        end_chunk = min(total_chunks, bounded_start + max_chunks)
+        chunks = []
+        for index in range(bounded_start, end_chunk):
+            start = index * chunk_chars
+            end = min(total_chars, start + chunk_chars)
+            chunks.append({"index": index, "start": start, "end": end,
+                           "content": row["content"][start:end]})
+        return {
+            "context": _context_metadata(row),
+            "chunks": chunks,
+            "start_chunk": bounded_start,
+            "next_chunk": end_chunk if end_chunk < total_chunks else None,
+            "total_chunks": total_chunks,
+            "chunk_chars": chunk_chars,
+        }
+    finally:
+        con.close()
+
+
+def reduce_context(args):
+    """Create a bounded immutable context by deterministically joining refs."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"error": "name is required"}
+    if len(name) > 128:
+        return {"error": "name must be at most 128 characters"}
+    refs = args.get("refs")
+    if not isinstance(refs, list) or not refs:
+        return {"error": "refs must be a non-empty array"}
+    if any(not isinstance(ref, str) or not ref.strip() for ref in refs):
+        return {"error": "refs must be an array of non-empty refs"}
+    refs = list(dict.fromkeys(ref.strip() for ref in refs))
+    if len(refs) > _CONTEXT_MAX_REDUCE_REFS:
+        return {"error": f"refs may contain at most {_CONTEXT_MAX_REDUCE_REFS} refs"}
+    separator = args.get("separator", "\n\n")
+    if not isinstance(separator, str):
+        return {"error": "separator must be a string"}
+    if len(separator) > 1024:
+        return {"error": "separator must be at most 1024 characters"}
+    separator_bytes = len(separator.encode("utf-8"))
+    contents = []
+    total_bytes = 0
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        for ref in refs:
+            row, row_err = _context_row(con, ref, workspace)
+            if row_err:
+                return row_err
+            if not row:
+                return {"error": "context not found or not in your workspace", "ref": ref}
+            total_bytes += len(row["content"].encode("utf-8"))
+            if contents:
+                total_bytes += separator_bytes
+            if total_bytes > _CONTEXT_MAX_BYTES:
+                return {"error": "reduced content exceeds the context storage limit",
+                        "size_bytes": total_bytes}
+            contents.append(row["content"])
+    finally:
+        con.close()
+    result = put_context({
+        "name": name,
+        "content": separator.join(contents),
+        "workspace": workspace,
+        "schema": args.get("schema"),
+        "source": args.get("source"),
+        "checksum": args.get("checksum"),
+        "ttl_seconds": args.get("ttl_seconds"),
+        "parent_refs": refs,
+    })
+    if "error" in result:
+        return result
+    result["reduced_from"] = refs
+    result["reduction"] = "deterministic-concat"
+    return result
 
 
 def _db_dir():
@@ -2767,6 +2940,49 @@ TOOLS = {
             "required": ["ref", "workspace"],
         },
     },
+    "search_context": {
+        "description": "Search context names, metadata, and payloads in one workspace. Returns metadata only; payloads require read_context.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "maxLength": 256},
+                "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 100},
+                "workspace": {"type": "string", "description": "Required project/run access scope"},
+            },
+            "required": ["query", "workspace"],
+        },
+    },
+    "chunk_context": {
+        "description": "Read a bounded sequence of chunks from one context ref. The response cap and workspace ACL are enforced by the server.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string"},
+                "chunk_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "default": 4000},
+                "start_chunk": {"type": "integer", "minimum": 0, "default": 0},
+                "max_chunks": {"type": "integer", "minimum": 1, "maximum": 32, "default": 8},
+                "workspace": {"type": "string", "description": "Required project/run access scope"},
+            },
+            "required": ["ref", "workspace"],
+        },
+    },
+    "reduce_context": {
+        "description": "Create a new immutable context by deterministically joining existing refs. This is concatenation, not semantic model summarization.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "refs": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
+                "separator": {"type": "string", "maxLength": 1024, "default": "\\n\\n"},
+                "schema": {"description": "Optional schema metadata (string or JSON value)"},
+                "source": {"type": "string", "description": "Origin: issue/run/artifact ref"},
+                "checksum": {"type": "string", "description": "Optional SHA-256 checksum for the reduced content"},
+                "ttl_seconds": {"type": "integer", "minimum": 0},
+                "workspace": {"type": "string", "description": "Required project/run access scope"},
+            },
+            "required": ["name", "refs", "workspace"],
+        },
+    },
     "search_facts": {
         "description": "Full-text search over stored facts (FTS5, BM25 ranking). With semantic=true and MEMORY_MCP_EMBEDDINGS=1, merges lexical and embedding rankings (RRF).",
         "inputSchema": {
@@ -3253,6 +3469,9 @@ HANDLERS = {
     "list_context": list_context,
     "resolve_context": resolve_context,
     "read_context": read_context,
+    "search_context": search_context,
+    "chunk_context": chunk_context,
+    "reduce_context": reduce_context,
     "search_facts": search_facts,
     "search_semantic": search_semantic,
     "embed_backfill": embed_backfill,
