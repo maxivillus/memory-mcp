@@ -75,7 +75,8 @@ def load_facts():
     for fn in sorted(os.listdir(SRC_DIR)):
         if not fn.endswith(".md") or fn == "MEMORY.md":
             continue
-        raw = open(os.path.join(SRC_DIR, fn), encoding="utf-8").read()
+        with open(os.path.join(SRC_DIR, fn), encoding="utf-8") as fh:
+            raw = fh.read()
         fm = parse_frontmatter(raw)
         body = FM_RE.sub("", raw).strip()
         title = fm.get("title") or fn[:-3]
@@ -114,7 +115,7 @@ class MCPClient:
             env["MEMORY_MCP_DB"] = db
         self.proc = subprocess.Popen(
             [cmd], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, env=env)
+            stderr=subprocess.DEVNULL, env=env)
         self.next_id = 0
 
     def call(self, method, params=None):
@@ -136,8 +137,19 @@ class MCPClient:
                 return msg["result"]
 
     def close(self):
-        self.proc.stdin.close()
+        if self.proc.stdin:
+            try:
+                self.proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        if self.proc.poll() is not None:
+            return
         self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
 
 
 def main():

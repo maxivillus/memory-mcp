@@ -5,8 +5,8 @@ Stdio MCP server (JSON-RPC 2.0, newline-delimited), SQLite + FTS5 storage.
 Replaces the storage layer of the reasonix memory patches with a shared,
 searchable fact store; extraction/gating/injection stay client-side.
 
-Schema: text, sha256 (dedup), source, project, domain, trust (high|medium|low),
-strong (bool), created_at, updated_at, archived (soft delete).
+Schema: text, sha256 (workspace-scoped dedup), source, project, domain, trust
+(high|medium|low), strong (bool), created_at, updated_at, archived (soft delete).
 
 Tools:
   remember_fact {text, source?, project?, domain?, trust?, strong?}
@@ -141,6 +141,21 @@ CREATE TABLE facts_new (
 );
 """
 
+# v0.14 rebuild DDL: entity names are unique within a workspace, matching the
+# resolver's ownership predicate and the relation workspace boundary.
+_ENTITIES_TABLE_DDL = """
+CREATE TABLE entities_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT '',
+  aliases TEXT NOT NULL DEFAULT '',
+  workspace_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(name, workspace_id)
+);
+"""
+
 _FTS_TRIGGERS_DDL = """
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
   INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
@@ -216,12 +231,13 @@ END;
 -- v0.3 (2026-08-15): lightweight knowledge graph + decision log + provenance.
 CREATE TABLE IF NOT EXISTS entities (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
   type TEXT NOT NULL DEFAULT '',
   aliases TEXT NOT NULL DEFAULT '',
   workspace_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  UNIQUE(name, workspace_id)
 );
 CREATE TABLE IF NOT EXISTS relations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -449,6 +465,7 @@ def _open_db(path):
     con.executescript(_SCHEMA)
     con.executescript(_EMBED_SCHEMA)
     _migrate_facts(con)
+    _migrate_entities(con)
     _migrate_fks(con)
     _migrate_fts(con, preexisting_fts)
     _migrate_categories(con)
@@ -528,6 +545,41 @@ def _migrate_facts(con):
     else:
         # fresh or already-rebuilt DB: ensure the composite unique index
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS facts_sha_ws ON facts(sha256, workspace_id)")
+    con.commit()
+
+
+def _migrate_entities(con):
+    """v0.14 migration: replace legacy global UNIQUE(name) with the intended
+    workspace-scoped UNIQUE(name, workspace_id), preserving ids and relations.
+
+    SQLite cannot drop a table-level UNIQUE constraint in place, so legacy
+    entity tables are rebuilt atomically with foreign keys temporarily disabled,
+    following the existing facts/FK migration pattern.
+    """
+    indexes = con.execute("PRAGMA index_list(entities)").fetchall()
+    has_workspace_unique = False
+    for index in indexes:
+        if not index["unique"]:
+            continue
+        index_name = str(index["name"]).replace('"', '""')
+        columns = [row["name"] for row in con.execute(
+            'PRAGMA index_info("%s")' % index_name)]
+        if columns == ["name", "workspace_id"]:
+            has_workspace_unique = True
+            break
+    if has_workspace_unique:
+        return
+
+    con.executescript(
+        "PRAGMA foreign_keys=OFF;\n"
+        "BEGIN;\n"
+        + _ENTITIES_TABLE_DDL + "\n"
+        "INSERT INTO entities_new (id, name, type, aliases, workspace_id, created_at, updated_at) "
+        "SELECT id, name, type, aliases, workspace_id, created_at, updated_at FROM entities;\n"
+        "DROP TABLE entities;\n"
+        "ALTER TABLE entities_new RENAME TO entities;\n"
+        "COMMIT;\n"
+        "PRAGMA foreign_keys=ON;\n")
     con.commit()
 
 
@@ -710,6 +762,22 @@ def _importance(args):
         return max(0.0, min(1.0, float(args.get("importance", 0.5))))
     except (TypeError, ValueError):
         return 0.5
+
+
+def _bounded_int_arg(args, name, default, minimum, maximum):
+    """Parse a bounded integer argument without leaking ValueError/TypeError.
+
+    MCP schema validation normally handles this at the transport boundary, but
+    handlers are also called directly by integrations and tests.
+    """
+    raw = args.get(name, default)
+    if isinstance(raw, bool):
+        return None, {"error": "%s must be an integer" % name}
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None, {"error": "%s must be an integer" % name}
+    return max(minimum, min(value, maximum)), None
 
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -2182,7 +2250,9 @@ def search_facts(args):
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query is required"}
-    limit = max(1, min(int(args.get("limit", 20)), 100))
+    limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
+    if err:
+        return err
     sql = ("SELECT f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong, "
            "f.importance, f.confirmed, f.invalid_at, f.created_at, "
            "c.name AS category, bm25(facts_fts) AS rank "
@@ -2201,6 +2271,8 @@ def search_facts(args):
     else:
         sql += " AND f.invalid_at=''"
     if args.get("trust_min"):
+        if args["trust_min"] not in VALID_TRUST:
+            return {"error": "trust_min must be one of %s" % (VALID_TRUST,)}
         order = {"high": 0, "medium": 1, "low": 2}
         allowed = [t for t in VALID_TRUST if order[t] <= order[args["trust_min"]]]
         sql += f" AND f.trust IN ({','.join('?' * len(allowed))})"
@@ -2267,8 +2339,13 @@ def search_semantic(args):
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query is required"}
-    limit = max(1, min(int(args.get("limit", 20)), 100))
-    threshold = float(args.get("threshold", 0.0))
+    limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
+    if err:
+        return err
+    try:
+        threshold = float(args.get("threshold", 0.0))
+    except (TypeError, ValueError):
+        return {"error": "threshold must be a number"}
     ws = _workspace(args)
     con = get_db()
     try:
@@ -2294,7 +2371,9 @@ def embed_backfill(args):
 
 
 def list_facts(args):
-    limit = max(1, min(int(args.get("limit", 50)), 500))
+    limit, err = _bounded_int_arg(args, "limit", 50, 1, 500)
+    if err:
+        return err
     sql = ("SELECT f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong, f.importance, f.confirmed, "
            "f.created_at, f.updated_at, c.name AS category "
            "FROM facts f LEFT JOIN categories c ON c.id = f.category_id "
@@ -2329,8 +2408,12 @@ def summarize_index(args):
     chars) for the shared MCP store: lines are `#id trust! [domain] text`,
     ordered by updated_at DESC. Suitable for prompt-injection budgets.
     """
-    limit = max(1, min(int(args.get("limit", 200)), 500))
-    max_chars = max(int(args.get("max_chars", 4000)), 200)
+    limit, err = _bounded_int_arg(args, "limit", 200, 1, 500)
+    if err:
+        return err
+    max_chars, err = _bounded_int_arg(args, "max_chars", 4000, 200, 1_000_000)
+    if err:
+        return err
     sql = ("SELECT f.id, f.text, f.project, f.domain, f.trust, f.strong, f.updated_at, "
            "c.name AS category "
            "FROM facts f LEFT JOIN categories c ON c.id = f.category_id "
@@ -2347,6 +2430,8 @@ def summarize_index(args):
         sql += " AND domain=?"
         params.append(args["domain"])
     if args.get("trust_min"):
+        if args["trust_min"] not in VALID_TRUST:
+            return {"error": "trust_min must be one of %s" % (VALID_TRUST,)}
         order = {"high": 0, "medium": 1, "low": 2}
         allowed = [t for t in VALID_TRUST if order[t] <= order[args["trust_min"]]]
         sql += f" AND trust IN ({','.join('?' * len(allowed))})"
@@ -2434,8 +2519,12 @@ def search_index(args):
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query is required"}
-    limit = max(1, min(int(args.get("limit", 30)), 100))
-    max_chars = max(int(args.get("max_chars", 2000)), 200)
+    limit, err = _bounded_int_arg(args, "limit", 30, 1, 100)
+    if err:
+        return err
+    max_chars, err = _bounded_int_arg(args, "max_chars", 2000, 200, 1_000_000)
+    if err:
+        return err
     sql = ("SELECT f.id, f.text, f.source, f.trust, f.strong, f.importance, f.updated_at, "
            "c.name AS category, bm25(facts_fts) AS rank "
            "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
@@ -2518,7 +2607,9 @@ def categorize_pending(args):
     remember_fact stay as the instant fallback."""
     if not os.environ.get("MEMORY_MCP_CATEGORIZE"):
         return {"error": "categorize_pending is disabled (set MEMORY_MCP_CATEGORIZE=1)"}
-    limit = max(1, min(int(args.get("limit", 20)), 100))
+    limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
+    if err:
+        return err
     ws = _workspace(args)
     con = get_db()
     try:
@@ -2642,8 +2733,12 @@ def search_graph(args):
     name = (args.get("entity") or "").strip()
     if not name:
         return {"error": "entity is required"}
-    depth = max(1, min(int(args.get("depth", 1)), 2))
-    limit = max(1, min(int(args.get("limit", 50)), 200))
+    depth, err = _bounded_int_arg(args, "depth", 1, 1, 2)
+    if err:
+        return err
+    limit, err = _bounded_int_arg(args, "limit", 50, 1, 200)
+    if err:
+        return err
     con = get_db()
     try:
         ws = _workspace(args)
@@ -2729,7 +2824,10 @@ def query_decisions(args):
             sql += f" AND {key}=?"
             params.append(args[key])
     sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
-    params.append(max(1, min(int(args.get("limit", 20)), 100)))
+    limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
+    if err:
+        return err
+    params.append(limit)
     con = get_db()
     try:
         err = _ws_inactive_error(con, ws)
@@ -2748,7 +2846,9 @@ def find_precedents(args):
     terms = fts_terms(scenario)
     if not terms:
         return {"error": "scenario has no searchable terms", "count": 0, "precedents": []}
-    limit = max(1, min(int(args.get("limit", 10)), 50))
+    limit, err = _bounded_int_arg(args, "limit", 10, 1, 50)
+    if err:
+        return err
     # OR-joined: precedent search is about similarity, not full-term matching;
     # BM25 ranks the partially-matching decisions.
     query = " OR ".join(terms)
@@ -2986,7 +3086,9 @@ def fact_history(args):
 def review_pending(args):
     """Human-in-the-loop: unconfirmed facts (confirmed=0, trust != high) that
     are active — ordered by importance, then recency. Confirm with confirm_fact."""
-    limit = max(1, min(int(args.get("limit", 20)), 100))
+    limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
+    if err:
+        return err
     con = get_db()
     try:
         ws = _workspace(args)
@@ -3091,7 +3193,9 @@ def fact_references(args):
 def export_rdf(args):
     """W3C PROV-flavoured Turtle export: facts, entities/relations, decisions,
     evidence, and bi-temporal supersession edges."""
-    limit = max(1, min(int(args.get("limit", 5000)), 50000))
+    limit, err = _bounded_int_arg(args, "limit", 5000, 1, 50000)
+    if err:
+        return err
     ws = _workspace(args)
     con = get_db()
     try:
@@ -3173,7 +3277,9 @@ def facts_for_session(args):
     session_ref = (args.get("session_ref") or "").strip()
     if not session_ref:
         return {"error": "session_ref is required"}
-    limit = max(1, min(int(args.get("limit", 50)), 200))
+    limit, err = _bounded_int_arg(args, "limit", 50, 1, 200)
+    if err:
+        return err
     con = get_db()
     try:
         sql = ("SELECT id, text, source, project, domain, trust, strong, importance, confirmed, "
@@ -3194,7 +3300,9 @@ def facts_for_session(args):
 
 def list_sessions(args):
     """Session index: distinct sources with active-fact counts, freshest first."""
-    limit = max(1, min(int(args.get("limit", 50)), 200))
+    limit, err = _bounded_int_arg(args, "limit", 50, 1, 200)
+    if err:
+        return err
     con = get_db()
     try:
         ws = _workspace(args)
@@ -4091,7 +4199,7 @@ TOOLS = {
         },
     },
     "remember_entity": {
-        "description": "Upsert an entity node (name unique; type/aliases optional).",
+        "description": "Upsert an entity node (name unique within the workspace; type/aliases optional).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4329,15 +4437,17 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {}},
     },
     "list_forgotten": {
-        "description": "Direct review of forgotten facts (lifecycle=forgotten) — the only way to see them besides restore_fact.",
+        "description": "Direct review of forgotten facts in the requested workspace (lifecycle=forgotten) — the only way to see them besides restore_fact.",
         "inputSchema": {"type": "object", "properties": {
-            "limit": {"type": "integer", "default": 50},
+            "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project plus the shared pool"},
         }},
     },
     "restore_fact": {
-        "description": "Manually bring a forgotten/degraded fact back to lifecycle=active (resets revival_count, stamps last_accessed_at).",
+        "description": "Manually bring a forgotten/degraded fact in the requested workspace back to lifecycle=active (resets revival_count, stamps last_accessed_at).",
         "inputSchema": {"type": "object", "properties": {
             "id": {"type": "integer"},
+            "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project plus the shared pool"},
         }, "required": ["id"]},
     },
 }

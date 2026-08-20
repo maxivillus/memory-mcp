@@ -20,6 +20,15 @@ import os
 
 import llm
 
+_FACT_TYPES = ("user", "feedback", "project", "reference")
+_TRUST_LEVELS = ("high", "medium", "low")
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "y")
+
 PROMPT = """You extract durable facts from a conversation transcript for an
 agent memory store. Return ONLY JSON matching this schema:
 {"facts": [{"text": "...", "type": "user|feedback|project|reference", "trust": "high|medium|low", "strong": false, "scope": "project|global", "importance": 0.5}]}
@@ -46,16 +55,21 @@ def _min_chars():
         return 800
 
 
-def _remember(text, source, project, domain, importance=None, workspace=""):
+def _remember(text, source, project, domain, importance=None, workspace="",
+              fact_type="", trust="medium", strong=False, scope="project"):
     """Store one fact via the core server's remember_fact (lazy import — the
     core imports this module, so the import must happen at call time)."""
     from memory_mcp import remember_fact
+    fact_type = fact_type if fact_type in _FACT_TYPES else "project"
+    trust = trust if trust in _TRUST_LEVELS else "medium"
+    effective_domain = domain or fact_type
+    effective_workspace = "" if scope == "global" else workspace
     args = {"text": text, "source": source or "ingest_turn",
-            "project": project or "", "domain": domain or "project"}
+            "project": project or "", "domain": effective_domain,
+            "trust": trust, "strong": _as_bool(strong),
+            "workspace": effective_workspace}
     if importance is not None:
         args["importance"] = importance
-    if workspace:
-        args["workspace"] = workspace
     return remember_fact(args)
 
 
@@ -106,15 +120,21 @@ def ingest_turn(args):
         if not text:
             continue
         try:
-            res = _remember(text, session_ref, project, domain, importance=f.get("importance"),
-                            workspace=workspace)
+            scope = f.get("scope") if f.get("scope") in ("project", "global") else "project"
+            fact_workspace = "" if scope == "global" else workspace
+            res = _remember(
+                text, session_ref, project, domain,
+                importance=f.get("importance"), workspace=workspace,
+                fact_type=f.get("type", ""), trust=f.get("trust", "medium"),
+                strong=f.get("strong", False), scope=scope)
             if res.get("dedup"):
                 deduped += 1
             else:
                 stored += 1
-                new_facts.append({"id": res.get("id"), "text": text, "workspace": workspace})
+                new_facts.append({"id": res.get("id"), "text": text,
+                                  "workspace": fact_workspace})
             if session_ref and res.get("id"):
-                _attach(res["id"], session_ref, workspace)
+                _attach(res["id"], session_ref, fact_workspace)
         except Exception:
             failed += 1
 
