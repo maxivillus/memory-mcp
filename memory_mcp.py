@@ -24,6 +24,14 @@ Tools:
   search_context {query, workspace, limit?}
   chunk_context {ref, workspace, chunk_chars?, start_chunk?, max_chunks?}
   reduce_context {name, refs, workspace, separator?, schema?, source?, checksum?, ttl_seconds?}
+  -- v0.13 bounded lifecycle capture and typed handoffs --
+  capture_event {idempotency_key, event_kind, payload, workspace, ...}
+  list_events {workspace, session_id?, event_kind?, limit?}
+  read_event {event_ref, workspace, max_chars?}
+  handoff_begin {content, owner, workspace, source?, checksum?, ttl_seconds?, ...}
+  list_handoffs {workspace, owner?, state?, limit?}
+  handoff_accept {handoff_ref, actor, workspace, cwd?, max_chars?}
+  handoff_cancel {handoff_ref, actor, workspace}
   -- v0.3 graph/decisions/provenance --
   remember_entity {name, type?, aliases?}
   remember_relation {subject, predicate, object, source_fact_id?}
@@ -37,7 +45,7 @@ Tools:
   attach_evidence {fact_id, source_ref, source_checksum?, fetched_at?}
   detect_conflicts {text}
 """
-import hashlib, json, os, re, sqlite3, sys
+import fnmatch, hashlib, json, os, re, sqlite3, sys
 from datetime import datetime, timedelta, timezone
 
 def default_db_path():
@@ -76,6 +84,36 @@ _CONTEXT_MAX_CHUNK_RESPONSE_CHARS = _env_int(
     "MEMORY_MCP_CONTEXT_MAX_CHUNK_RESPONSE_CHARS", 64 * 1024, 1)
 _CONTEXT_MAX_REDUCE_REFS = 64
 _CONTEXT_MAX_SEARCH_QUERY = 256
+
+# v0.13 lifecycle capture and typed handoffs. These limits keep the local
+# event spool useful between short runtime sessions without turning it into an
+# unbounded transcript store.
+_LIFECYCLE_MAX_EVENTS = _env_int("MEMORY_MCP_LIFECYCLE_MAX_EVENTS", 1000, 1)
+_LIFECYCLE_MAX_PAYLOAD_BYTES = _env_int(
+    "MEMORY_MCP_LIFECYCLE_MAX_PAYLOAD_BYTES", 64 * 1024, 1)
+_LIFECYCLE_MAX_FIELD_CHARS = _env_int(
+    "MEMORY_MCP_LIFECYCLE_MAX_FIELD_CHARS", 256, 1)
+_LIFECYCLE_MAX_PATH_CHARS = _env_int(
+    "MEMORY_MCP_LIFECYCLE_MAX_PATH_CHARS", 1024, 1)
+_HANDOFF_DEFAULT_TTL = _env_int("MEMORY_MCP_HANDOFF_DEFAULT_TTL", 24 * 60 * 60, 0)
+_HANDOFF_MAX_TTL = _env_int("MEMORY_MCP_HANDOFF_MAX_TTL", 7 * 24 * 60 * 60, 0)
+_HANDOFF_MAX_CONTENT_BYTES = _env_int(
+    "MEMORY_MCP_HANDOFF_MAX_CONTENT_BYTES", 256 * 1024, 1)
+_HANDOFF_MAX_LIST = 100
+_LIFECYCLE_EXCLUDED_GLOBS = (
+    ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx",
+    "id_rsa*", "credentials*", "secrets*",
+)
+_LIFECYCLE_KIND_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_LIFECYCLE_SECRET_PATTERNS = (
+    re.compile(r"(?is)-----BEGIN [^-]+ PRIVATE KEY-----.*?-----END [^-]+ PRIVATE KEY-----"),
+    re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)(\b(?:api[_-]?key|access[_-]?key|secret|password|token|authorization)\s*[=:]\s*)[^\s,;]+"),
+    re.compile(r"(?i)([\"']?(?:api[_-]?key|access[_-]?key|secret|password|token|authorization)[\"']?\s*:\s*[\"']?)[^\s,;}\"']+"),
+    re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\b(?:ghp|gho|ghs|ghr|github_pat|xox[baprs]-)[A-Za-z0-9_-]+\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
 # v0.5 rebuild DDL: same facts shape without the global UNIQUE(sha256).
 _FACTS_TABLE_DDL = """
 CREATE TABLE facts_new (
@@ -265,6 +303,59 @@ CREATE INDEX IF NOT EXISTS contexts_workspace_idx ON contexts(workspace_id);
 CREATE INDEX IF NOT EXISTS contexts_name_idx ON contexts(name, workspace_id);
 CREATE INDEX IF NOT EXISTS context_lineage_parent_idx ON context_lineage(parent_ref);
 CREATE INDEX IF NOT EXISTS context_lineage_child_idx ON context_lineage(child_ref);
+
+-- v0.13: bounded lifecycle event spool. The event payload is stored as an
+-- immutable context so existing context reads/ACLs remain the only payload
+-- seam; this table is only the idempotency and catalog index.
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  idempotency_key TEXT NOT NULL,
+  event_kind TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  cwd TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  tool_name TEXT NOT NULL DEFAULT '',
+  context_ref TEXT NOT NULL UNIQUE REFERENCES contexts(ref) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  payload_bytes INTEGER NOT NULL,
+  payload_truncated INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  UNIQUE(workspace_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS lifecycle_events_workspace_idx
+  ON lifecycle_events(workspace_id, created_at, id);
+CREATE INDEX IF NOT EXISTS lifecycle_events_session_idx
+  ON lifecycle_events(workspace_id, session_id, created_at, id);
+
+-- v0.13: typed, one-shot handoffs over immutable context artifacts.
+CREATE TABLE IF NOT EXISTS handoffs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ref TEXT NOT NULL UNIQUE,
+  context_ref TEXT NOT NULL UNIQUE REFERENCES contexts(ref) ON DELETE CASCADE,
+  owner TEXT NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
+  cwd TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  sha256 TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  shared INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'open'
+    CHECK(state IN ('open','accepted','cancelled','expired')),
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  accepted_at TEXT NOT NULL DEFAULT '',
+  accepted_by TEXT NOT NULL DEFAULT '',
+  cancelled_at TEXT NOT NULL DEFAULT '',
+  cancelled_by TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS handoffs_idempotency_idx
+  ON handoffs(workspace_id, idempotency_key) WHERE idempotency_key <> '';
+CREATE INDEX IF NOT EXISTS handoffs_workspace_idx
+  ON handoffs(workspace_id, state, created_at, id);
 CREATE INDEX IF NOT EXISTS relations_subject_idx ON relations(subject_id);
 CREATE INDEX IF NOT EXISTS relations_object_idx ON relations(object_id);
 CREATE INDEX IF NOT EXISTS evidence_fact_idx ON evidence(fact_id);
@@ -719,6 +810,670 @@ def _context_limit(value, name, default, maximum):
     if parsed < 1 or parsed > maximum:
         return None, {"error": f"{name} must be between 1 and {maximum}"}
     return parsed, None
+
+
+def _bounded_utf8(text, max_bytes):
+    """Return text clipped at a UTF-8 byte boundary and a truncation flag."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    return encoded[:max_bytes].decode("utf-8", "ignore"), True
+
+
+def _redact_lifecycle_text(text):
+    """Remove common credential forms before lifecycle data reaches SQLite."""
+    for pattern in _LIFECYCLE_SECRET_PATTERNS:
+        def replacement(match):
+            prefix = match.group(1) if match.lastindex else ""
+            return prefix + "<redacted>"
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _lifecycle_field(value, field, maximum, required=False, redact=True):
+    if value is None:
+        if required:
+            return None, {"error": f"{field} is required"}
+        return "", None
+    if not isinstance(value, str):
+        return None, {"error": f"{field} must be a string"}
+    value = value.strip()
+    if required and not value:
+        return None, {"error": f"{field} is required"}
+    if len(value) > maximum:
+        return None, {"error": f"{field} must be at most {maximum} characters"}
+    return (_redact_lifecycle_text(value) if redact else value), None
+
+
+def _lifecycle_payload(payload):
+    if payload is None:
+        return None, None, None, {"error": "payload is required"}
+    if isinstance(payload, str):
+        payload_text, payload_format = payload, "text"
+    else:
+        try:
+            payload_text = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            return None, None, None, {"error": "payload must be JSON-serializable"}
+        payload_format = "json"
+    payload_text = _redact_lifecycle_text(payload_text)
+    payload_text, truncated = _bounded_utf8(
+        payload_text, _LIFECYCLE_MAX_PAYLOAD_BYTES)
+    return payload_text, payload_format, truncated, None
+
+
+def _lifecycle_path_excluded(path, patterns):
+    if not path:
+        return False
+    normalized = path.replace("\\", "/")
+    candidates = (normalized, os.path.basename(normalized))
+    return any(fnmatch.fnmatchcase(candidate, pattern)
+               for candidate in candidates for pattern in patterns)
+
+
+def _lifecycle_exclusion_patterns(args):
+    patterns = args.get("exclude_paths", args.get("capture_exclusions", []))
+    if patterns is None:
+        return [], None
+    if not isinstance(patterns, list):
+        return None, {"error": "exclude_paths must be an array of strings"}
+    if len(patterns) > 32:
+        return None, {"error": "exclude_paths may contain at most 32 patterns"}
+    clean = []
+    for pattern in patterns:
+        if not isinstance(pattern, str) or not pattern.strip():
+            return None, {"error": "exclude_paths must contain non-empty strings"}
+        pattern = pattern.strip()
+        if len(pattern) > _LIFECYCLE_MAX_PATH_CHARS:
+            return None, {"error": "exclude path patterns are too long"}
+        clean.append(pattern)
+    return clean, None
+
+
+def _context_expiry(ttl_seconds, default=None, maximum=None):
+    ttl = default if ttl_seconds is None else ttl_seconds
+    if isinstance(ttl, bool):
+        return None, {"error": "ttl_seconds must be a non-negative integer"}
+    try:
+        ttl = int(ttl)
+    except (TypeError, ValueError):
+        return None, {"error": "ttl_seconds must be a non-negative integer"}
+    if ttl < 0:
+        return None, {"error": "ttl_seconds must be a non-negative integer"}
+    if maximum is not None and ttl > maximum:
+        return None, {"error": f"ttl_seconds must be at most {maximum}"}
+    return (datetime.now(timezone.utc) + timedelta(seconds=ttl)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"), None
+
+
+def _new_context_ref(name, created_at, prefix="ctx"):
+    ref_seed = (name + "\0" + created_at + "\0" + os.urandom(16).hex()).encode("utf-8")
+    return prefix + "_" + hashlib.sha256(ref_seed).hexdigest()
+
+
+def _insert_context_row(con, *, name, content, workspace, schema, source,
+                        checksum, created_at, expires_at, ref_prefix="ctx"):
+    """Insert a context inside the caller's transaction and return its row."""
+    size_bytes = len(content.encode("utf-8"))
+    ref = _new_context_ref(name, created_at, ref_prefix)
+    con.execute(
+        "INSERT INTO contexts (ref, name, content, schema_json, source, sha256, "
+        "workspace_id, created_at, expires_at, size_bytes) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (ref, name, content, _context_json(schema), source, checksum, workspace,
+         created_at, expires_at, size_bytes))
+    return con.execute(
+        "SELECT ref, name, content, schema_json, source, sha256, workspace_id, "
+        "created_at, expires_at, size_bytes FROM contexts WHERE ref=?", [ref]).fetchone()
+
+
+def _event_row(con, workspace, idempotency_key):
+    return con.execute(
+        "SELECT id, idempotency_key, event_kind, event_id, session_id, source, cwd, "
+        "path, tool_name, context_ref, workspace_id, sha256, payload_bytes, "
+        "payload_truncated, created_at FROM lifecycle_events "
+        "WHERE workspace_id=? AND idempotency_key=?",
+        [workspace, idempotency_key]).fetchone()
+
+
+def _event_metadata(row):
+    return {
+        "event_ref": row["context_ref"],
+        "context_ref": row["context_ref"],
+        "idempotency_key": row["idempotency_key"],
+        "event_id": row["event_id"],
+        "event_kind": row["event_kind"],
+        "session_id": row["session_id"],
+        "source": row["source"],
+        "tool_name": row["tool_name"],
+        "sha256": row["sha256"],
+        "payload_bytes": row["payload_bytes"],
+        "payload_truncated": bool(row["payload_truncated"]),
+        "workspace": row["workspace_id"],
+        "created_at": row["created_at"],
+    }
+
+
+def _trim_event_spool(con, workspace):
+    """Keep only the newest bounded number of event contexts per workspace."""
+    limit = max(1, int(_LIFECYCLE_MAX_EVENTS))
+    count = con.execute(
+        "SELECT COUNT(*) FROM lifecycle_events WHERE workspace_id=?", [workspace]
+    ).fetchone()[0]
+    excess = count - limit
+    if excess <= 0:
+        return 0
+    old_rows = con.execute(
+        "SELECT context_ref FROM lifecycle_events WHERE workspace_id=? "
+        "ORDER BY id LIMIT ?", [workspace, excess]).fetchall()
+    for old in old_rows:
+        # Context deletion cascades to its event index row. Event contexts have
+        # no parent lineage and are never shared with a handoff.
+        con.execute("DELETE FROM contexts WHERE ref=?", [old["context_ref"]])
+    return len(old_rows)
+
+
+def capture_event(args):
+    """Capture one sanitized lifecycle envelope into the bounded local spool."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    idempotency_key, err = _lifecycle_field(
+        args.get("idempotency_key", args.get("event_id")),
+        "idempotency_key", _LIFECYCLE_MAX_FIELD_CHARS, required=True, redact=False)
+    if err:
+        return err
+    event_id, err = _lifecycle_field(
+        args.get("event_id", idempotency_key), "event_id",
+        _LIFECYCLE_MAX_FIELD_CHARS, required=True, redact=False)
+    if err:
+        return err
+    kind, err = _lifecycle_field(args.get("event_kind", args.get("kind")),
+                                 "event_kind", _LIFECYCLE_MAX_FIELD_CHARS,
+                                 required=True, redact=False)
+    if err:
+        return err
+    kind = kind.lower().replace("_", "-")
+    if not _LIFECYCLE_KIND_RE.match(kind):
+        return {"error": "event_kind must use lowercase letters, digits, '.', '_' or '-'"}
+    session_id, err = _lifecycle_field(args.get("session_id", args.get("session_ref")),
+                                       "session_id", _LIFECYCLE_MAX_FIELD_CHARS,
+                                       redact=False)
+    if err:
+        return err
+    source, err = _lifecycle_field(args.get("source"), "source",
+                                   _LIFECYCLE_MAX_FIELD_CHARS)
+    if err:
+        return err
+    cwd, err = _lifecycle_field(args.get("cwd"), "cwd", _LIFECYCLE_MAX_PATH_CHARS)
+    if err:
+        return err
+    path, err = _lifecycle_field(args.get("path"), "path", _LIFECYCLE_MAX_PATH_CHARS)
+    if err:
+        return err
+    tool_name, err = _lifecycle_field(args.get("tool_name"), "tool_name",
+                                      _LIFECYCLE_MAX_FIELD_CHARS)
+    if err:
+        return err
+    patterns, err = _lifecycle_exclusion_patterns(args)
+    if err:
+        return err
+    if args.get("capture", True) is False:
+        return {"accepted": False, "status": "excluded", "reason": "capture_disabled"}
+    if _lifecycle_path_excluded(path, _LIFECYCLE_EXCLUDED_GLOBS + tuple(patterns)):
+        return {"accepted": False, "status": "excluded", "reason": "path_excluded"}
+    payload, payload_format, truncated, err = _lifecycle_payload(
+        args.get("payload", args.get("content")))
+    if err:
+        return err
+
+    created_at = now()
+    envelope = {
+        "version": 1,
+        "event_id": event_id,
+        "event_kind": kind,
+        "session_id": session_id,
+        "source": source,
+        "tool_name": tool_name,
+        "payload_format": payload_format,
+        "payload": payload,
+        "truncated": truncated,
+    }
+    content = json.dumps(envelope, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
+    checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    schema = {"kind": "lifecycle_event", "version": 1, "event_kind": kind,
+              "payload_format": payload_format}
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        con.execute("BEGIN IMMEDIATE")
+        existing = _event_row(con, workspace, idempotency_key)
+        if existing:
+            con.rollback()
+            if existing["sha256"] != checksum:
+                return {"error": "idempotency key already used for a different event"}
+            return {"accepted": True, "duplicate": True,
+                    "event": _event_metadata(existing)}
+        context = _insert_context_row(
+            con, name="event-" + hashlib.sha256(idempotency_key.encode()).hexdigest()[:32],
+            content=content, workspace=workspace, schema=schema, source=source,
+            checksum=checksum, created_at=created_at, expires_at="")
+        con.execute(
+            "INSERT INTO lifecycle_events (idempotency_key, event_kind, event_id, "
+            "session_id, source, cwd, path, tool_name, context_ref, workspace_id, "
+            "sha256, payload_bytes, payload_truncated, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (idempotency_key, kind, event_id, session_id, source, cwd, path, tool_name,
+             context["ref"], workspace, checksum, len(payload.encode("utf-8")),
+             int(truncated), created_at))
+        pruned = _trim_event_spool(con, workspace)
+        con.commit()
+        row = _event_row(con, workspace, idempotency_key)
+        return {"accepted": True, "duplicate": False, "event": _event_metadata(row),
+                "context": _context_metadata(context), "pruned": pruned}
+    except sqlite3.IntegrityError:
+        con.rollback()
+        existing = _event_row(con, workspace, idempotency_key)
+        if existing and existing["sha256"] == checksum:
+            return {"accepted": True, "duplicate": True,
+                    "event": _event_metadata(existing)}
+        return {"error": "lifecycle event write conflicted with another event"}
+    except sqlite3.DatabaseError as e:
+        con.rollback()
+        return {"error": f"lifecycle event write failed: {e}"}
+    finally:
+        con.close()
+
+
+def list_events(args):
+    """List lifecycle metadata without returning captured payloads."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    limit, err = _context_limit(args.get("limit"), "limit", 50, _HANDOFF_MAX_LIST)
+    if err:
+        return err
+    session_id, err = _lifecycle_field(args.get("session_id", args.get("session_ref")),
+                                       "session_id", _LIFECYCLE_MAX_FIELD_CHARS,
+                                       redact=False)
+    if err:
+        return err
+    kind = (args.get("event_kind", args.get("kind")) or "").strip().lower().replace("_", "-")
+    if kind and not _LIFECYCLE_KIND_RE.match(kind):
+        return {"error": "event_kind must use lowercase letters, digits, '.', '_' or '-'"}
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        query = "SELECT id, idempotency_key, event_kind, event_id, session_id, source, cwd, " \
+                "path, tool_name, context_ref, workspace_id, sha256, payload_bytes, " \
+                "payload_truncated, created_at FROM lifecycle_events WHERE workspace_id=?"
+        params = [workspace]
+        if session_id:
+            query += " AND session_id=?"
+            params.append(session_id)
+        if kind:
+            query += " AND event_kind=?"
+            params.append(kind)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = con.execute(query, params).fetchall()
+        return {"count": len(rows), "events": [_event_metadata(row) for row in rows]}
+    finally:
+        con.close()
+
+
+def read_event(args):
+    """Read a bounded lifecycle envelope by event/context ref."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    ref = (args.get("event_ref", args.get("ref")) or "").strip()
+    if not ref:
+        return {"error": "event_ref is required"}
+    max_chars, err = _context_limit(args.get("max_chars"), "max_chars",
+                                     _CONTEXT_DEFAULT_READ_CHARS,
+                                     _CONTEXT_MAX_READ_CHARS)
+    if err:
+        return err
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        row = con.execute(
+            "SELECT e.id, e.idempotency_key, e.event_kind, e.event_id, e.session_id, "
+            "e.source, e.cwd, e.path, e.tool_name, e.context_ref, e.workspace_id, "
+            "e.sha256, e.payload_bytes, e.payload_truncated, e.created_at "
+            "FROM lifecycle_events e WHERE e.workspace_id=? AND "
+            "(e.context_ref=? OR e.idempotency_key=?)", [workspace, ref, ref]).fetchone()
+        if not row:
+            return {"error": "event not found or not in your workspace", "event_ref": ref}
+        context_row, row_err = _context_row(con, row["context_ref"], workspace)
+        if row_err:
+            return row_err
+        if not context_row:
+            return {"error": "event context not found or not in your workspace",
+                    "event_ref": ref}
+        content = context_row["content"][:max_chars]
+        context = _context_metadata(context_row)
+        context.update({"content": content, "start": 0, "end": len(content),
+                        "total_chars": len(context_row["content"]),
+                        "truncated": len(content) < len(context_row["content"]),
+                        "next_start": len(content) if len(content) < len(context_row["content"])
+                        else None})
+        return {"event": _event_metadata(row), "context": context,
+                "lineage": _context_lineage(con, row["context_ref"], workspace)}
+    finally:
+        con.close()
+
+
+def _handoff_row(con, workspace, ref):
+    return con.execute(
+        "SELECT id, ref, context_ref, owner, session_id, cwd, source, sha256, "
+        "workspace_id, shared, state, idempotency_key, created_at, expires_at, "
+        "accepted_at, accepted_by, cancelled_at, cancelled_by FROM handoffs "
+        "WHERE workspace_id=? AND ref=?", [workspace, ref]).fetchone()
+
+
+def _handoff_metadata(row):
+    return {
+        "ref": row["ref"],
+        "context_ref": row["context_ref"],
+        "owner": row["owner"],
+        "session_id": row["session_id"],
+        "source": row["source"],
+        "sha256": row["sha256"],
+        "workspace": row["workspace_id"],
+        "shared": bool(row["shared"]),
+        "state": row["state"],
+        "created_at": row["created_at"],
+        "expires_at": row["expires_at"],
+        "accepted_at": row["accepted_at"],
+        "accepted_by": row["accepted_by"],
+        "cancelled_at": row["cancelled_at"],
+        "cancelled_by": row["cancelled_by"],
+    }
+
+
+def _expire_handoffs(con, workspace):
+    cur = con.execute(
+        "UPDATE handoffs SET state='expired' WHERE workspace_id=? AND state='open' "
+        "AND expires_at<>'' AND expires_at<=?", [workspace, now()])
+    return cur.rowcount
+
+
+def handoff_begin(args):
+    """Create a typed, expiring handoff backed by one immutable context ref."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    owner, err = _lifecycle_field(args.get("owner"), "owner",
+                                  _LIFECYCLE_MAX_FIELD_CHARS, required=True,
+                                  redact=False)
+    if err:
+        return err
+    session_id, err = _lifecycle_field(args.get("session_id", args.get("session_ref")),
+                                       "session_id", _LIFECYCLE_MAX_FIELD_CHARS,
+                                       redact=False)
+    if err:
+        return err
+    cwd, err = _lifecycle_field(args.get("cwd"), "cwd", _LIFECYCLE_MAX_PATH_CHARS,
+                                redact=False)
+    if err:
+        return err
+    source, err = _lifecycle_field(args.get("source"), "source",
+                                   _LIFECYCLE_MAX_FIELD_CHARS)
+    if err:
+        return err
+    idempotency_key, err = _lifecycle_field(
+        args.get("idempotency_key"), "idempotency_key",
+        _LIFECYCLE_MAX_FIELD_CHARS, redact=False)
+    if err:
+        return err
+    content = args.get("content")
+    if not isinstance(content, str) or not content:
+        return {"error": "content is required and must be a non-empty string"}
+    if len(content.encode("utf-8")) > _HANDOFF_MAX_CONTENT_BYTES:
+        return {"error": "content exceeds the handoff storage limit"}
+    checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    supplied_checksum = (args.get("checksum") or "").strip().lower()
+    if supplied_checksum and supplied_checksum != checksum:
+        return {"error": "checksum does not match content", "sha256": checksum}
+    expires_at, err = _context_expiry(args.get("ttl_seconds"),
+                                      _HANDOFF_DEFAULT_TTL, _HANDOFF_MAX_TTL)
+    if err:
+        return err
+    shared = args.get("shared", False)
+    if not isinstance(shared, bool):
+        return {"error": "shared must be a boolean"}
+    name = (args.get("name") or "").strip()
+    if not name:
+        name = "handoff-" + checksum[:32]
+    if len(name) > 128:
+        return {"error": "name must be at most 128 characters"}
+
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        con.execute("BEGIN IMMEDIATE")
+        if idempotency_key:
+            existing = con.execute(
+                "SELECT id, ref, context_ref, owner, session_id, cwd, source, sha256, "
+                "workspace_id, shared, state, idempotency_key, created_at, expires_at, "
+                "accepted_at, accepted_by, cancelled_at, cancelled_by FROM handoffs "
+                "WHERE workspace_id=? AND idempotency_key=?", [workspace, idempotency_key]
+            ).fetchone()
+            if existing:
+                con.rollback()
+                if existing["sha256"] != checksum or existing["owner"] != owner:
+                    return {"error": "idempotency key already used for a different handoff"}
+                return {"created": True, "duplicate": True,
+                        "handoff": _handoff_metadata(existing)}
+        created_at = now()
+        schema = {"kind": "typed_handoff", "version": 1, "owner": owner,
+                  "session_id": session_id, "shared": shared}
+        context = _insert_context_row(
+            con, name=name, content=content, workspace=workspace, schema=schema,
+            source=source, checksum=checksum, created_at=created_at,
+            expires_at=expires_at)
+        handoff_ref = _new_context_ref(name, created_at, "hnd")
+        con.execute(
+            "INSERT INTO handoffs (ref, context_ref, owner, session_id, cwd, source, "
+            "sha256, workspace_id, shared, state, idempotency_key, created_at, "
+            "expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (handoff_ref, context["ref"], owner, session_id, cwd, source, checksum,
+             workspace, int(shared), "open", idempotency_key, created_at, expires_at))
+        con.commit()
+        row = _handoff_row(con, workspace, handoff_ref)
+        return {"created": True, "duplicate": False,
+                "handoff": _handoff_metadata(row),
+                "context": _context_metadata(context)}
+    except sqlite3.IntegrityError:
+        con.rollback()
+        if idempotency_key:
+            existing = con.execute(
+                "SELECT id, ref, context_ref, owner, session_id, cwd, source, sha256, "
+                "workspace_id, shared, state, idempotency_key, created_at, expires_at, "
+                "accepted_at, accepted_by, cancelled_at, cancelled_by FROM handoffs "
+                "WHERE workspace_id=? AND idempotency_key=?", [workspace, idempotency_key]
+            ).fetchone()
+            if existing and existing["sha256"] == checksum and existing["owner"] == owner:
+                return {"created": True, "duplicate": True,
+                        "handoff": _handoff_metadata(existing)}
+        return {"error": "handoff write conflicted with another handoff"}
+    except sqlite3.DatabaseError as e:
+        con.rollback()
+        return {"error": f"handoff write failed: {e}"}
+    finally:
+        con.close()
+
+
+def list_handoffs(args):
+    """List handoff metadata and transition open expired rows safely."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    limit, err = _context_limit(args.get("limit"), "limit", 50, _HANDOFF_MAX_LIST)
+    if err:
+        return err
+    owner, err = _lifecycle_field(args.get("owner"), "owner",
+                                  _LIFECYCLE_MAX_FIELD_CHARS, redact=False)
+    if err:
+        return err
+    state = (args.get("state") or "").strip().lower()
+    if state and state not in ("open", "accepted", "cancelled", "expired"):
+        return {"error": "state must be open, accepted, cancelled, or expired"}
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        _expire_handoffs(con, workspace)
+        con.commit()
+        query = (
+            "SELECT id, ref, context_ref, owner, session_id, cwd, source, sha256, "
+            "workspace_id, shared, state, idempotency_key, created_at, expires_at, "
+            "accepted_at, accepted_by, cancelled_at, cancelled_by FROM handoffs "
+            "WHERE workspace_id=?")
+        params = [workspace]
+        if owner:
+            query += " AND owner=?"
+            params.append(owner)
+        if state:
+            query += " AND state=?"
+            params.append(state)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = con.execute(query, params).fetchall()
+        return {"count": len(rows), "handoffs": [_handoff_metadata(row) for row in rows]}
+    finally:
+        con.close()
+
+
+def handoff_accept(args):
+    """Atomically claim one open handoff and return a bounded payload once."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    ref = (args.get("handoff_ref", args.get("ref")) or "").strip()
+    if not ref:
+        return {"error": "handoff_ref is required"}
+    actor, err = _lifecycle_field(
+        args.get("actor", args.get("accepted_by")), "actor",
+        _LIFECYCLE_MAX_FIELD_CHARS, required=True, redact=False)
+    if err:
+        return err
+    cwd, err = _lifecycle_field(args.get("cwd"), "cwd", _LIFECYCLE_MAX_PATH_CHARS,
+                                redact=False)
+    if err:
+        return err
+    max_chars, err = _context_limit(args.get("max_chars"), "max_chars",
+                                     _CONTEXT_DEFAULT_READ_CHARS,
+                                     _CONTEXT_MAX_READ_CHARS)
+    if err:
+        return err
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        con.execute("BEGIN IMMEDIATE")
+        _expire_handoffs(con, workspace)
+        row = _handoff_row(con, workspace, ref)
+        if not row:
+            con.rollback()
+            return {"error": "handoff not found or not in your workspace", "handoff_ref": ref}
+        if row["state"] != "open":
+            con.rollback()
+            return {"error": "handoff is not open", "state": row["state"],
+                    "handoff": _handoff_metadata(row)}
+        if not row["shared"] and row["owner"] != actor:
+            con.rollback()
+            return {"error": "handoff owner does not match actor"}
+        if row["cwd"] and (not cwd or cwd != row["cwd"]):
+            con.rollback()
+            return {"error": "handoff cwd does not match"}
+        context_row, row_err = _context_row(con, row["context_ref"], workspace)
+        if row_err:
+            con.execute("UPDATE handoffs SET state='expired' WHERE id=?", [row["id"]])
+            con.commit()
+            return {"error": "handoff has expired", "handoff_ref": ref}
+        if not context_row:
+            con.rollback()
+            return {"error": "handoff context not found or not in your workspace"}
+        accepted_at = now()
+        con.execute(
+            "UPDATE handoffs SET state='accepted', accepted_at=?, accepted_by=? WHERE id=?",
+            [accepted_at, actor, row["id"]])
+        con.commit()
+        row = _handoff_row(con, workspace, ref)
+        content = context_row["content"][:max_chars]
+        context = _context_metadata(context_row)
+        context.update({"content": content, "start": 0, "end": len(content),
+                        "total_chars": len(context_row["content"]),
+                        "truncated": len(content) < len(context_row["content"]),
+                        "next_start": len(content) if len(content) < len(context_row["content"])
+                        else None})
+        return {"accepted": True, "handoff": _handoff_metadata(row),
+                "context": context,
+                "lineage": _context_lineage(con, row["context_ref"], workspace)}
+    except sqlite3.DatabaseError as e:
+        con.rollback()
+        return {"error": f"handoff accept failed: {e}"}
+    finally:
+        con.close()
+
+
+def handoff_cancel(args):
+    """Cancel one open handoff; only its owner can consume this transition."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    ref = (args.get("handoff_ref", args.get("ref")) or "").strip()
+    if not ref:
+        return {"error": "handoff_ref is required"}
+    actor, err = _lifecycle_field(
+        args.get("actor", args.get("cancelled_by")), "actor",
+        _LIFECYCLE_MAX_FIELD_CHARS, required=True, redact=False)
+    if err:
+        return err
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        con.execute("BEGIN IMMEDIATE")
+        _expire_handoffs(con, workspace)
+        row = _handoff_row(con, workspace, ref)
+        if not row:
+            con.rollback()
+            return {"error": "handoff not found or not in your workspace", "handoff_ref": ref}
+        if row["state"] != "open":
+            con.rollback()
+            return {"error": "handoff is not open", "state": row["state"],
+                    "handoff": _handoff_metadata(row)}
+        if row["owner"] != actor:
+            con.rollback()
+            return {"error": "only the handoff owner may cancel it"}
+        cancelled_at = now()
+        con.execute(
+            "UPDATE handoffs SET state='cancelled', cancelled_at=?, cancelled_by=? WHERE id=?",
+            [cancelled_at, actor, row["id"]])
+        con.commit()
+        row = _handoff_row(con, workspace, ref)
+        return {"cancelled": True, "handoff": _handoff_metadata(row)}
+    except sqlite3.DatabaseError as e:
+        con.rollback()
+        return {"error": f"handoff cancel failed: {e}"}
+    finally:
+        con.close()
 
 
 def put_context(args):
@@ -2697,7 +3452,9 @@ def list_workspaces(args):
              "(SELECT COUNT(*) FROM relations r WHERE r.workspace_id=w.id) AS relations, "
              "(SELECT COUNT(*) FROM decisions d WHERE d.workspace_id=w.id) AS decisions, "
              "(SELECT COUNT(*) FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE f.workspace_id=w.id) AS evidence, "
-             "(SELECT COUNT(*) FROM contexts c WHERE c.workspace_id=w.id) AS contexts "
+             "(SELECT COUNT(*) FROM contexts c WHERE c.workspace_id=w.id) AS contexts, "
+             "(SELECT COUNT(*) FROM lifecycle_events le WHERE le.workspace_id=w.id) AS lifecycle_events, "
+             "(SELECT COUNT(*) FROM handoffs h WHERE h.workspace_id=w.id) AS handoffs "
              "FROM workspaces w")
         params = []
         if status:
@@ -2735,6 +3492,10 @@ def _purge_workspace_rows(con, name):
     counts["facts"] = cur.rowcount
     cur = con.execute("DELETE FROM categories WHERE workspace_id=?", [name])
     counts["categories"] = cur.rowcount
+    cur = con.execute("DELETE FROM handoffs WHERE workspace_id=?", [name])
+    counts["handoffs"] = cur.rowcount
+    cur = con.execute("DELETE FROM lifecycle_events WHERE workspace_id=?", [name])
+    counts["lifecycle_events"] = cur.rowcount
     cur = con.execute("DELETE FROM context_lineage WHERE workspace_id=?", [name])
     counts["context_lineage"] = cur.rowcount
     cur = con.execute("DELETE FROM contexts WHERE workspace_id=?", [name])
@@ -2842,11 +3603,22 @@ def backup_workspace(args):
         context_lineage = [dict(r) for r in con.execute(
             "SELECT parent_ref, child_ref, relation, workspace_id, created_at "
             "FROM context_lineage WHERE workspace_id=? ORDER BY id", [name])]
+        lifecycle_events = [dict(r) for r in con.execute(
+            "SELECT idempotency_key, event_kind, event_id, session_id, source, cwd, path, "
+            "tool_name, context_ref, workspace_id, sha256, payload_bytes, "
+            "payload_truncated, created_at FROM lifecycle_events "
+            "WHERE workspace_id=? ORDER BY id", [name])]
+        handoffs = [dict(r) for r in con.execute(
+            "SELECT ref, context_ref, owner, session_id, cwd, source, sha256, workspace_id, "
+            "shared, state, idempotency_key, created_at, expires_at, accepted_at, "
+            "accepted_by, cancelled_at, cancelled_by FROM handoffs "
+            "WHERE workspace_id=? ORDER BY id", [name])]
     finally:
         con.close()
     counts = {"facts": len(facts), "entities": len(entities), "relations": len(relations),
               "decisions": len(decisions), "evidence": len(evidence),
-              "contexts": len(contexts), "context_lineage": len(context_lineage)}
+              "contexts": len(contexts), "context_lineage": len(context_lineage),
+              "lifecycle_events": len(lifecycle_events), "handoffs": len(handoffs)}
     if sum(counts.values()) == 0:
         return {"error": f"workspace {name} has no data"}
     dest = os.path.join(_backup_dir(), f"workspace-{name}-{_ts_stamp()}.json")
@@ -2855,7 +3627,8 @@ def backup_workspace(args):
             json.dump({"workspace": name, "exported_at": now(), "counts": counts,
                        "facts": facts, "entities": entities, "relations": relations,
                        "decisions": decisions, "evidence": evidence,
-                       "contexts": contexts, "context_lineage": context_lineage},
+                       "contexts": contexts, "context_lineage": context_lineage,
+                       "lifecycle_events": lifecycle_events, "handoffs": handoffs},
                       f, ensure_ascii=False, indent=2)
     except OSError as e:
         # No host paths in client-visible errors (repo rule).
@@ -2981,6 +3754,113 @@ TOOLS = {
                 "workspace": {"type": "string", "description": "Required project/run access scope"},
             },
             "required": ["name", "refs", "workspace"],
+        },
+    },
+    "capture_event": {
+        "description": "Capture one sanitized, bounded lifecycle envelope in the exact workspace. Idempotency is required; payloads are stored behind a context ref.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "idempotency_key": {"type": "string", "maxLength": 256},
+                "event_id": {"type": "string", "maxLength": 256},
+                "event_kind": {"type": "string", "maxLength": 64},
+                "session_id": {"type": "string", "maxLength": 256},
+                "source": {"type": "string", "maxLength": 256},
+                "cwd": {"type": "string", "maxLength": 1024},
+                "path": {"type": "string", "maxLength": 1024},
+                "tool_name": {"type": "string", "maxLength": 256},
+                "payload": {"description": "JSON value or text; secrets are redacted and the payload is byte-bounded"},
+                "content": {"type": "string", "description": "Alias for a text payload"},
+                "exclude_paths": {"type": "array", "items": {"type": "string"}, "maxItems": 32},
+                "capture": {"type": "boolean", "default": True},
+                "workspace": {"type": "string", "description": "Required exact project/run access scope"},
+            },
+            "required": ["idempotency_key", "event_kind", "workspace"],
+            "anyOf": [{"required": ["payload"]}, {"required": ["content"]}],
+        },
+    },
+    "list_events": {
+        "description": "List lifecycle event metadata only. Payloads require read_event and are bounded by the server.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "maxLength": 256},
+                "event_kind": {"type": "string", "maxLength": 64},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+                "workspace": {"type": "string", "description": "Required exact project/run access scope"},
+            },
+            "required": ["workspace"],
+        },
+    },
+    "read_event": {
+        "description": "Read one bounded sanitized lifecycle envelope by event_ref or idempotency key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "event_ref": {"type": "string"},
+                "max_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "default": 4000},
+                "workspace": {"type": "string", "description": "Required exact project/run access scope"},
+            },
+            "required": ["event_ref", "workspace"],
+        },
+    },
+    "handoff_begin": {
+        "description": "Create an expiring typed handoff over one immutable context. Owner and exact workspace are mandatory; checksum and optional idempotency are retained.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "content": {"type": "string", "description": "Bounded handoff payload; treated as data"},
+                "owner": {"type": "string", "maxLength": 256},
+                "session_id": {"type": "string", "maxLength": 256},
+                "cwd": {"type": "string", "maxLength": 1024},
+                "source": {"type": "string", "maxLength": 256},
+                "checksum": {"type": "string", "description": "Optional SHA-256 checksum for content"},
+                "ttl_seconds": {"type": "integer", "minimum": 0, "default": 86400},
+                "shared": {"type": "boolean", "default": False},
+                "idempotency_key": {"type": "string", "maxLength": 256},
+                "workspace": {"type": "string", "description": "Required exact project/run access scope"},
+            },
+            "required": ["content", "owner", "workspace"],
+        },
+    },
+    "list_handoffs": {
+        "description": "List typed handoff metadata in one exact workspace; expired open rows are transitioned to expired before readback.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string", "maxLength": 256},
+                "state": {"type": "string", "enum": ["open", "accepted", "cancelled", "expired"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+                "workspace": {"type": "string", "description": "Required exact project/run access scope"},
+            },
+            "required": ["workspace"],
+        },
+    },
+    "handoff_accept": {
+        "description": "Atomically accept one open handoff once and return one bounded payload slice. Owner/shared, exact workspace, optional cwd, and safe expiry are enforced.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "handoff_ref": {"type": "string"},
+                "actor": {"type": "string", "maxLength": 256},
+                "cwd": {"type": "string", "maxLength": 1024},
+                "max_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "default": 4000},
+                "workspace": {"type": "string", "description": "Required exact project/run access scope"},
+            },
+            "required": ["handoff_ref", "actor", "workspace"],
+        },
+    },
+    "handoff_cancel": {
+        "description": "Cancel one open handoff exactly once. Only the owner may cancel it; accepted/cancelled/expired rows remain auditable.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "handoff_ref": {"type": "string"},
+                "actor": {"type": "string", "maxLength": 256},
+                "workspace": {"type": "string", "description": "Required exact project/run access scope"},
+            },
+            "required": ["handoff_ref", "actor", "workspace"],
         },
     },
     "search_facts": {
@@ -3472,6 +4352,13 @@ HANDLERS = {
     "search_context": search_context,
     "chunk_context": chunk_context,
     "reduce_context": reduce_context,
+    "capture_event": capture_event,
+    "list_events": list_events,
+    "read_event": read_event,
+    "handoff_begin": handoff_begin,
+    "list_handoffs": list_handoffs,
+    "handoff_accept": handoff_accept,
+    "handoff_cancel": handoff_cancel,
     "search_facts": search_facts,
     "search_semantic": search_semantic,
     "embed_backfill": embed_backfill,
@@ -3539,7 +4426,7 @@ def main():
                 "result": {
                     "protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "memory-mcp", "version": "0.3.0"},
+                    "serverInfo": {"name": "memory-mcp", "version": "0.13.0"},
                 },
             }
         elif msg.get("method") == "tools/list":
