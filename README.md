@@ -32,6 +32,11 @@ pipeline into the server for runtimes that have no client patches.
 - `search_context {query, workspace, limit?}` — search context metadata and payloads, returning metadata only
 - `chunk_context {ref, workspace, chunk_chars?, start_chunk?, max_chunks?}` — read a bounded page of numbered chunks
 - `reduce_context {name, refs, workspace, separator?, schema?, source?, checksum?, ttl_seconds?}` — create a derived ref by deterministic concatenation
+- `capture_event {idempotency_key, event_kind, payload, workspace, session_id?, source?, path?, exclude_paths?}` — sanitize and capture one bounded lifecycle envelope; returns stable refs and deduplicates retries
+- `list_events {workspace, session_id?, event_kind?, limit?}` / `read_event {event_ref, workspace, max_chars?}` — inspect event metadata and read one bounded payload slice
+- `handoff_begin {content, owner, workspace, source?, checksum?, ttl_seconds?, cwd?, shared?, idempotency_key?}` — create an expiring typed handoff over immutable context
+- `list_handoffs {workspace, owner?, state?, limit?}` — list open and terminal handoff metadata; expired rows are marked safely
+- `handoff_accept {handoff_ref, actor, workspace, cwd?, max_chars?}` / `handoff_cancel {handoff_ref, actor, workspace}` — one-shot owner-scoped accept or cancel transitions
 
 ### v0.6 — database & workspace management (2026-08-17)
 
@@ -63,18 +68,22 @@ it create/reset/archive/backup semantics.
 - `create_workspace {workspace}` — register a workspace (idempotent;
   re-registering reactivates an archived/reset workspace)
 - `list_workspaces {status?}` — registry rows with full data counts
-  (active_facts, facts, entities, relations, decisions, evidence, contexts)
+  (active_facts, facts, entities, relations, decisions, evidence, contexts,
+  lifecycle_events, handoffs)
 - `reset_workspace {workspace, hard?, confirm?}` — soft (default): hide all
   its data (facts get `archived=1`; graph/decisions/evidence become
   unreadable and unwritable), status='reset'; `hard:true` purges facts,
-  evidence, graph and decisions permanently (requires `confirm:true`;
+  evidence, graph, decisions, lifecycle events, handoffs, and contexts
+  permanently (requires `confirm:true`;
   response reports per-table deleted counts)
 - `archive_workspace {workspace, hard?, confirm?}` — soft (default): hide all
   its data, status='archived'; `hard:true` purges facts, evidence, graph and
-  decisions permanently (requires `confirm:true`; per-table deleted counts)
+  decisions, lifecycle events, handoffs, and contexts permanently (requires
+  `confirm:true`; per-table deleted counts)
 - `backup_workspace {workspace}` — JSON export of ALL workspace data (facts
-  incl. archived, entities, relations, decisions, evidence, contexts) with per-table
-  counts to `backups/workspace-<name>-<ts>.json`
+  incl. archived, entities, relations, decisions, evidence, contexts, lifecycle
+  events, and handoffs) with per-table counts to
+  `backups/workspace-<name>-<ts>.json`
 
 ### v0.7 — automatic decay (2026-08-17)
 
@@ -208,6 +217,39 @@ characters and are capped at 16000; override these operational limits with
   records all source refs as lineage, and enforces the normal storage cap. It
   is deterministic concatenation, not semantic model summarization.
 
+### v0.13 — bounded lifecycle capture and typed handoffs
+
+Lifecycle capture and handoffs are additive SQLite seams over the immutable
+context store. They do not import transcripts, call a remote server, or use an
+LLM to rewrite memory.
+
+- `capture_event` requires an opaque `idempotency_key`, an `event_kind`, an
+  exact `workspace`, and a text/JSON `payload`. The server stores a versioned
+  envelope behind a `ctx_...` ref, redacts common bearer/API-key/private-key
+  forms, and caps the sanitized payload at 64 KiB. A retry with the same key
+  and identical envelope is a no-op; a different envelope under that key is
+  rejected.
+- Capture can be disabled per event (`capture:false`) or excluded by path with
+  `exclude_paths`. `.env`, credential/key/certificate files, and SSH private
+  key names are excluded by default. `list_events` is metadata-only; use
+  `read_event` for a bounded payload slice. The per-workspace spool keeps the
+  newest `MEMORY_MCP_LIFECYCLE_MAX_EVENTS` rows (default 1000).
+- `handoff_begin` records owner, exact workspace, source, checksum, optional
+  session/cwd, and a bounded TTL (default 24 hours, maximum 7 days). The
+  payload remains immutable context data. `handoff_accept` is an atomic
+  one-shot transition: private handoffs require the exact owner (shared ones
+  accept any actor), and a stored cwd must match. `handoff_cancel` is owner-only.
+  Expiry transitions open rows to `expired`; terminal rows remain auditable.
+- Workspace isolation applies to every event and handoff operation. Hard
+  workspace cleanup removes their rows and backup JSON includes both tables.
+  No new runtime dependency is required: the implementation uses Python's
+  standard library, SQLite, and the existing context APIs.
+
+The full request/response contract and threat notes are in
+[`docs/lifecycle-and-handoffs.md`](docs/lifecycle-and-handoffs.md). The
+architecture record is
+[`docs/decisions/ADR-0001-lifecycle-capture-and-typed-handoffs.md`](docs/decisions/ADR-0001-lifecycle-capture-and-typed-handoffs.md).
+
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
 Covers decision rationale, precedent search and evidence lineage with zero
@@ -263,6 +305,15 @@ v0.11 additions (additive — existing stores create these tables on open):
 - `context_lineage(parent_ref → contexts, child_ref → contexts, relation,
   workspace_id, created_at)`
 
+v0.13 additions (additive — existing stores create these tables on open):
+
+- `lifecycle_events(workspace_id, idempotency_key, event_kind, event_id,
+  context_ref → contexts, sha256, payload_bytes, created_at)` with a unique
+  `(workspace_id, idempotency_key)` and bounded retention.
+- `handoffs(ref, context_ref → contexts, owner, session_id, cwd, source,
+  sha256, workspace_id, state, expires_at, accepted_at, cancelled_at)` with
+  one-shot state transitions and workspace-scoped optional idempotency.
+
 ## Environment
 
 - `MEMORY_MCP_DB` — SQLite path. Default is **script-relative**: `<repo>/data/facts.db`
@@ -282,6 +333,15 @@ v0.11 additions (additive — existing stores create these tables on open):
   `chunk_context` request (default 32).
 - `MEMORY_MCP_CONTEXT_MAX_CHUNK_RESPONSE_CHARS` — aggregate character cap for
   one `chunk_context` response (default 65536).
+- `MEMORY_MCP_LIFECYCLE_MAX_EVENTS` — newest lifecycle events retained per
+  workspace (default 1000).
+- `MEMORY_MCP_LIFECYCLE_MAX_PAYLOAD_BYTES` — sanitized event payload cap
+  (default 65536).
+- `MEMORY_MCP_LIFECYCLE_MAX_FIELD_CHARS` / `_MAX_PATH_CHARS` — metadata field
+  caps (defaults 256 / 1024).
+- `MEMORY_MCP_HANDOFF_DEFAULT_TTL` / `_MAX_TTL` — handoff TTL defaults and
+  hard maximum in seconds (defaults 86400 / 604800).
+- `MEMORY_MCP_HANDOFF_MAX_CONTENT_BYTES` — handoff payload cap (default 262144).
 - Journal mode WAL, busy_timeout 5000 (multi-writer: host + containers).
 
 ## Integration
