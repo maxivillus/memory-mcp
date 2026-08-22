@@ -4,7 +4,7 @@ Each test uses unique data against a temp DB (MEMORY_MCP_DB). The module reads
 that env var at import time, so the import happens in setUpModule AFTER the
 temp path is set.
 
-Run:  python3 -m unittest discover -s tests -v
+Run:  MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -v
 """
 
 import importlib

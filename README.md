@@ -19,7 +19,7 @@ pipeline into the server for runtimes that have no client patches.
   ingestion with `new` / `duplicate` / `related` classification. Preview is
   the default; `commit:true` only writes `new` items and leaves related,
   update, and contradiction candidates for review.
-- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?}` —
+- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?, chunk_chars?}` —
   FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors.
   `chunk_chars?` optionally adds bounded, offset-addressable chunks to hits.
 - `chunk_fact {id | fact_id | sha256, workspace?, chunk_chars?, chunk_overlap?, start_chunk?, max_chunks?}` — read one active fact through a bounded page API
@@ -47,7 +47,9 @@ pipeline into the server for runtimes that have no client patches.
 `attach_evidence` accepts optional code-local fields (`repo`, `ref`, `path`,
 `symbol`, line/column range, `selected_text` or its SHA-256, and
 `resolution_status`). `get_provenance` and `backup_workspace` retain these
-anchors. Raw `selected_text` is never stored; only its SHA-256 is kept.
+anchors. Raw `selected_text` is never stored; only its SHA-256 is kept. The
+complete v0.16 ingestion and provenance flow is documented in
+[`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md).
 
 ### v0.6 — database & workspace management (2026-08-17)
 
@@ -281,12 +283,17 @@ extracted candidate memories:
   selected-text hash, with `resolved`, `stale`, or `unresolved` status.
 
 The repository deliberately does not bundle a UI, cloud sync, or a separate
-code graph into this stdlib core; those remain separate integration surfaces.
+code graph into this stdlib core. No external product is required for the
+v0.16 local path; existing provider-backed modules remain opt-in.
 
 The full request/response contract and threat notes are in
+[`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md).
+Lifecycle events and typed handoffs remain documented in
 [`docs/lifecycle-and-handoffs.md`](docs/lifecycle-and-handoffs.md). The
-architecture record is
-[`docs/decisions/ADR-0001-lifecycle-capture-and-typed-handoffs.md`](docs/decisions/ADR-0001-lifecycle-capture-and-typed-handoffs.md).
+architecture records are
+[`docs/decisions/ADR-0001-lifecycle-capture-and-typed-handoffs.md`](docs/decisions/ADR-0001-lifecycle-capture-and-typed-handoffs.md)
+and
+[`docs/decisions/ADR-0002-local-ingestion-and-code-provenance.md`](docs/decisions/ADR-0002-local-ingestion-and-code-provenance.md).
 
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
