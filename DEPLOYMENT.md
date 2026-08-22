@@ -9,6 +9,13 @@ and writes the same fact store.
 This guide uses a **codex-style runtime container** as the example; the same
 pattern applies to any runtime that can spawn a process.
 
+The v0.16 ingestion, bounded fact retrieval, and code-local provenance paths
+run inside the existing local SQLite-backed server. They do not require a UI,
+cloud service, separate code graph, or another external product. The detailed
+request flow is in `docs/ingestion-and-provenance.md`; the optional runtime
+adapters below describe pre-existing deployment choices and are not required
+for the local-only path.
+
 ## 1. Compose service
 
 ```yaml
@@ -111,7 +118,7 @@ env = { MEMORY_MCP_DB = "/opt/memory-shared/facts.db" }
 
 ```sh
 cd <repo>
-python3 -m unittest discover -s tests -v
+MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -v
 ```
 
 Zero external dependencies (stdlib only).
