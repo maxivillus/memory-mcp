@@ -5183,7 +5183,7 @@ def main():
                 "result": {
                     "protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "memory-mcp", "version": "0.13.0"},
+                    "serverInfo": {"name": "memory-mcp", "version": "0.16.0"},
                 },
             }
         elif msg.get("method") == "tools/list":
