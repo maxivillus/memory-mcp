@@ -149,6 +149,90 @@ class MemoryMCPTest(unittest.TestCase):
         self.assertNotIn("error", prov, prov)
         self.assertTrue(any(e["source_ref"] == "issue/123" for e in prov["evidence"]))
 
+    def test_structured_code_evidence_anchor_roundtrip(self):
+        res = self.remember("structured anchor fact about the worker retry path")
+        evidence = mcp.attach_evidence({
+            "fact_id": res["id"],
+            "source_ref": "repo@abc123:src/worker.py",
+            "repo": "https://github.com/example/worker",
+            "ref": "abc123",
+            "path": "src/worker.py",
+            "symbol": "Worker.retry",
+            "start_line": 42,
+            "start_col": 4,
+            "end_line": 48,
+            "end_col": 16,
+            "selected_text": "return retry(task)",
+            "resolution_status": "resolved",
+        })
+        self.assertNotIn("error", evidence, evidence)
+        prov = mcp.get_provenance({"fact_id": res["id"]})
+        self.assertNotIn("error", prov, prov)
+        anchor = [e for e in prov["evidence"]
+                   if e["source_ref"] == "repo@abc123:src/worker.py"][0]
+        self.assertEqual(anchor["repo"], "https://github.com/example/worker")
+        self.assertEqual(anchor["path"], "src/worker.py")
+        self.assertEqual(anchor["symbol"], "Worker.retry")
+        self.assertEqual(anchor["start_line"], 42)
+        self.assertEqual(anchor["resolution_status"], "resolved")
+        self.assertEqual(len(anchor["selected_text_hash"]), 64)
+
+    def test_absorb_preview_commit_and_review_classification(self):
+        workspace = "absorb-roundtrip"
+        existing = mcp.remember_fact({
+            "text": "absorb existing fact says the worker retries failed jobs",
+            "source": "issue/absorb",
+            "workspace": workspace,
+        })
+        self.assertNotIn("error", existing, existing)
+        candidates = [
+            {"text": "absorb new fact says the worker stores retry counters",
+             "source": "repo@abc123:src/worker.py",
+             "evidence": {"repo": "repo", "ref": "abc123",
+                          "path": "src/worker.py", "start_line": 10,
+                          "end_line": 12}},
+            "absorb existing fact says the worker retries failed jobs",
+            "absorb related fact says the worker retries failed jobs with backoff",
+        ]
+        preview = mcp.absorb({"facts": candidates, "workspace": workspace})
+        self.assertNotIn("error", preview, preview)
+        self.assertTrue(preview["dry_run"])
+        self.assertFalse(preview["committed"])
+        self.assertEqual([i["classification"] for i in preview["items"]],
+                         ["new", "duplicate", "related"])
+        self.assertEqual(mcp.search_facts({"query": "stores retry counters",
+                                           "workspace": workspace})["count"], 0)
+
+        committed = mcp.absorb({"facts": candidates, "workspace": workspace,
+                                "commit": True})
+        self.assertNotIn("error", committed, committed)
+        self.assertTrue(committed["committed"])
+        self.assertEqual(committed["created"], 1)
+        self.assertEqual(committed["deduped"], 1)
+        self.assertEqual(committed["pending_review"], 1)
+        new_id = [i["id"] for i in committed["items"] if i["classification"] == "new"][0]
+        prov = mcp.get_provenance({"fact_id": new_id, "workspace": workspace})
+        self.assertEqual(prov["evidence"][0]["path"], "src/worker.py")
+        self.assertEqual(mcp.search_facts({"query": "backoff", "workspace": workspace})["count"], 0)
+
+    def test_fact_chunking_is_bounded_and_offset_addressable(self):
+        text = "chunked fact alpha beta gamma delta epsilon zeta eta theta"
+        fact = self.remember(text, workspace="fact-chunks")
+        page = mcp.chunk_fact({"id": fact["id"], "workspace": "fact-chunks",
+                               "chunk_chars": 16, "chunk_overlap": 3,
+                               "max_chunks": 2})
+        self.assertNotIn("error", page, page)
+        self.assertEqual(page["fact"]["text_length"], len(text))
+        self.assertEqual(len(page["chunks"]), 2)
+        self.assertEqual(page["chunks"][0]["start"], 0)
+        self.assertEqual(page["chunks"][0]["end"], page["chunks"][1]["start"] + 3)
+        self.assertIsNotNone(page["next_chunk"])
+        searched = mcp.search_facts({"query": "chunked alpha", "workspace": "fact-chunks",
+                                     "chunk_chars": 12})
+        self.assertNotIn("error", searched, searched)
+        self.assertTrue(searched["facts"][0]["chunks"])
+        self.assertLessEqual(len(str(searched)), 64 * 1024 * 2)
+
     # ---- conflicts ----
 
     def test_detect_conflicts(self):
@@ -1869,6 +1953,16 @@ INSERT INTO decisions (scenario, workspace_id, created_at, updated_at) VALUES ('
         try:
             os.environ["MEMORY_MCP_DB"] = db
             mcp.DB_PATH = db
+            con = mcp.get_db()
+            columns = {row["name"] for row in con.execute("PRAGMA table_info(evidence)")}
+            self.assertIn("repo", columns)
+            old_evidence = con.execute(
+                "SELECT source_ref, repo, resolution_status FROM evidence WHERE fact_id=1"
+            ).fetchone()
+            self.assertEqual(old_evidence["source_ref"], "old://ref")
+            self.assertEqual(old_evidence["repo"], "")
+            self.assertEqual(old_evidence["resolution_status"], "")
+            con.close()
             r = mcp.reset_workspace({"workspace": "ws-old", "hard": True, "confirm": True})
             self.assertNotIn("error", r, r)
             con = mcp.get_db()
