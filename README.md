@@ -15,8 +15,14 @@ pipeline into the server for runtimes that have no client patches.
   upsert (dedup by sha256 of text). Category auto-assigned at write time
   (explicit `category` > legacy `domain` > keyword rules > uncategorized).
   `add_fact` is an alias for the same operation.
-- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?}` —
-  FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors
+- `absorb {facts, workspace?, dry_run?, commit?, verify?}` — bounded batch
+  ingestion with `new` / `duplicate` / `related` classification. Preview is
+  the default; `commit:true` only writes `new` items and leaves related,
+  update, and contradiction candidates for review.
+- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?, chunk_chars?}` —
+  FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors.
+  `chunk_chars?` optionally adds bounded, offset-addressable chunks to hits.
+- `chunk_fact {id | fact_id | sha256, workspace?, chunk_chars?, chunk_overlap?, start_chunk?, max_chunks?}` — read one active fact through a bounded page API
 - `list_facts {project?, domain?, category?, limit?}` — recent non-archived facts
 - `summarize_index {project?, domain?, category?, trust_min?, strong_only?, limit?, max_chars?}` —
   compact one-line-per-fact index (`#id trust! [category] [domain] text`), freshest first,
@@ -37,6 +43,13 @@ pipeline into the server for runtimes that have no client patches.
 - `handoff_begin {content, owner, workspace, source?, checksum?, ttl_seconds?, cwd?, shared?, idempotency_key?}` — create an expiring typed handoff over immutable context
 - `list_handoffs {workspace, owner?, state?, limit?}` — list open and terminal handoff metadata; expired rows are marked safely
 - `handoff_accept {handoff_ref, actor, workspace, cwd?, max_chars?}` / `handoff_cancel {handoff_ref, actor, workspace}` — one-shot owner-scoped accept or cancel transitions
+
+`attach_evidence` accepts optional code-local fields (`repo`, `ref`, `path`,
+`symbol`, line/column range, `selected_text` or its SHA-256, and
+`resolution_status`). `get_provenance` and `backup_workspace` retain these
+anchors. Raw `selected_text` is never stored; only its SHA-256 is kept. The
+complete v0.16 ingestion and provenance flow is documented in
+[`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md).
 
 ### v0.6 — database & workspace management (2026-08-17)
 
@@ -246,10 +259,41 @@ LLM to rewrite memory.
   No new runtime dependency is required: the implementation uses Python's
   standard library, SQLite, and the existing context APIs.
 
+### v0.16 — absorb, bounded fact retrieval, and code-local provenance (2026-08-22)
+
+The core now supports a safe ingestion boundary for clients that have already
+extracted candidate memories:
+
+- `absorb` is a dry-run planner by default. Exact SHA-256 matches are
+  `duplicate`; lexical term coverage of at least 0.6 is `related`; remaining
+  candidates are `new`. Optional `verify:true` (only with
+  `MEMORY_MCP_VERIFY=1`) adds the existing verifier's `update`,
+  `supersedes`, and `conflict` signals. No LLM result automatically rewrites
+  or invalidates an existing fact.
+- `commit:true` is explicit and idempotent at the fact layer. It writes only
+  `new` candidates, reuses normal workspace/category/dedup rules, and attaches
+  supplied evidence. Duplicate evidence rows are ignored by
+  `(fact_id, source_ref)`.
+- `chunk_fact` and `search_facts {chunk_chars}` provide bounded chunks with
+  character offsets, optional overlap, pagination, and a 64 KiB aggregate
+  chunk budget. This keeps retrieval usable for long facts without changing
+  BM25 or semantic ranking.
+- Evidence anchors are additive and migration-safe. A code-local record can
+  point to a repository, immutable ref, path, symbol, line/column range, and
+  selected-text hash, with `resolved`, `stale`, or `unresolved` status.
+
+The repository deliberately does not bundle a UI, cloud sync, or a separate
+code graph into this stdlib core. No external product is required for the
+v0.16 local path; existing provider-backed modules remain opt-in.
+
 The full request/response contract and threat notes are in
+[`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md).
+Lifecycle events and typed handoffs remain documented in
 [`docs/lifecycle-and-handoffs.md`](docs/lifecycle-and-handoffs.md). The
-architecture record is
-[`docs/decisions/ADR-0001-lifecycle-capture-and-typed-handoffs.md`](docs/decisions/ADR-0001-lifecycle-capture-and-typed-handoffs.md).
+architecture records are
+[`docs/decisions/ADR-0001-lifecycle-capture-and-typed-handoffs.md`](docs/decisions/ADR-0001-lifecycle-capture-and-typed-handoffs.md)
+and
+[`docs/decisions/ADR-0002-local-ingestion-and-code-provenance.md`](docs/decisions/ADR-0002-local-ingestion-and-code-provenance.md).
 
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
@@ -446,7 +490,8 @@ pipeline modules below move each of them into the server when enabled:
   similarity, and BM25 ranks partially matching decisions.
 - **Near-duplicate handling** — writes dedup on exact text (sha256).
   Paraphrased facts stay separate records; `detect_conflicts` surfaces
-  near-duplicates (term coverage ≥ 0.6) on demand.
+  near-duplicates (term coverage ≥ 0.6) on demand, while `absorb` exposes the
+  same signal during a dry-run and never auto-merges it.
 
 
 ## Server-side pipeline (optional modules)

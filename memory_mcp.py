@@ -42,7 +42,9 @@ Tools:
   find_precedents {scenario, category?, limit?}
   get_causal_chain {decision_id}
   get_provenance {fact_id | sha256}
-  attach_evidence {fact_id, source_ref, source_checksum?, fetched_at?}
+  attach_evidence {fact_id, source_ref, source_checksum?, fetched_at?, repo?, ref?, path?, symbol?, line range?}
+  chunk_fact {id | sha256, workspace?, chunk_chars?, start_chunk?, max_chunks?, chunk_overlap?}
+  absorb {facts, workspace?, dry_run?, commit?, verify?}
   detect_conflicts {text}
 """
 import fnmatch, hashlib, json, os, re, sqlite3, sys
@@ -84,6 +86,18 @@ _CONTEXT_MAX_CHUNK_RESPONSE_CHARS = _env_int(
     "MEMORY_MCP_CONTEXT_MAX_CHUNK_RESPONSE_CHARS", 64 * 1024, 1)
 _CONTEXT_MAX_REDUCE_REFS = 64
 _CONTEXT_MAX_SEARCH_QUERY = 256
+
+# Fact retrieval uses the same bounded delivery contract as context artifacts,
+# but keeps its own knobs so a large fact cannot turn a search response into an
+# unbounded prompt payload.
+_FACT_DEFAULT_CHUNK_CHARS = _env_int("MEMORY_MCP_FACT_CHUNK_CHARS", 4000, 1)
+_FACT_MAX_CHUNK_CHARS = _env_int("MEMORY_MCP_FACT_MAX_CHUNK_CHARS", 16000, 1)
+_FACT_MAX_CHUNKS = _env_int("MEMORY_MCP_FACT_MAX_CHUNKS", 32, 1)
+_FACT_MAX_CHUNK_RESPONSE_CHARS = _env_int(
+    "MEMORY_MCP_FACT_MAX_CHUNK_RESPONSE_CHARS", 64 * 1024, 1)
+_ABSORB_MAX_FACTS = _env_int("MEMORY_MCP_ABSORB_MAX_FACTS", 50, 1)
+_ABSORB_MAX_TEXT_CHARS = _env_int("MEMORY_MCP_ABSORB_MAX_TEXT_CHARS", 16000, 1)
+_EVIDENCE_MAX_FIELD_CHARS = _env_int("MEMORY_MCP_EVIDENCE_MAX_FIELD_CHARS", 2048, 1)
 
 # v0.13 lifecycle capture and typed handoffs. These limits keep the local
 # event spool useful between short runtime sessions without turning it into an
@@ -176,6 +190,23 @@ _FACT_EXTRA_COLUMNS = {
     "invalid_at": "TEXT NOT NULL DEFAULT ''",
     "superseded_by": "INTEGER",
     "confirmed": "INTEGER NOT NULL DEFAULT 0",
+}
+
+# v0.16 structured code-local provenance. These columns are additive so an
+# existing evidence table can be upgraded without losing its old source_ref
+# rows. The empty resolution status means that an evidence row is a plain
+# source link rather than a code anchor.
+_EVIDENCE_EXTRA_COLUMNS = {
+    "repo": "TEXT NOT NULL DEFAULT ''",
+    "ref": "TEXT NOT NULL DEFAULT ''",
+    "path": "TEXT NOT NULL DEFAULT ''",
+    "symbol": "TEXT NOT NULL DEFAULT ''",
+    "start_line": "INTEGER",
+    "start_col": "INTEGER",
+    "end_line": "INTEGER",
+    "end_col": "INTEGER",
+    "selected_text_hash": "TEXT NOT NULL DEFAULT ''",
+    "resolution_status": "TEXT NOT NULL DEFAULT ''",
 }
 
 _SCHEMA = """
@@ -287,6 +318,16 @@ CREATE TABLE IF NOT EXISTS evidence (
   source_ref TEXT NOT NULL,
   source_checksum TEXT NOT NULL DEFAULT '',
   fetched_at TEXT NOT NULL DEFAULT '',
+  repo TEXT NOT NULL DEFAULT '',
+  ref TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  symbol TEXT NOT NULL DEFAULT '',
+  start_line INTEGER,
+  start_col INTEGER,
+  end_line INTEGER,
+  end_col INTEGER,
+  selected_text_hash TEXT NOT NULL DEFAULT '',
+  resolution_status TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   UNIQUE(fact_id, source_ref)
 );
@@ -467,6 +508,7 @@ def _open_db(path):
     _migrate_facts(con)
     _migrate_entities(con)
     _migrate_fks(con)
+    _migrate_evidence(con)
     _migrate_fts(con, preexisting_fts)
     _migrate_categories(con)
     return con
@@ -596,6 +638,16 @@ def _migrate_fks(con):
         return bool(row and row["sql"] and needle in row["sql"])
 
     if not _has_cascade("evidence", "ON DELETE CASCADE"):
+        # Preserve any anchor columns that may already exist on a partially
+        # migrated store. Older stores have only the six base columns; the
+        # additive migration below fills in the rest after the FK rebuild.
+        evidence_columns = ["id", "fact_id", "source_ref", "source_checksum",
+                            "fetched_at"] + list(_EVIDENCE_EXTRA_COLUMNS) + ["created_at"]
+        existing = {r["name"] for r in con.execute("PRAGMA table_info(evidence)")}
+        copied = [column for column in evidence_columns if column in existing]
+        copy_sql = ", ".join(copied)
+        extra_ddl = "".join("  %s %s,\n" % item
+                             for item in _EVIDENCE_EXTRA_COLUMNS.items())
         con.executescript(
             "PRAGMA foreign_keys=OFF;\n"
             "BEGIN;\n"
@@ -605,11 +657,12 @@ def _migrate_fks(con):
             "  source_ref TEXT NOT NULL,\n"
             "  source_checksum TEXT NOT NULL DEFAULT '',\n"
             "  fetched_at TEXT NOT NULL DEFAULT '',\n"
+            + extra_ddl +
             "  created_at TEXT NOT NULL,\n"
             "  UNIQUE(fact_id, source_ref)\n"
             ");\n"
-            "INSERT INTO evidence_new (id, fact_id, source_ref, source_checksum, fetched_at, created_at)\n"
-            "  SELECT id, fact_id, source_ref, source_checksum, fetched_at, created_at FROM evidence;\n"
+            "INSERT INTO evidence_new (%s) SELECT %s FROM evidence;\n" %
+            (copy_sql, copy_sql) +
             "DROP TABLE evidence;\n"
             "ALTER TABLE evidence_new RENAME TO evidence;\n"
             "CREATE INDEX IF NOT EXISTS evidence_fact_idx ON evidence(fact_id);\n"
@@ -637,6 +690,15 @@ def _migrate_fks(con):
             "CREATE INDEX IF NOT EXISTS relations_object_idx ON relations(object_id);\n"
             "COMMIT;\n"
             "PRAGMA foreign_keys=ON;\n")
+    con.commit()
+
+
+def _migrate_evidence(con):
+    """v0.16 additive migration for structured code-local evidence anchors."""
+    existing = {r["name"] for r in con.execute("PRAGMA table_info(evidence)")}
+    for name, decl in _EVIDENCE_EXTRA_COLUMNS.items():
+        if name not in existing:
+            con.execute("ALTER TABLE evidence ADD COLUMN %s %s" % (name, decl))
     con.commit()
 
 
@@ -1901,6 +1963,134 @@ def reduce_context(args):
     return result
 
 
+def _split_fact_text(text, chunk_chars, overlap=0):
+    """Split fact text into deterministic, offset-addressable chunks."""
+    if not text:
+        return []
+    step = chunk_chars - overlap
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_chars)
+        chunks.append({"index": len(chunks), "start": start, "end": end,
+                       "content": text[start:end]})
+        if end >= len(text):
+            break
+        start += step
+    return chunks
+
+
+def _fact_chunk_params(args):
+    """Validate bounded fact chunk pagination and return its parameters."""
+    chunk_chars, err = _context_limit(
+        args.get("chunk_chars"), "chunk_chars", _FACT_DEFAULT_CHUNK_CHARS,
+        _FACT_MAX_CHUNK_CHARS)
+    if err:
+        return None, err
+    start_chunk = args.get("start_chunk", 0)
+    if isinstance(start_chunk, bool):
+        return None, {"error": "start_chunk must be a non-negative integer"}
+    try:
+        start_chunk = int(start_chunk)
+    except (TypeError, ValueError):
+        return None, {"error": "start_chunk must be a non-negative integer"}
+    if start_chunk < 0:
+        return None, {"error": "start_chunk must be a non-negative integer"}
+    max_chunks, err = _context_limit(
+        args.get("max_chunks"), "max_chunks", 8, _FACT_MAX_CHUNKS)
+    if err:
+        return None, err
+    overlap = args.get("chunk_overlap", 0)
+    if isinstance(overlap, bool):
+        return None, {"error": "chunk_overlap must be a non-negative integer"}
+    try:
+        overlap = int(overlap)
+    except (TypeError, ValueError):
+        return None, {"error": "chunk_overlap must be a non-negative integer"}
+    if overlap < 0 or overlap >= chunk_chars:
+        return None, {"error": "chunk_overlap must be less than chunk_chars"}
+    # Keep the aggregate response bounded even at the largest legal page.
+    max_response_chunks = max(1, _FACT_MAX_CHUNK_RESPONSE_CHARS // chunk_chars)
+    return (chunk_chars, overlap, start_chunk, min(max_chunks, max_response_chunks)), None
+
+
+def _add_fact_chunks(rows, chunk_chars, overlap):
+    """Add a bounded chunk page to search rows without changing their rank."""
+    budget = _FACT_MAX_CHUNK_RESPONSE_CHARS
+    for row in rows:
+        all_chunks = _split_fact_text(row.get("text") or "", chunk_chars, overlap)
+        row["total_chunks"] = len(all_chunks)
+        row["chunks"] = []
+        for chunk in all_chunks:
+            chunk_size = len(chunk["content"].encode("utf-8"))
+            if chunk_size > budget:
+                row["chunks_truncated"] = True
+                break
+            row["chunks"].append(chunk)
+            budget -= chunk_size
+        if len(row["chunks"]) < len(all_chunks):
+            row["chunks_truncated"] = True
+    return rows
+
+
+def chunk_fact(args):
+    """Read a bounded, paginated chunk sequence from one active fact."""
+    if args.get("id") is None and args.get("fact_id") is None and not args.get("sha256"):
+        return {"error": "id, fact_id, or sha256 is required"}
+    params, err = _fact_chunk_params(args)
+    if err:
+        return err
+    chunk_chars, overlap, start_chunk, max_chunks = params
+    ws = _workspace(args)
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, ws)
+        if inactive:
+            return inactive
+        if args.get("id") is not None or args.get("fact_id") is not None:
+            fid = args.get("id") if args.get("id") is not None else args.get("fact_id")
+            if isinstance(fid, bool):
+                return {"error": "id must be an integer"}
+            try:
+                fid = int(fid)
+            except (TypeError, ValueError):
+                return {"error": "id must be an integer"}
+            row = con.execute(
+                "SELECT id, sha256, text, source, project, domain, trust, strong, "
+                "importance, confirmed, invalid_at, created_at, updated_at "
+                "FROM facts WHERE id=? AND archived=0 AND invalid_at='' "
+                "AND lifecycle='active'" + _ws_check("facts", ws),
+                [fid] + ([ws] if ws else [])).fetchone()
+        else:
+            row = con.execute(
+                "SELECT id, sha256, text, source, project, domain, trust, strong, "
+                "importance, confirmed, invalid_at, created_at, updated_at "
+                "FROM facts WHERE sha256=? AND archived=0 AND invalid_at='' "
+                "AND lifecycle='active'" + _ws_check("facts", ws),
+                [args["sha256"]] + ([ws] if ws else [])).fetchone()
+        if not row:
+            return {"error": "fact not found or not in your workspace"}
+        all_chunks = _split_fact_text(row["text"], chunk_chars, overlap)
+        total_chunks = len(all_chunks)
+        bounded_start = min(start_chunk, total_chunks)
+        end_chunk = min(total_chunks, bounded_start + max_chunks)
+        chunks = all_chunks[bounded_start:end_chunk]
+        fact = dict(row)
+        fact.pop("text", None)
+        fact["text_length"] = len(row["text"])
+        return {
+            "fact": fact,
+            "chunks": chunks,
+            "start_chunk": bounded_start,
+            "next_chunk": end_chunk if end_chunk < total_chunks else None,
+            "total_chunks": total_chunks,
+            "chunk_chars": chunk_chars,
+            "chunk_overlap": overlap,
+        }
+    finally:
+        con.close()
+
+
 def _db_dir():
     """Directory of named databases — sibling of the active DB file."""
     d = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "databases")
@@ -2246,6 +2436,275 @@ def remember_fact(args):
         con.close()
 
 
+def _absorb_candidates(con, text, workspace):
+    """Return bounded lexical candidates for absorb classification."""
+    terms = fts_terms(text)
+    if not terms:
+        return []
+    query = " OR ".join(terms)
+    sql = ("SELECT f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong, "
+           "f.importance, f.confirmed, f.invalid_at, f.archived, "
+           "bm25(facts_fts) AS rank FROM facts_fts "
+           "JOIN facts f ON f.id=facts_fts.rowid "
+           "WHERE facts_fts MATCH ? AND f.lifecycle != 'forgotten'" +
+           _ws_filter("f", workspace) + " ORDER BY rank LIMIT 10")
+    params = [query] + ([workspace] if workspace else [])
+    try:
+        rows = [dict(row) for row in con.execute(sql, params)]
+    except sqlite3.OperationalError:
+        return []
+    for row in rows:
+        row["coverage"] = round(
+            sum(1 for term in terms if term in (row["text"] or "").lower()) /
+            len(terms), 2)
+    return [row for row in rows if row["coverage"] >= 0.6][:5]
+
+
+def _absorb_evidence_items(item, fallback_source=""):
+    """Normalize one candidate's evidence list without storing raw snippets."""
+    raw = item.get("evidence", [])
+    if raw is None:
+        raw = []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list) or len(raw) > 8:
+        return None, {"error": "evidence must be an object or an array of at most 8 objects"}
+    evidence = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            return None, {"error": "evidence[%d] must be an object" % index}
+        normalized = dict(entry)
+        source_ref = normalized.get("source_ref") or ""
+        if not isinstance(source_ref, str):
+            return None, {"error": "evidence[%d].source_ref must be a string" % index}
+        source_ref = source_ref.strip()
+        if not source_ref:
+            parts = []
+            values = {}
+            for name in ("repo", "ref", "path"):
+                value = normalized.get(name) or ""
+                if not isinstance(value, str):
+                    return None, {"error": "evidence[%d].%s must be a string" %
+                                   (index, name)}
+                values[name] = value.strip()
+            repo, ref, path = values["repo"], values["ref"], values["path"]
+            if repo:
+                parts.append(repo + (("@" + ref) if ref else ""))
+            if path:
+                parts.append(":" + path)
+            source_ref = "".join(parts)
+        if not source_ref:
+            return None, {"error": "evidence[%d] requires source_ref or repo/path" % index}
+        if len(source_ref) > _EVIDENCE_MAX_FIELD_CHARS:
+            return None, {"error": "evidence[%d].source_ref is too long" % index}
+        normalized["source_ref"] = source_ref
+        _, anchor_err = _evidence_anchor_fields(normalized)
+        if anchor_err:
+            return None, {"error": "evidence[%d]: %s" %
+                          (index, anchor_err["error"])}
+        evidence.append(normalized)
+    if fallback_source and not any(e["source_ref"] == fallback_source for e in evidence):
+        evidence.insert(0, {"source_ref": fallback_source})
+    return evidence, None
+
+
+def absorb(args):
+    """Preview or explicitly commit a batch of candidate facts.
+
+    Classification is deliberately conservative: exact duplicates are no-ops,
+    lexical near-duplicates are review items, and only candidates classified as
+    new are committed. Optional LLM verification can turn a related candidate
+    into a new/update/contradiction classification, but update and contradiction
+    still require a separate explicit operation.
+    """
+    raw_facts = args.get("facts")
+    if raw_facts is None and args.get("text") is not None:
+        raw_facts = [args.get("text")]
+    if not isinstance(raw_facts, list) or not raw_facts:
+        return {"error": "facts must be a non-empty array"}
+    if len(raw_facts) > _ABSORB_MAX_FACTS:
+        return {"error": "facts may contain at most %d items" % _ABSORB_MAX_FACTS}
+    dry_run_provided = "dry_run" in args
+    dry_run = args.get("dry_run", True)
+    commit = args.get("commit", False)
+    if not isinstance(dry_run, bool) or not isinstance(commit, bool):
+        return {"error": "dry_run and commit must be booleans"}
+    if dry_run_provided and dry_run and commit:
+        return {"error": "dry_run and commit cannot both be true"}
+    if commit:
+        dry_run = False
+    elif not dry_run:
+        commit = True
+    verify_requested = args.get("verify", False)
+    if not isinstance(verify_requested, bool):
+        return {"error": "verify must be a boolean"}
+    if verify_requested and os.environ.get("MEMORY_MCP_VERIFY") != "1":
+        return {"error": "verification is disabled (set MEMORY_MCP_VERIFY=1)"}
+
+    workspace = _workspace(args)
+    defaults = {key: args[key] for key in (
+        "source", "project", "domain", "category", "trust", "strong", "importance")
+        if key in args}
+    normalized = []
+    for index, raw in enumerate(raw_facts):
+        if isinstance(raw, str):
+            item = {"text": raw}
+        elif isinstance(raw, dict):
+            item = dict(raw)
+        else:
+            return {"error": "facts[%d] must be a string or object" % index}
+        item_workspace = item.get("workspace") or ""
+        if not isinstance(item_workspace, str):
+            return {"error": "facts[%d].workspace must be a string" % index}
+        item_workspace = item_workspace.strip()
+        if item_workspace and item_workspace != workspace:
+            return {"error": "facts[%d] workspace must match the batch workspace" % index}
+        text = item.get("text") or ""
+        if not isinstance(text, str):
+            return {"error": "facts[%d].text must be a string" % index}
+        text = text.strip()
+        if not text:
+            return {"error": "facts[%d].text is required" % index}
+        if len(text) > _ABSORB_MAX_TEXT_CHARS:
+            return {"error": "facts[%d].text is too long (max %d characters)" %
+                    (index, _ABSORB_MAX_TEXT_CHARS)}
+        fact_args = dict(defaults)
+        fact_args.update({key: item[key] for key in (
+            "source", "project", "domain", "category", "trust", "strong", "importance")
+            if key in item})
+        fact_args["text"] = text
+        for name in ("source", "project", "domain", "category"):
+            if name in fact_args and fact_args[name] is not None and not isinstance(fact_args[name], str):
+                return {"error": "facts[%d].%s must be a string" % (index, name)}
+        if workspace:
+            fact_args["workspace"] = workspace
+        trust = fact_args.get("trust", "medium")
+        if trust not in VALID_TRUST:
+            return {"error": "facts[%d].trust must be one of %s" % (index, VALID_TRUST)}
+        fallback_source = fact_args.get("source") or ""
+        if not isinstance(fallback_source, str):
+            return {"error": "facts[%d].source must be a string" % index}
+        evidence, evidence_err = _absorb_evidence_items(item, fallback_source=fallback_source.strip())
+        if evidence_err:
+            return {"error": "facts[%d]: %s" % (index, evidence_err["error"])}
+        normalized.append({"args": fact_args, "text": text, "evidence": evidence})
+
+    con = get_db()
+    planned = []
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        for index, item in enumerate(normalized):
+            text = item["text"]
+            sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            exact = con.execute(
+                "SELECT id, archived, invalid_at, lifecycle FROM facts WHERE sha256=?" +
+                _ws_check("facts", workspace),
+                [sha] + ([workspace] if workspace else [])).fetchone()
+            candidates = [] if exact else _absorb_candidates(con, text, workspace)
+            classification = "duplicate" if exact else ("related" if candidates else "new")
+            action = "noop" if exact else ("review" if candidates else "create")
+            verdict = None
+            verification_error = ""
+            if verify_requested and candidates and not exact:
+                try:
+                    from verify import verify_facts
+                    check_args = {"text": text}
+                    if workspace:
+                        check_args["workspace"] = workspace
+                    check = verify_facts(check_args)
+                    if "error" in check:
+                        verification_error = check["error"]
+                    else:
+                        verdict = check.get("verdict") or {}
+                        verdict_action = verdict.get("action")
+                        reason = (verdict.get("reason") or "").lower()
+                        if verdict_action == "add":
+                            classification, action = "new", "create"
+                        elif verdict_action in ("update", "supersedes"):
+                            classification, action = "update", "review"
+                        elif verdict_action == "delete" or (
+                                verdict_action == "noop" and reason == "conflict"):
+                            classification, action = "contradiction", "review"
+                except Exception:
+                    verification_error = "verification failed (provider error)"
+            out = {
+                "index": index,
+                "sha256": sha,
+                "text_preview": text[:300],
+                "classification": classification,
+                "action": action,
+                "candidate_ids": [row["id"] for row in candidates],
+                "evidence_count": len(item["evidence"]),
+            }
+            if exact:
+                out["existing_id"] = exact["id"]
+            if candidates:
+                out["candidates"] = [
+                    {"id": row["id"], "text": row["text"][:300],
+                     "coverage": row["coverage"], "source": row["source"]}
+                    for row in candidates]
+            if verdict is not None:
+                out["verdict"] = verdict
+            if verification_error:
+                out["verification_error"] = verification_error
+            planned.append({"out": out, "item": item, "existing_id":
+                            exact["id"] if exact else None})
+    finally:
+        con.close()
+
+    result = {
+        "dry_run": not commit,
+        "committed": False,
+        "count": len(planned),
+        "created": 0,
+        "deduped": 0,
+        "pending_review": sum(1 for entry in planned
+                               if entry["out"]["action"] == "review"),
+        "evidence_attached": 0,
+        "items": [entry["out"] for entry in planned],
+    }
+    if not commit:
+        return result
+
+    evidence_errors = []
+    for entry in planned:
+        out = entry["out"]
+        item = entry["item"]
+        fid = entry["existing_id"]
+        if out["classification"] == "new":
+            stored = remember_fact(item["args"])
+            if "error" in stored:
+                out["error"] = stored["error"]
+                continue
+            fid = stored["id"]
+            out["id"] = fid
+            if stored.get("dedup"):
+                result["deduped"] += 1
+            else:
+                result["created"] += 1
+        elif out["classification"] == "duplicate":
+            result["deduped"] += 1
+        else:
+            continue
+        for evidence in item["evidence"]:
+            attach_args = dict(evidence)
+            attach_args["fact_id"] = fid
+            if workspace:
+                attach_args["workspace"] = workspace
+            attached = attach_evidence(attach_args)
+            if "error" in attached:
+                evidence_errors.append({"index": out["index"],
+                                        "error": attached["error"]})
+            elif not attached.get("dedup"):
+                result["evidence_attached"] += 1
+    result["committed"] = True
+    if evidence_errors:
+        result["evidence_errors"] = evidence_errors
+    return result
+
+
 def search_facts(args):
     query = (args.get("query") or "").strip()
     if not query:
@@ -2253,6 +2712,14 @@ def search_facts(args):
     limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
     if err:
         return err
+    chunk_params = None
+    if "chunk_chars" in args or "chunk_overlap" in args:
+        chunk_params, err = _fact_chunk_params(args)
+        if err:
+            return err
+        # Search pagination is controlled by the result limit; only the
+        # chunk-size and overlap portion of the fact paging contract applies.
+        chunk_params = chunk_params[:2]
     sql = ("SELECT f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong, "
            "f.importance, f.confirmed, f.invalid_at, f.created_at, "
            "c.name AS category, bm25(facts_fts) AS rank "
@@ -2320,6 +2787,8 @@ def search_facts(args):
                 # No lexical hits: fall back to semantic ranking alone.
                 res = emb.search_semantic(con, query, limit=limit, workspace=ws)
             rows = res.get("facts", []) if isinstance(res, dict) else res or []
+        if chunk_params:
+            rows = _add_fact_chunks(rows, *chunk_params)
         _mark_hits(con, rows)
         result = {"count": len(rows), "facts": rows}
         if args.get("graph"):
@@ -2930,6 +3399,73 @@ def get_causal_chain(args):
         con.close()
 
 
+def _evidence_anchor_fields(args):
+    """Validate and normalize optional code-local evidence anchor fields."""
+    fields = {}
+    for name in ("repo", "ref", "path", "symbol"):
+        value = args.get(name, "")
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            return None, {"error": "%s must be a string" % name}
+        value = value.strip()
+        if len(value) > _EVIDENCE_MAX_FIELD_CHARS:
+            return None, {"error": "%s is too long" % name}
+        fields[name] = value
+    for name in ("start_line", "start_col", "end_line", "end_col"):
+        value = args.get(name)
+        if value in (None, ""):
+            fields[name] = None
+            continue
+        if isinstance(value, bool):
+            return None, {"error": "%s must be a non-negative integer" % name}
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None, {"error": "%s must be a non-negative integer" % name}
+        if value < 0 or value > 10_000_000:
+            return None, {"error": "%s is outside the supported range" % name}
+        if name.endswith("line") and value == 0:
+            return None, {"error": "%s must start at line 1" % name}
+        fields[name] = value
+    if (fields["start_line"] is not None and fields["end_line"] is not None and
+            fields["end_line"] < fields["start_line"]):
+        return None, {"error": "end_line must be greater than or equal to start_line"}
+    if (fields["start_line"] is not None and fields["end_line"] is not None and
+            fields["end_line"] == fields["start_line"] and
+            fields["start_col"] is not None and fields["end_col"] is not None and
+            fields["end_col"] < fields["start_col"]):
+        return None, {"error": "end_col must be greater than or equal to start_col"}
+
+    selected_text = args.get("selected_text")
+    if selected_text is not None:
+        if not isinstance(selected_text, str):
+            return None, {"error": "selected_text must be a string"}
+        if len(selected_text.encode("utf-8")) > 128 * 1024:
+            return None, {"error": "selected_text is too long"}
+    selected_hash = args.get("selected_text_hash", "") or ""
+    if not isinstance(selected_hash, str):
+        return None, {"error": "selected_text_hash must be a SHA-256 string"}
+    selected_hash = selected_hash.strip().lower()
+    if selected_text is not None:
+        computed = hashlib.sha256(selected_text.encode("utf-8")).hexdigest()
+        if selected_hash and selected_hash != computed:
+            return None, {"error": "selected_text_hash does not match selected_text"}
+        selected_hash = computed
+    if selected_hash and not re.fullmatch(r"[0-9a-f]{64}", selected_hash):
+        return None, {"error": "selected_text_hash must be a SHA-256 string"}
+    fields["selected_text_hash"] = selected_hash
+
+    status = args.get("resolution_status", "") or ""
+    if not isinstance(status, str) or status not in ("", "resolved", "stale", "unresolved"):
+        return None, {"error": "resolution_status must be resolved, stale, or unresolved"}
+    has_anchor = any(fields[name] not in ("", None) for name in (
+        "repo", "ref", "path", "symbol", "start_line", "start_col",
+        "end_line", "end_col", "selected_text_hash"))
+    fields["resolution_status"] = status or ("unresolved" if has_anchor else "")
+    return fields, None
+
+
 def get_provenance(args):
     con = get_db()
     try:
@@ -2948,7 +3484,9 @@ def get_provenance(args):
         if not fact:
             return {"error": "fact not found (use fact_id or sha256)", "fact": None, "evidence": []}
         evidence = [dict(r) for r in con.execute(
-            "SELECT source_ref, source_checksum, fetched_at, created_at FROM evidence "
+            "SELECT source_ref, source_checksum, fetched_at, repo, ref, path, symbol, "
+            "start_line, start_col, end_line, end_col, selected_text_hash, "
+            "resolution_status, created_at FROM evidence "
             "WHERE fact_id=? ORDER BY created_at", (fact["id"],))]
         return {"fact": dict(fact), "evidence": evidence}
     finally:
@@ -2957,9 +3495,25 @@ def get_provenance(args):
 
 def attach_evidence(args):
     fact_id = args.get("fact_id")
-    source_ref = (args.get("source_ref") or "").strip()
+    source_ref = args.get("source_ref") or ""
+    if not isinstance(source_ref, str):
+        return {"error": "source_ref must be a string"}
+    source_ref = source_ref.strip()
     if not fact_id or not source_ref:
         return {"error": "fact_id and source_ref are required"}
+    if len(source_ref) > _EVIDENCE_MAX_FIELD_CHARS:
+        return {"error": "source_ref is too long"}
+    source_checksum = args.get("source_checksum", "") or ""
+    fetched_at = args.get("fetched_at", "") or ""
+    if not isinstance(source_checksum, str) or not isinstance(fetched_at, str):
+        return {"error": "source_checksum and fetched_at must be strings"}
+    if len(source_checksum) > _EVIDENCE_MAX_FIELD_CHARS:
+        return {"error": "source_checksum is too long"}
+    if len(fetched_at) > _EVIDENCE_MAX_FIELD_CHARS:
+        return {"error": "fetched_at is too long"}
+    anchor, err = _evidence_anchor_fields(args)
+    if err:
+        return err
     ws = _workspace(args)
     con = get_db()
     try:
@@ -2972,10 +3526,14 @@ def attach_evidence(args):
         if not owner:
             return {"error": "fact not found or not in your workspace", "fact_id": fact_id}
         cur = con.execute(
-            "INSERT OR IGNORE INTO evidence (fact_id, source_ref, source_checksum, fetched_at, created_at) "
-            "VALUES (?,?,?,?,?)",
-            (fact_id, source_ref, args.get("source_checksum", ""),
-             args.get("fetched_at", ""), now()))
+            "INSERT OR IGNORE INTO evidence (fact_id, source_ref, source_checksum, fetched_at, "
+            "repo, ref, path, symbol, start_line, start_col, end_line, end_col, "
+            "selected_text_hash, resolution_status, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (fact_id, source_ref, source_checksum, fetched_at, anchor["repo"], anchor["ref"],
+             anchor["path"], anchor["symbol"], anchor["start_line"],
+             anchor["start_col"], anchor["end_line"], anchor["end_col"],
+             anchor["selected_text_hash"], anchor["resolution_status"], now()))
         con.commit()
         return {"fact_id": fact_id, "source_ref": source_ref,
                 "dedup": cur.rowcount == 0}
@@ -3170,7 +3728,9 @@ def fact_references(args):
             "WHERE e.source_ref=? AND e.fact_id!=?" + _ws_check("f", ws),
             ["supersedes:%s" % fid, fid] + ws_params)]
         evidence = [dict(r) for r in con.execute(
-            "SELECT source_ref, source_checksum, created_at FROM evidence WHERE fact_id=?",
+            "SELECT source_ref, source_checksum, repo, ref, path, symbol, start_line, "
+            "start_col, end_line, end_col, selected_text_hash, resolution_status, "
+            "created_at FROM evidence WHERE fact_id=?",
             (fid,))]
         return {
             "fact_id": fid, "text": f["text"][:200],
@@ -3253,13 +3813,27 @@ def export_rdf(args):
                 add("    prov:wasDerivedFrom mem:decision-%d ;" % r["parent_decision_id"])
             add("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % r["created_at"])
         for r in con.execute(
-                "SELECT e.fact_id, e.source_ref, e.source_checksum, e.created_at "
+                "SELECT e.id, e.fact_id, e.source_ref, e.source_checksum, e.repo, e.ref, e.path, "
+                "e.symbol, e.start_line, e.start_col, e.end_line, e.end_col, "
+                "e.selected_text_hash, e.resolution_status, e.created_at "
                 "FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE 1=1" +
                 _ws_check("f", ws) + " ORDER BY e.fact_id", [ws] if ws else []):
             add("mem:fact-%d prov:wasDerivedFrom [ a prov:Entity ; "
                 "prov:atLocation \"%s\" ; prov:value \"%s\" ] ;"
                 % (r["fact_id"], esc(r["source_ref"]), esc(r["source_checksum"])))
             add("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % r["created_at"])
+            anchor = []
+            for key in ("repo", "ref", "path", "symbol", "resolution_status"):
+                if r[key]:
+                    anchor.append("mem:%s \"%s\"" % (key, esc(r[key])))
+            for key in ("start_line", "start_col", "end_line", "end_col"):
+                if r[key] is not None:
+                    anchor.append("mem:%s \"%s\"^^xsd:integer" % (key, r[key]))
+            if r["selected_text_hash"]:
+                anchor.append("mem:selectedTextHash \"%s\"" % esc(r["selected_text_hash"]))
+            if anchor:
+                add("mem:evidence-%s a prov:Entity ; %s ." %
+                    (r["id"], " ; ".join(anchor)))
         # cap and cut at a triple boundary (last line ends with '.')
         if len(out) > limit * 6:
             out = out[:limit * 6]
@@ -3703,7 +4277,9 @@ def backup_workspace(args):
             "issue_ref, parent_decision_id, workspace_id, created_at, updated_at "
             "FROM decisions WHERE workspace_id=? ORDER BY id", [name])]
         evidence = [dict(r) for r in con.execute(
-            "SELECT e.id, e.fact_id, e.source_ref, e.source_checksum, e.fetched_at, e.created_at "
+            "SELECT e.id, e.fact_id, e.source_ref, e.source_checksum, e.fetched_at, "
+            "e.repo, e.ref, e.path, e.symbol, e.start_line, e.start_col, e.end_line, "
+            "e.end_col, e.selected_text_hash, e.resolution_status, e.created_at "
             "FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE f.workspace_id=? ORDER BY e.id", [name])]
         contexts = [dict(r) for r in con.execute(
             "SELECT ref, name, content, schema_json, source, sha256, workspace_id, "
@@ -3765,6 +4341,62 @@ TOOLS = {
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["text"],
+        },
+    },
+    "absorb": {
+        "description": "Preview or explicitly commit a bounded batch of candidate facts. Exact duplicates are no-ops; related, update, and contradiction candidates remain review-only. dry_run defaults to true.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "facts": {
+                    "type": "array", "minItems": 1, "maxItems": 50,
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "object", "properties": {
+                                "text": {"type": "string"},
+                                "source": {"type": "string"},
+                                "project": {"type": "string"},
+                                "domain": {"type": "string"},
+                                "category": {"type": "string"},
+                                "trust": {"type": "string", "enum": list(VALID_TRUST)},
+                                "strong": {"type": "boolean"},
+                                "importance": {"type": "number"},
+                                "workspace": {"type": "string"},
+                                "evidence": {"type": ["object", "array"]},
+                            }, "required": ["text"]},
+                        ],
+                    },
+                },
+                "text": {"type": "string", "description": "Single-item alias for facts"},
+                "source": {"type": "string"},
+                "project": {"type": "string"},
+                "domain": {"type": "string"},
+                "category": {"type": "string"},
+                "trust": {"type": "string", "enum": list(VALID_TRUST)},
+                "strong": {"type": "boolean"},
+                "importance": {"type": "number"},
+                "workspace": {"type": "string", "description": "Project scope id; the whole batch stays in one scope"},
+                "dry_run": {"type": "boolean", "default": True},
+                "commit": {"type": "boolean", "default": False, "description": "Explicitly apply only items classified as new"},
+                "verify": {"type": "boolean", "default": False, "description": "Use the optional LLM verifier to classify related candidates"},
+            },
+        },
+    },
+    "chunk_fact": {
+        "description": "Read one active fact as bounded, offset-addressable chunks without returning the full text in one payload.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "fact_id": {"type": "integer", "description": "Alias for id"},
+                "sha256": {"type": "string"},
+                "chunk_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "default": 4000},
+                "chunk_overlap": {"type": "integer", "minimum": 0, "maximum": 15999, "default": 0},
+                "start_chunk": {"type": "integer", "minimum": 0, "default": 0},
+                "max_chunks": {"type": "integer", "minimum": 1, "maximum": 32, "default": 8},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads to your project + shared pool"},
+            },
         },
     },
     "put_context": {
@@ -3986,6 +4618,8 @@ TOOLS = {
                 "semantic": {"type": "boolean", "default": False, "description": "Hybrid: RRF-merge FTS BM25 with embedding search (requires MEMORY_MCP_EMBEDDINGS=1)"},
                 "valid_at": {"type": "string", "description": "RFC3339: include facts that were still valid at that time (bi-temporal)"},
                 "graph": {"type": "boolean", "default": False, "description": "RRF-merge entity-graph expansion"},
+                "chunk_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "description": "Optionally add bounded chunks to each hit"},
+                "chunk_overlap": {"type": "integer", "minimum": 0, "maximum": 15999, "default": 0},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["query"],
@@ -4299,7 +4933,7 @@ TOOLS = {
         },
     },
     "get_provenance": {
-        "description": "Return a fact (by id or sha256) plus its evidence rows (source_ref, checksum).",
+        "description": "Return a fact plus evidence rows, including optional repository/ref/path/symbol/line-range anchors.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4310,7 +4944,7 @@ TOOLS = {
         },
     },
     "attach_evidence": {
-        "description": "Link a fact to a source (source_ref + optional checksum); dedup by (fact_id, source_ref).",
+        "description": "Link a fact to a source and optional code-local anchor; dedup by (fact_id, source_ref).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4318,6 +4952,17 @@ TOOLS = {
                 "source_ref": {"type": "string"},
                 "source_checksum": {"type": "string"},
                 "fetched_at": {"type": "string"},
+                "repo": {"type": "string", "description": "Repository URL or stable repository id"},
+                "ref": {"type": "string", "description": "Commit, tag, or branch"},
+                "path": {"type": "string"},
+                "symbol": {"type": "string"},
+                "start_line": {"type": "integer", "minimum": 1},
+                "start_col": {"type": "integer", "minimum": 0},
+                "end_line": {"type": "integer", "minimum": 1},
+                "end_col": {"type": "integer", "minimum": 0},
+                "selected_text": {"type": "string", "description": "Optional local snippet; only its SHA-256 is retained"},
+                "selected_text_hash": {"type": "string"},
+                "resolution_status": {"type": "string", "enum": ["resolved", "stale", "unresolved"]},
                 "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
             },
         },
@@ -4455,6 +5100,8 @@ TOOLS = {
 HANDLERS = {
     "add_fact": remember_fact,
     "remember_fact": remember_fact,
+    "absorb": absorb,
+    "chunk_fact": chunk_fact,
     "put_context": put_context,
     "list_context": list_context,
     "resolve_context": resolve_context,
