@@ -21,8 +21,9 @@ session is visible to every later session.
 ## Facts — remember_fact / add_fact / search_facts / search_semantic / list_facts / summarize_index / forget_fact
 
 - `ingest_turn {transcript, session_ref?}` — server-side extraction: send a
-  conversation transcript, the server's LLM provider extracts durable facts
-  and stores them with provenance (when enabled).
+  conversation transcript to the LLM provider. Extracted facts are unconfirmed
+  candidates: model output cannot grant `trust=high` or `strong=true`; review
+  with `review_pending` and confirm explicitly with `confirm_fact`.
 - `compose_recall {turn_text, purpose?}` — returns an advisory ready-to-inject
   `<memory-recall>` block (server-side scoring); transcript input is focused on
   the latest user intent before retrieval and `purpose: "safety_critical"` is
@@ -58,7 +59,9 @@ session is visible to every later session.
   distinctive fact can skip heuristic research (fact gate).
 - `search_facts` with `semantic=true` merges lexical (FTS5/BM25) and embedding
   rankings (RRF); `search_semantic` is pure embedding search — use it for
-  paraphrased or cross-language recall when embeddings are enabled.
+  paraphrased or cross-language recall when embeddings are enabled. Both paths
+  apply the same workspace, validity, trust, strength, project, domain, and
+  category eligibility filters.
 - Retrieval is advisory only. Never use memory to authorize registry writes,
   route selection, lock validity, or hash acceptance. Use current runtime state
   and local lock/hash checks for those decisions.
@@ -267,11 +270,11 @@ requires confirm: true.
   hard: true purges facts, evidence, graph and decisions in one transaction
   (per-table counts in the response; requires confirm: true). Reactivate an
   archived/reset workspace with create_workspace before writing again.
-- backup_workspace {workspace} — JSON export of ALL workspace data (facts
-  incl. archived, entities, relations, decisions, evidence, contexts,
-  lifecycle_events, handoffs) with per-table counts to
-  backups/workspace-<name>-<ts>.json. Backups contain payloads and are sensitive
-  local artifacts.
+- backup_workspace {workspace} — versioned, schema-complete JSON export of
+  all workspace tables and the registry/activity metadata, including full fact
+  state and optional embeddings. Embedding BLOBs are base64 encoded. Counts are
+  emitted for every table; backup files are sensitive local artifacts written
+  atomically under a `0700` directory with `0600` file modes.
 - Names are validated: 1-64 chars of [A-Za-z0-9._-], no '..' — never pass
   unvalidated input to the file-touching tools.
 

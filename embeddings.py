@@ -323,16 +323,63 @@ def _missing_count(con, workspace=""):
         params).fetchone()[0]
 
 
-def search_semantic(con, query, limit=20, threshold=0.0, workspace=""):
-    """Brute-force cosine over stored vectors, best first. Workspace-scoped
-    like lexical search: (workspace, '') when scoped, '' only when not."""
+def _fact_filter_sql(filters=None):
+    """Build the same fact eligibility predicate used by semantic callers.
+
+    The core validates the public arguments; this helper still validates the
+    trust value because embeddings is also an importable module boundary.
+    """
+    filters = filters or {}
+    workspace = filters.get("workspace") or ""
+    clauses = ["f.archived=0", "f.lifecycle='active'"]
+    params = []
+    if filters.get("valid_at"):
+        clauses.append("(f.invalid_at='' OR f.invalid_at >= ?)")
+        params.append(filters["valid_at"])
+    else:
+        clauses.append("f.invalid_at=''")
+    if workspace:
+        clauses.append("f.workspace_id IN (?, '')")
+        params.append(workspace)
+    else:
+        clauses.append("f.workspace_id = ''")
+    trust_min = filters.get("trust_min")
+    if trust_min:
+        if trust_min not in ("high", "medium", "low"):
+            raise ValueError("trust_min must be one of ('high', 'medium', 'low')")
+        order = {"high": 0, "medium": 1, "low": 2}
+        allowed = [trust for trust in ("high", "medium", "low")
+                   if order[trust] <= order[trust_min]]
+        clauses.append("f.trust IN (%s)" % ",".join("?" * len(allowed)))
+        params.extend(allowed)
+    if filters.get("strong_only"):
+        clauses.append("f.strong=1")
+    for field in ("project", "domain"):
+        if filters.get(field):
+            clauses.append("f.%s=?" % field)
+            params.append(filters[field])
+    if filters.get("category"):
+        clauses.append("c.name=?")
+        params.append(filters["category"])
+    return " AND ".join(clauses), params
+
+
+def search_semantic(con, query, limit=20, threshold=0.0, workspace="", filters=None):
+    """Brute-force cosine over eligible stored vectors, best first.
+
+    ``filters`` is the normalized fact-search predicate from the core. Keeping
+    it at this seam prevents semantic and lexical paths from drifting apart.
+    """
+    filters = dict(filters or {})
+    filters["workspace"] = workspace
     qvec = _normalize(embed([query])[0])
-    ws_clause = " AND f.workspace_id IN (?, '')" if workspace else " AND f.workspace_id = ''"
-    params = [workspace] if workspace else []
+    where, params = _fact_filter_sql(filters)
     rows = con.execute(
-        "SELECT e.fact_id, e.vec, e.model, f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong "
+        "SELECT e.fact_id, e.vec, e.model, f.id, f.text, f.source, f.project, f.domain, "
+        "f.trust, f.strong, f.importance, f.confirmed, f.invalid_at, f.created_at, "
+        "f.updated_at, f.archived, f.lifecycle, c.name AS category "
         "FROM fact_embeddings e JOIN facts f ON f.id=e.fact_id "
-        "WHERE f.archived=0 AND f.lifecycle='active'" + ws_clause,
+        "LEFT JOIN categories c ON c.id=f.category_id WHERE " + where,
         params).fetchall()
     scored = []
     for r in rows:
@@ -343,17 +390,22 @@ def search_semantic(con, query, limit=20, threshold=0.0, workspace=""):
     scored.sort(key=lambda x: x[0], reverse=True)
     out = []
     for score, r in scored[:limit]:
-        d = {k: r[k] for k in ("id", "text", "source", "project", "domain", "trust", "strong")}
+        d = {k: r[k] for k in (
+            "id", "text", "source", "project", "domain", "trust", "strong",
+            "importance", "confirmed", "invalid_at", "created_at", "updated_at",
+            "archived", "lifecycle", "category")}
         d["score"] = round(float(score), 4)
         out.append(d)
     return {"count": len(out), "model": model_name(), "facts": out}
 
 
-def hybrid_rerank(con, query, fts_facts, limit=20, workspace=""):
+def hybrid_rerank(con, query, fts_facts, limit=20, workspace="", filters=None):
     """RRF merge of FTS BM25 ranks and semantic ranks (k=60)."""
     if not fts_facts:
-        return search_semantic(con, query, limit=limit, workspace=workspace)
-    sem = search_semantic(con, query, limit=200, threshold=0.0, workspace=workspace)
+        return search_semantic(con, query, limit=limit, workspace=workspace,
+                               filters=filters)
+    sem = search_semantic(con, query, limit=200, threshold=0.0,
+                          workspace=workspace, filters=filters)
     sem_index = {f["id"]: i for i, f in enumerate(sem["facts"])}
     fts_index = {f["id"]: i for i, f in enumerate(fts_facts)}
     k = 60

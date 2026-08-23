@@ -2088,10 +2088,17 @@ class DatabaseIsolationTest(unittest.TestCase):
         self.assertEqual(lst["evidence"], 1)
         bk = mcp.backup_workspace({"workspace": "iso-bk"})
         self.assertNotIn("error", bk, bk)
-        self.assertEqual(bk["counts"], {"facts": 1, "entities": 1, "relations": 0,
-                                        "decisions": 1, "evidence": 1,
-                                        "contexts": 0, "context_lineage": 0,
-                                        "lifecycle_events": 0, "handoffs": 0})
+        expected_counts = {"facts": 1, "entities": 1, "relations": 0,
+                           "decisions": 1, "evidence": 1,
+                           "contexts": 0, "context_lineage": 0,
+                           "lifecycle_events": 0, "handoffs": 0}
+        self.assertEqual({key: bk["counts"][key] for key in expected_counts},
+                         expected_counts)
+        self.assertIn("categories", bk["counts"])
+        self.assertIn("fact_embeddings", bk["counts"])
+        self.assertIn("decision_embeddings", bk["counts"])
+        self.assertIn("workspaces", bk["counts"])
+        self.assertIn("activity_days", bk["counts"])
         # the JSON on disk carries the same counts + rows
         import json as _json
         with open(os.path.join(os.path.dirname(mcp.DB_PATH), "backups",
@@ -2284,7 +2291,8 @@ class AuditRegressionTest(unittest.TestCase):
         self._env = {
             key: os.environ.get(key)
             for key in ("MEMORY_MCP_EXTRACT", "MEMORY_MCP_EXTRACT_MIN_CHARS",
-                        "MEMORY_MCP_RECALL", "MEMORY_MCP_ALLOW_INSECURE_HTTP")
+                        "MEMORY_MCP_RECALL", "MEMORY_MCP_ALLOW_INSECURE_HTTP",
+                        "MEMORY_MCP_EMBEDDINGS", "MEMORY_MCP_EMBED_PROVIDER")
         }
 
     def tearDown(self):
@@ -2297,6 +2305,199 @@ class AuditRegressionTest(unittest.TestCase):
         mcp._SELECTED_DB[0] = self._old_selected
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_semantic_search_honors_filters_and_returns_category_metadata(self):
+        os.environ["MEMORY_MCP_EMBEDDINGS"] = "1"
+        os.environ["MEMORY_MCP_EMBED_PROVIDER"] = "test"
+        workspace = "semantic-filter-ws"
+        wanted = mcp.remember_fact({
+            "text": "semantic filter marker wanted",
+            "source": "test", "project": "alpha", "domain": "product",
+            "category": "wanted", "trust": "high", "strong": True,
+            "importance": 0.9, "workspace": workspace,
+        })
+        self.assertNotIn("error", wanted, wanted)
+        for suffix, overrides in (
+                ("other category", {"category": "other"}),
+                ("low trust", {"trust": "low"}),
+                ("not strong", {"strong": False}),
+                ("other project", {"project": "beta"}),
+                ("other domain", {"domain": "ops"}),
+                ("other workspace", {"workspace": "other-ws"})):
+            result = mcp.remember_fact({
+                "text": "semantic filter marker " + suffix,
+                "source": "test", "project": "alpha", "domain": "product",
+                "category": "wanted", "trust": "high", "strong": True,
+                "workspace": workspace,
+                **overrides,
+            })
+            self.assertNotIn("error", result, result)
+        invalid = mcp.remember_fact({
+            "text": "semantic filter marker invalidated",
+            "source": "test", "project": "alpha", "domain": "product",
+            "category": "wanted", "trust": "high", "strong": True,
+            "workspace": workspace,
+        })
+        con = mcp.get_db()
+        con.execute("UPDATE facts SET invalid_at=? WHERE id=?",
+                    ("2026-08-01T00:00:00Z", invalid["id"]))
+        con.commit()
+        con.close()
+        archived = mcp.remember_fact({
+            "text": "semantic filter marker archived",
+            "source": "test", "project": "alpha", "domain": "product",
+            "category": "wanted", "trust": "high", "strong": True,
+            "workspace": workspace,
+        })
+        mcp.forget_fact({"id": archived["id"], "workspace": workspace})
+
+        filters = {
+            "query": "semantic filter marker", "limit": 50,
+            "workspace": workspace, "category": "wanted", "trust_min": "high",
+            "strong_only": True, "project": "alpha", "domain": "product",
+        }
+        direct = mcp.search_semantic(filters)
+        self.assertNotIn("error", direct, direct)
+        self.assertEqual([row["id"] for row in direct["facts"]], [wanted["id"]], direct)
+        self.assertEqual(direct["facts"][0]["category"], "wanted")
+        self.assertIn("importance", direct["facts"][0])
+        self.assertIn("confirmed", direct["facts"][0])
+        self.assertIn("invalid_at", direct["facts"][0])
+
+        hybrid = mcp.search_facts(dict(filters, semantic=True))
+        self.assertNotIn("error", hybrid, hybrid)
+        self.assertEqual([row["id"] for row in hybrid["facts"]], [wanted["id"]], hybrid)
+
+    def test_semantic_search_honors_valid_at(self):
+        os.environ["MEMORY_MCP_EMBEDDINGS"] = "1"
+        os.environ["MEMORY_MCP_EMBED_PROVIDER"] = "test"
+        fact = mcp.remember_fact({
+            "text": "semantic historical validity marker",
+            "source": "test", "workspace": "semantic-history",
+        })
+        con = mcp.get_db()
+        con.execute("UPDATE facts SET invalid_at=? WHERE id=?",
+                    ("2026-08-20T00:00:00Z", fact["id"]))
+        con.commit()
+        con.close()
+        current = mcp.search_semantic({
+            "query": "semantic historical validity marker",
+            "workspace": "semantic-history",
+        })
+        self.assertEqual(current["count"], 0, current)
+        historical = mcp.search_semantic({
+            "query": "semantic historical validity marker",
+            "workspace": "semantic-history", "valid_at": "2026-08-19T00:00:00Z",
+        })
+        self.assertEqual([row["id"] for row in historical["facts"]], [fact["id"]], historical)
+
+    def test_sweep_freshness_rejects_inactive_workspace_before_shared_update(self):
+        os.environ.pop("MEMORY_MCP_EMBEDDINGS", None)
+        os.environ["MEMORY_MCP_RECALL"] = "1"
+        shared = mcp.remember_fact({
+            "text": "shared stale freshness marker", "source": "test",
+            "importance": 0.1,
+        })
+        con = mcp.get_db()
+        con.execute("UPDATE facts SET updated_at=? WHERE id=?",
+                    ("2020-01-01T00:00:00Z", shared["id"]))
+        con.commit()
+        con.close()
+        self.assertNotIn("error", mcp.create_workspace({"workspace": "stale-ws"}))
+        self.assertNotIn("error", mcp.archive_workspace({"workspace": "stale-ws"}))
+
+        result = mcp.sweep_freshness({"workspace": "stale-ws"})
+        self.assertIn("error", result, result)
+        con = mcp.get_db()
+        row = con.execute("SELECT archived FROM facts WHERE id=?", [shared["id"]]).fetchone()
+        con.close()
+        self.assertEqual(row["archived"], 0)
+        os.environ["MEMORY_MCP_EMBEDDINGS"] = "1"
+        os.environ["MEMORY_MCP_EMBED_PROVIDER"] = "test"
+        backfill = mcp.embed_backfill({"workspace": "stale-ws"})
+        self.assertIn("error", backfill, backfill)
+
+    def test_workspace_backup_contains_schema_data_and_private_artifacts(self):
+        import base64
+        import stat
+        from unittest.mock import patch
+
+        os.environ["MEMORY_MCP_EMBEDDINGS"] = "1"
+        os.environ["MEMORY_MCP_EMBED_PROVIDER"] = "test"
+        workspace = "complete-backup-ws"
+        self.assertNotIn("error", mcp.create_workspace({"workspace": workspace}))
+        fact = mcp.remember_fact({
+            "text": "complete backup fact marker", "source": "test",
+            "category": "backup", "workspace": workspace,
+        })
+        self.assertNotIn("error", fact, fact)
+        con = mcp.get_db()
+        con.execute(
+            "UPDATE facts SET invalid_at=?, superseded_by=?, confirmed=1, "
+            "last_accessed_at=?, access_count=3, revival_count=2, lifecycle='degraded', "
+            "archived=1 WHERE id=?",
+            ("2026-08-20T00:00:00Z", 999, "2026-08-21T00:00:00Z", fact["id"]))
+        con.commit()
+        con.close()
+        first = mcp.remember_entity({"name": "backup-service", "workspace": workspace})
+        second = mcp.remember_entity({"name": "backup-db", "workspace": workspace})
+        mcp.remember_relation({"subject": "backup-service", "predicate": "uses",
+                               "object": "backup-db", "workspace": workspace})
+        mcp.record_decision({"scenario": "backup decision", "workspace": workspace,
+                             "subject": "backup", "outcome": "retain"})
+        mcp.attach_evidence({"fact_id": fact["id"], "source_ref": "test/backup",
+                             "workspace": workspace})
+        context = mcp.put_context({"name": "backup-context", "content": "payload",
+                                   "workspace": workspace})
+        mcp.capture_event({"idempotency_key": "backup-event", "event_id": "backup-event",
+                           "event_kind": "test", "payload": "event payload",
+                           "workspace": workspace})
+        mcp.handoff_begin({"content": "handoff payload", "owner": "tester",
+                           "workspace": workspace})
+        mcp._register_activity_day()
+
+        result = mcp.backup_workspace({"workspace": workspace})
+        self.assertNotIn("error", result, result)
+        backup_dir = os.path.join(self.tmpdir, "backups")
+        backup_path = os.path.join(backup_dir, result["backup"])
+        self.assertEqual(stat.S_IMODE(os.stat(backup_dir).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(backup_path).st_mode), 0o600)
+        with open(backup_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        table_names = (
+            "categories", "facts", "fact_embeddings", "entities", "relations",
+            "decisions", "decision_embeddings", "evidence", "contexts",
+            "context_lineage", "lifecycle_events", "handoffs", "workspaces",
+            "activity_days",
+        )
+        self.assertEqual(data["manifest"]["format"], "memory-mcp.workspace-backup")
+        self.assertEqual(data["manifest"]["version"], 1)
+        for table in table_names:
+            self.assertIn(table, data, table)
+            self.assertEqual(data["counts"][table], len(data[table]), table)
+        self.assertEqual(data["workspace"], workspace)
+        self.assertEqual(data["facts"][0]["invalid_at"], "2026-08-20T00:00:00Z")
+        self.assertEqual(data["facts"][0]["superseded_by"], 999)
+        self.assertEqual(data["facts"][0]["confirmed"], 1)
+        self.assertEqual(data["facts"][0]["access_count"], 3)
+        self.assertEqual(data["facts"][0]["revival_count"], 2)
+        self.assertEqual(data["facts"][0]["lifecycle"], "degraded")
+        self.assertEqual(data["workspaces"][0]["id"], workspace)
+        self.assertEqual(data["contexts"][0]["ref"], context["context"]["ref"])
+        self.assertTrue(data["fact_embeddings"])
+        base64.b64decode(data["fact_embeddings"][0]["vec"])
+        self.assertIn("decision_embeddings", data)
+        self.assertTrue(data["activity_days"])
+
+        database_backup = mcp.backup_database({})
+        self.assertNotIn("error", database_backup, database_backup)
+        database_path = os.path.join(backup_dir, database_backup["backup"])
+        self.assertEqual(stat.S_IMODE(os.stat(database_path).st_mode), 0o600)
+
+        with patch("memory_mcp.json.dump", side_effect=OSError("simulated write failure")):
+            failed = mcp.backup_workspace({"workspace": workspace})
+        self.assertIn("error", failed, failed)
+        self.assertFalse(any(name.startswith(".") for name in os.listdir(backup_dir)))
 
     def test_decay_review_and_restore_are_workspace_scoped(self):
         fact = mcp.remember_fact({"text": "beta forgotten isolation marker",
@@ -2363,7 +2564,7 @@ class AuditRegressionTest(unittest.TestCase):
         self.assertNotIn("scope\nINJECTED_SCOPE_LINE".replace("\\n", "\n"), entry)
         self.assertNotIn("fact: fact line\nINJECTED_FACT_LINE", entry)
 
-    def test_ingest_turn_preserves_model_metadata_and_scope(self):
+    def test_ingest_turn_requires_human_confirmation_for_authority_metadata(self):
         from unittest.mock import patch
         os.environ["MEMORY_MCP_EXTRACT"] = "1"
         os.environ["MEMORY_MCP_EXTRACT_MIN_CHARS"] = "100"
@@ -2385,14 +2586,51 @@ class AuditRegressionTest(unittest.TestCase):
         self.assertEqual(result["stored"], 1, result)
         con = mcp.get_db()
         row = con.execute(
-            "SELECT domain, trust, strong, importance, workspace_id FROM facts "
+            "SELECT id, domain, trust, strong, importance, confirmed, workspace_id FROM facts "
             "WHERE text=?", ["global extracted metadata marker"]).fetchone()
         con.close()
         self.assertEqual(row["domain"], "reference")
-        self.assertEqual(row["trust"], "high")
-        self.assertEqual(row["strong"], 1)
+        self.assertEqual(row["trust"], "medium")
+        self.assertEqual(row["strong"], 0)
         self.assertEqual(row["importance"], 0.9)
         self.assertEqual(row["workspace_id"], "")
+        self.assertEqual(row["confirmed"], 0)
+        pending = mcp.review_pending({})
+        self.assertTrue(any(item["id"] == row["id"] for item in pending["facts"]))
+        confirmed = mcp.confirm_fact({"id": row["id"]})
+        self.assertEqual(confirmed["trust"], "high")
+        self.assertTrue(confirmed["confirmed"])
+
+    def test_stdio_returns_jsonrpc_errors_for_non_object_and_bad_params(self):
+        import subprocess
+
+        env = os.environ.copy()
+        env["MEMORY_MCP_DB"] = os.path.join(self.tmpdir, "stdio.db")
+        request = (
+            "null\n"
+            "[]\n"
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":[]}\n'
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":[]}\n'
+            '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_database","arguments":{"name":5}}}\n'
+            "{not valid json\n"
+            '{"jsonrpc":"2.0","id":3,"method":"ping"}\n'
+        )
+        completed = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                          "memory_mcp.py")],
+            input=request, text=True, capture_output=True, env=env, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        responses = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertEqual(len(responses), 7, responses)
+        self.assertEqual(responses[0]["error"]["code"], -32600)
+        self.assertEqual(responses[1]["error"]["code"], -32600)
+        self.assertEqual(responses[2]["error"]["code"], -32602)
+        self.assertEqual(responses[3]["error"]["code"], -32602)
+        self.assertTrue(responses[4]["result"]["isError"])
+        self.assertIn("tool execution failed", responses[4]["result"]["content"][0]["text"])
+        self.assertNotIn("strip", responses[4]["result"]["content"][0]["text"])
+        self.assertEqual(responses[5]["error"]["code"], -32700)
+        self.assertEqual(responses[6]["result"], {})
 
     def test_credential_bearing_http_requires_explicit_opt_in(self):
         from http_security import validate_http_url
