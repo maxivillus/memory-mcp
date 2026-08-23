@@ -3,7 +3,6 @@
 - Status: Proposed (PM ratification required)
 - Date: 2026-08-20
 - Scope: `memory-mcp` product repository, v0.13
-- Request source: NTL-668 / issue `b2f34554-be5a-4c33-b8d5-5af38c7f1b6b`
 
 ## Context
 

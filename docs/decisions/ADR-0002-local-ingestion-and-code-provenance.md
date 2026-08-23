@@ -3,7 +3,6 @@
 - Status: Proposed (implementation complete; PM acceptance follows issue review)
 - Date: 2026-08-22
 - Scope: `memory-mcp` product repository, v0.16 ingestion and v0.17 advisory retrieval
-- Request source: NTL-682 / issue `01a02764-bd87-7143-8073-8607ccd4e8c0`
 
 ## Context
 
