@@ -32,6 +32,13 @@ Tools:
   list_handoffs {workspace, owner?, state?, limit?}
   handoff_accept {handoff_ref, actor, workspace, cwd?, max_chars?}
   handoff_cancel {handoff_ref, actor, workspace}
+  -- v0.18 runs, issue/PR links, anchored queries, access telemetry --
+  run_begin {run_id, workspace?, issue_ref?, pr_ref?, session_id?, cwd?, source?}
+  run_end {run_id, workspace?, base_sha?, head_sha?, files_changed?, diff?, issue_ref?, pr_ref?}
+  link_run {run_id, workspace?, issue_ref?, pr_ref?}
+  query_run {run_id?, workspace?, state?, issue_ref?, limit?}
+  prepare_summary {run_id, workspace?, max_decisions?}
+  query_anchored {path?, symbol?, repo?, workspace?, limit?, purpose?}
   -- v0.3 graph/decisions/provenance --
   remember_entity {name, type?, aliases?}
   remember_relation {subject, predicate, object, source_fact_id?}
@@ -48,7 +55,7 @@ Tools:
   detect_conflicts {text}
 """
 import base64
-import fnmatch, hashlib, json, os, re, sqlite3, sys, tempfile
+import fnmatch, hashlib, json, os, re, sqlite3, sys, tempfile, time
 from datetime import datetime, timedelta, timezone
 
 def default_db_path():
@@ -115,6 +122,15 @@ _HANDOFF_MAX_TTL = _env_int("MEMORY_MCP_HANDOFF_MAX_TTL", 7 * 24 * 60 * 60, 0)
 _HANDOFF_MAX_CONTENT_BYTES = _env_int(
     "MEMORY_MCP_HANDOFF_MAX_CONTENT_BYTES", 256 * 1024, 1)
 _HANDOFF_MAX_LIST = 100
+
+# v0.18 runs, issue/PR links, and memory access telemetry. Runs keep the
+# bounded, additive pattern of v0.13: a small per-workspace index table plus
+# bounded client-supplied git facts (the server never shells out to git).
+_RUN_MAX_FIELD_CHARS = _env_int("MEMORY_MCP_RUN_MAX_FIELD_CHARS", 256, 1)
+_RUN_MAX_FILES = _env_int("MEMORY_MCP_RUN_MAX_FILES", 200, 1)
+_RUN_MAX_DIFF_BYTES = _env_int("MEMORY_MCP_RUN_MAX_DIFF_BYTES", 64 * 1024, 1)
+_RUN_MAX_SUMMARY_DECISIONS = 10
+_ACCESS_MAX_EVENTS = _env_int("MEMORY_MCP_ACCESS_MAX_EVENTS", 5000, 1)
 _LIFECYCLE_EXCLUDED_GLOBS = (
     ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx",
     "id_rsa*", "credentials*", "secrets*",
@@ -291,6 +307,8 @@ CREATE TABLE IF NOT EXISTS decisions (
   confidence REAL,
   decision_maker TEXT NOT NULL DEFAULT '',
   issue_ref TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  symbol TEXT NOT NULL DEFAULT '',
   parent_decision_id INTEGER,
   workspace_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
@@ -434,6 +452,47 @@ CREATE TABLE IF NOT EXISTS workspaces (
 CREATE TABLE IF NOT EXISTS activity_days (
   day TEXT PRIMARY KEY
 );
+
+-- v0.18 (2026-08-23): bounded run records. A run is the client-side
+-- execution window (e.g. one issue/task turn); git facts (base/head sha,
+-- changed files, diff) are supplied by the client and never shelled out.
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  issue_ref TEXT NOT NULL DEFAULT '',
+  pr_ref TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  cwd TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  base_sha TEXT NOT NULL DEFAULT '',
+  head_sha TEXT NOT NULL DEFAULT '',
+  files_changed TEXT NOT NULL DEFAULT '',
+  diff TEXT NOT NULL DEFAULT '',
+  diff_truncated INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open','closed')),
+  workspace_id TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  ended_at TEXT NOT NULL DEFAULT '',
+  UNIQUE(workspace_id, run_id)
+);
+CREATE INDEX IF NOT EXISTS runs_workspace_idx
+  ON runs(workspace_id, created_at, id);
+
+-- v0.18 (2026-08-23): bounded memory access telemetry — which retrieval
+-- sites returned what, without payloads. Retention is capped per workspace
+-- (MEMORY_MCP_ACCESS_MAX_EVENTS, default 5000).
+CREATE TABLE IF NOT EXISTS memory_access_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id TEXT NOT NULL DEFAULT '',
+  channel TEXT NOT NULL DEFAULT 'pull' CHECK (channel IN ('pull','push')),
+  site TEXT NOT NULL,
+  query_hash TEXT NOT NULL DEFAULT '',
+  result_count INTEGER NOT NULL DEFAULT 0,
+  latency_ms REAL NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS access_events_workspace_idx
+  ON memory_access_events(workspace_id, created_at, id);
 """
 
 # Optional semantic search (embeddings.py) — created here so the schema is
@@ -518,6 +577,7 @@ def _open_db(path):
     _migrate_evidence(con)
     _migrate_fts(con, preexisting_fts)
     _migrate_categories(con)
+    _migrate_decisions_anchors(con)
     return con
 
 
@@ -539,6 +599,18 @@ def _migrate_categories(con):
     existing = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
     if "category_id" not in existing:
         con.execute("ALTER TABLE facts ADD COLUMN category_id INTEGER")
+    con.commit()
+
+
+def _migrate_decisions_anchors(con):
+    """v0.18 additive migration: `decisions.path` / `decisions.symbol` code
+    anchors (default ''), mirroring the evidence anchor fields so decisions
+    can be queried by file/symbol like facts are."""
+    existing = {r["name"] for r in con.execute("PRAGMA table_info(decisions)")}
+    if "path" not in existing:
+        con.execute("ALTER TABLE decisions ADD COLUMN path TEXT NOT NULL DEFAULT ''")
+    if "symbol" not in existing:
+        con.execute("ALTER TABLE decisions ADD COLUMN symbol TEXT NOT NULL DEFAULT ''")
     con.commit()
 
 
@@ -1613,6 +1685,417 @@ def handoff_cancel(args):
         con.close()
 
 
+# ---- v0.18 (2026-08-23): runs, issue/PR links, anchored queries, and
+# ---- bounded memory access telemetry ------------------------------------
+# A "run" is one client-side execution window (e.g. an issue/task turn).
+# Git facts are supplied by the client — the server never shells out to git.
+
+
+def _run_field(args, name, maximum=_RUN_MAX_FIELD_CHARS):
+    value = args.get(name, "") or ""
+    if not isinstance(value, str):
+        return None, {"error": "%s must be a string" % name}
+    value = value.strip()
+    if len(value) > maximum:
+        return None, {"error": "%s is too long" % name}
+    return value, None
+
+
+def _run_meta(row):
+    meta = dict(row)
+    try:
+        meta["files_changed"] = json.loads(meta.get("files_changed") or "[]")
+    except (TypeError, ValueError):
+        meta["files_changed"] = []
+    diff = meta.get("diff") or ""
+    meta["diff_clipped"] = len(diff) > _CONTEXT_MAX_READ_CHARS
+    meta["diff"] = diff[:_CONTEXT_MAX_READ_CHARS] if meta["diff_clipped"] else diff
+    meta["diff_truncated"] = bool(meta.get("diff_truncated"))
+    return meta
+
+
+def _record_access(ws, site, query, result_count, latency_ms):
+    """Append one bounded memory-access telemetry row. Best-effort by design:
+    a telemetry failure must never break retrieval."""
+    try:
+        con = get_db()
+        try:
+            con.execute(
+                "INSERT INTO memory_access_events (workspace_id, channel, site, query_hash, "
+                "result_count, latency_ms, created_at) VALUES (?,?,?,?,?,?,?)",
+                (ws, "push" if site == "compose_recall" else "pull", site,
+                 hashlib.sha256((query or "").encode("utf-8")).hexdigest(),
+                 int(result_count or 0), round(float(latency_ms or 0), 3), now()))
+            con.execute(
+                "DELETE FROM memory_access_events WHERE workspace_id=? AND id NOT IN "
+                "(SELECT id FROM memory_access_events WHERE workspace_id=? "
+                " ORDER BY created_at DESC, id DESC LIMIT ?)",
+                (ws, ws, _ACCESS_MAX_EVENTS))
+            con.commit()
+        finally:
+            con.close()
+    except Exception:
+        pass
+
+
+def _like_escape(value):
+    return (value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+
+
+def run_begin(args):
+    """Open a run record; idempotent per (workspace, run_id)."""
+    run_id, err = _run_field(args, "run_id")
+    if err:
+        return err
+    if not run_id:
+        return {"error": "run_id is required"}
+    issue_ref, err = _run_field(args, "issue_ref")
+    if err:
+        return err
+    pr_ref, err = _run_field(args, "pr_ref")
+    if err:
+        return err
+    session_id, err = _run_field(args, "session_id")
+    if err:
+        return err
+    cwd, err = _run_field(args, "cwd", _LIFECYCLE_MAX_PATH_CHARS)
+    if err:
+        return err
+    source, err = _run_field(args, "source")
+    if err:
+        return err
+    ws = _workspace(args)
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, ws)
+        if inactive:
+            return inactive
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM runs WHERE workspace_id=? AND run_id=?",
+                          (ws, run_id)).fetchone()
+        if row:
+            con.rollback()
+            if row["state"] == "closed":
+                return {"error": "run already closed", "run": _run_meta(row)}
+            return {"run": _run_meta(row), "duplicate": True}
+        ts = now()
+        con.execute(
+            "INSERT INTO runs (run_id, issue_ref, pr_ref, session_id, cwd, source, "
+            "state, workspace_id, created_at) VALUES (?,?,?,?,?,?,'open',?,?)",
+            (run_id, issue_ref, pr_ref, session_id, cwd, source, ws, ts))
+        con.commit()
+        row = con.execute("SELECT * FROM runs WHERE workspace_id=? AND run_id=?",
+                          (ws, run_id)).fetchone()
+        return {"run": _run_meta(row), "duplicate": False}
+    except sqlite3.DatabaseError as e:
+        con.rollback()
+        return {"error": f"run begin failed: {e}"}
+    finally:
+        con.close()
+
+
+def run_end(args):
+    """Close a run with bounded client-supplied git facts."""
+    run_id, err = _run_field(args, "run_id")
+    if err:
+        return err
+    if not run_id:
+        return {"error": "run_id is required"}
+    base_sha, err = _run_field(args, "base_sha", 64)
+    if err:
+        return err
+    head_sha, err = _run_field(args, "head_sha", 64)
+    if err:
+        return err
+    issue_ref, err = _run_field(args, "issue_ref")
+    if err:
+        return err
+    pr_ref, err = _run_field(args, "pr_ref")
+    if err:
+        return err
+    files = args.get("files_changed", [])
+    if files is None:
+        files = []
+    if not isinstance(files, list) or any(not isinstance(f, str) or not f.strip() for f in files):
+        return {"error": "files_changed must be an array of non-empty strings"}
+    files = list(dict.fromkeys(f.strip() for f in files))
+    if len(files) > _RUN_MAX_FILES:
+        return {"error": f"files_changed may contain at most {_RUN_MAX_FILES} paths"}
+    for f in files:
+        if len(f) > _LIFECYCLE_MAX_PATH_CHARS:
+            return {"error": "a files_changed entry is too long"}
+    diff = args.get("diff") or ""
+    if not isinstance(diff, str):
+        return {"error": "diff must be a string"}
+    diff = diff.strip()
+    truncated = False
+    if len(diff.encode("utf-8")) > _RUN_MAX_DIFF_BYTES:
+        diff = diff.encode("utf-8")[:_RUN_MAX_DIFF_BYTES].decode("utf-8", "ignore")
+        truncated = True
+    ws = _workspace(args)
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, ws)
+        if inactive:
+            return inactive
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM runs WHERE workspace_id=? AND run_id=?",
+                          (ws, run_id)).fetchone()
+        if not row:
+            con.rollback()
+            return {"error": "run not found — call run_begin first", "run_id": run_id}
+        if row["state"] == "closed":
+            con.rollback()
+            return {"error": "run already closed", "run": _run_meta(row)}
+        ts = now()
+        con.execute(
+            "UPDATE runs SET state='closed', base_sha=?, head_sha=?, files_changed=?, diff=?, "
+            "diff_truncated=?, issue_ref=COALESCE(NULLIF(?,''), issue_ref), "
+            "pr_ref=COALESCE(NULLIF(?,''), pr_ref), ended_at=? WHERE id=?",
+            (base_sha, head_sha, json.dumps(files, ensure_ascii=False), diff,
+             1 if truncated else 0, issue_ref, pr_ref, ts, row["id"]))
+        con.commit()
+        row = con.execute("SELECT * FROM runs WHERE workspace_id=? AND run_id=?",
+                          (ws, run_id)).fetchone()
+        return {"closed": True, "run": _run_meta(row), "diff_truncated": truncated}
+    except sqlite3.DatabaseError as e:
+        con.rollback()
+        return {"error": f"run end failed: {e}"}
+    finally:
+        con.close()
+
+
+def link_run(args):
+    """Bind a run to issue/PR refs (at least one is required)."""
+    run_id, err = _run_field(args, "run_id")
+    if err:
+        return err
+    if not run_id:
+        return {"error": "run_id is required"}
+    issue_ref, err = _run_field(args, "issue_ref")
+    if err:
+        return err
+    pr_ref, err = _run_field(args, "pr_ref")
+    if err:
+        return err
+    if not issue_ref and not pr_ref:
+        return {"error": "issue_ref or pr_ref is required"}
+    ws = _workspace(args)
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, ws)
+        if inactive:
+            return inactive
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM runs WHERE workspace_id=? AND run_id=?",
+                          (ws, run_id)).fetchone()
+        if not row:
+            con.rollback()
+            return {"error": "run not found", "run_id": run_id}
+        con.execute(
+            "UPDATE runs SET issue_ref=COALESCE(NULLIF(?,''), issue_ref), "
+            "pr_ref=COALESCE(NULLIF(?,''), pr_ref) WHERE id=?",
+            (issue_ref, pr_ref, row["id"]))
+        con.commit()
+        row = con.execute("SELECT * FROM runs WHERE workspace_id=? AND run_id=?",
+                          (ws, run_id)).fetchone()
+        return {"linked": True, "run": _run_meta(row)}
+    except sqlite3.DatabaseError as e:
+        con.rollback()
+        return {"error": f"link_run failed: {e}"}
+    finally:
+        con.close()
+
+
+def query_run(args):
+    """Run record(s): one by run_id, or a filtered list."""
+    ws = _workspace(args)
+    run_id, err = _run_field(args, "run_id")
+    if err:
+        return err
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, ws)
+        if inactive:
+            return inactive
+        if run_id:
+            row = con.execute("SELECT * FROM runs WHERE workspace_id=? AND run_id=?",
+                              (ws, run_id)).fetchone()
+            if not row:
+                return {"error": "run not found", "run_id": run_id}
+            return {"run": _run_meta(row)}
+        sql = "SELECT * FROM runs WHERE workspace_id=?"
+        params = [ws]
+        if args.get("state"):
+            if args["state"] not in ("open", "closed"):
+                return {"error": "state must be open or closed"}
+            sql += " AND state=?"
+            params.append(args["state"])
+        if args.get("issue_ref"):
+            sql += " AND issue_ref=?"
+            params.append(args["issue_ref"])
+        limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
+        if err:
+            return err
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        rows = [_run_meta(r) for r in con.execute(sql, params)]
+        return {"count": len(rows), "runs": rows}
+    finally:
+        con.close()
+
+
+def prepare_summary(args):
+    """Assemble a ready-to-post markdown summary from a run's own records
+    (decisions recorded in its window or bound to its issue_ref, and the
+    event catalog of the window). Posts nothing."""
+    run_id, err = _run_field(args, "run_id")
+    if err:
+        return err
+    if not run_id:
+        return {"error": "run_id is required"}
+    max_decisions, err = _bounded_int_arg(
+        args, "max_decisions", 5, 1, _RUN_MAX_SUMMARY_DECISIONS)
+    if err:
+        return err
+    ws = _workspace(args)
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, ws)
+        if inactive:
+            return inactive
+        row = con.execute("SELECT * FROM runs WHERE workspace_id=? AND run_id=?",
+                          (ws, run_id)).fetchone()
+        if not row:
+            return {"error": "run not found", "run_id": run_id}
+        meta = _run_meta(row)
+        window = [row["created_at"], row["ended_at"] or now()]
+        sql = ("SELECT id, category, subject, scenario, reasoning, outcome, confidence, "
+               "decision_maker, issue_ref, path, symbol, created_at FROM decisions "
+               "WHERE workspace_id=? AND ((created_at >= ? AND created_at <= ?)")
+        params = [ws, window[0], window[1]]
+        if row["issue_ref"]:
+            sql += " OR issue_ref=?"
+            params.append(row["issue_ref"])
+        sql += ") ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(max_decisions)
+        decisions = [dict(r) for r in con.execute(sql, params)]
+        events = [dict(r) for r in con.execute(
+            "SELECT event_kind, event_id, session_id, created_at FROM lifecycle_events "
+            "WHERE workspace_id=? AND created_at >= ? AND created_at <= ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 10",
+            (ws, window[0], window[1]))]
+        lines = ["## Run summary"]
+        if meta["issue_ref"]:
+            lines[0] += f" · {meta['issue_ref']}"
+        if meta["pr_ref"]:
+            lines[0] += f" · {meta['pr_ref']}"
+        lines.append(f"- window: {meta['created_at']} → {meta['ended_at'] or 'open'}")
+        if meta["base_sha"] or meta["head_sha"]:
+            lines.append(f"- commits: {meta['base_sha'] or '?'} → {meta['head_sha'] or '?'}")
+        if meta["files_changed"]:
+            lines.append("- files changed: " + ", ".join(meta["files_changed"][:20]))
+        if decisions:
+            lines.append("")
+            lines.append("### Decisions")
+            for d in decisions:
+                loc = f" ({d['path']})" if d["path"] else ""
+                subject = d["subject"] or (d["scenario"] or "")[:80]
+                lines.append(f"- {subject}{loc}: {d['outcome'] or 'recorded'}")
+        if events:
+            lines.append("")
+            lines.append("### Events")
+            for e in events:
+                lines.append(f"- {e['event_kind']} ({e['event_id']})")
+        return {"run": meta, "summary": "\n".join(lines),
+                "decisions": decisions, "events": events}
+    finally:
+        con.close()
+
+
+def query_anchored(args):
+    """Facts (via evidence code anchors) and decisions (via their own
+    path/symbol anchors) bound to a code path and/or symbol."""
+    policy_error = _advisory_only_error(args, "query_anchored")
+    if policy_error:
+        return policy_error
+    path = (args.get("path") or "").strip()
+    symbol = (args.get("symbol") or "").strip()
+    if not path and not symbol:
+        return {"error": "path or symbol is required"}
+    if len(path) > _EVIDENCE_MAX_FIELD_CHARS or len(symbol) > _EVIDENCE_MAX_FIELD_CHARS:
+        return {"error": "path/symbol too long"}
+    repo = (args.get("repo") or "").strip()
+    if len(repo) > _EVIDENCE_MAX_FIELD_CHARS:
+        return {"error": "repo is too long"}
+    limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
+    if err:
+        return err
+    ws = _workspace(args)
+    t0 = time.monotonic()
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, ws)
+        if inactive:
+            return inactive
+        facts = []
+        if path or symbol:
+            sql = ("SELECT DISTINCT f.id, f.text, f.source, f.project, f.domain, f.trust, "
+                   "f.strong, f.created_at, c.name AS category "
+                   "FROM evidence e JOIN facts f ON f.id = e.fact_id "
+                   "LEFT JOIN categories c ON c.id = f.category_id "
+                   "WHERE f.archived=0 AND f.invalid_at='' AND f.lifecycle='active'")
+            params = []
+            if path:
+                sql += " AND e.path LIKE ? ESCAPE '\\'"
+                params.append("%" + _like_escape(path) + "%")
+            if symbol:
+                sql += " AND lower(e.symbol)=lower(?)"
+                params.append(symbol)
+            if repo:
+                sql += " AND e.repo=?"
+                params.append(repo)
+            sql += _ws_filter("f", ws)
+            if ws:
+                params.append(ws)
+            sql += " ORDER BY f.updated_at DESC, f.id DESC LIMIT ?"
+            params.append(limit)
+            for r in con.execute(sql, params):
+                fact = dict(r)
+                text = fact["text"]
+                fact["text_clipped"] = len(text) > 500
+                fact["text"] = text[:500] + ("…" if fact["text_clipped"] else "")
+                fact["evidence"] = [dict(x) for x in con.execute(
+                    "SELECT source_ref, repo, ref, path, symbol, start_line, end_line, "
+                    "resolution_status FROM evidence WHERE fact_id=? "
+                    "ORDER BY created_at DESC LIMIT 5", (fact["id"],))]
+                facts.append(fact)
+        sql = ("SELECT id, category, subject, scenario, reasoning, outcome, confidence, "
+               "decision_maker, issue_ref, path, symbol, created_at "
+               "FROM decisions WHERE 1=1")
+        params = []
+        if path:
+            sql += " AND decisions.path LIKE ? ESCAPE '\\'"
+            params.append("%" + _like_escape(path) + "%")
+        if symbol:
+            sql += " AND lower(decisions.symbol)=lower(?)"
+            params.append(symbol)
+        sql += _ws_check("decisions", ws)
+        if ws:
+            params.append(ws)
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        decisions = [dict(r) for r in con.execute(sql, params)]
+        result = {"count": len(facts) + len(decisions), "facts": facts,
+                  "decisions": decisions, "memory_policy": "advisory_only",
+                  "safety_critical_allowed": False}
+        _record_access(ws, "query_anchored", path or symbol, result["count"],
+                       time.monotonic() - t0)
+        return result
+    finally:
+        con.close()
+
+
 def put_context(args):
     """Store an immutable, named context artifact and optional parent refs."""
     workspace, err = _context_scope(args)
@@ -2345,7 +2828,12 @@ def compose_recall(args):
     m = _mod("recall", "MEMORY_MCP_RECALL")
     if m is None:
         return _disabled("MEMORY_MCP_RECALL")
-    return m.compose_recall(args)
+    t0 = time.monotonic()
+    res = m.compose_recall(args)
+    if isinstance(res, dict) and "error" not in res:
+        _record_access(_workspace(args), "compose_recall", args.get("turn_text", ""),
+                       res.get("count", 0), time.monotonic() - t0)
+    return res
 
 
 def sweep_freshness(args):
@@ -2817,6 +3305,7 @@ def search_facts(args):
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query is required"}
+    t0 = time.monotonic()
     limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
     if err:
         return err
@@ -2906,6 +3395,7 @@ def search_facts(args):
                   "safety_critical_allowed": False}
         if args.get("graph"):
             result["graph"] = len(graph)
+        _record_access(ws, "search_facts", query, len(rows), time.monotonic() - t0)
         return result
     except sqlite3.OperationalError as e:
         return {"error": f"query failed: {e}", "facts": []}
@@ -2924,6 +3414,7 @@ def search_semantic(args):
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query is required"}
+    t0 = time.monotonic()
     limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
     if err:
         return err
@@ -2945,6 +3436,7 @@ def search_semantic(args):
         if isinstance(res, dict):
             res["memory_policy"] = "advisory_only"
             res["safety_critical_allowed"] = False
+        _record_access(ws, "search_semantic", query, len(rows), time.monotonic() - t0)
         return res
     finally:
         con.close()
@@ -3388,6 +3880,10 @@ def record_decision(args):
     scenario = (args.get("scenario") or "").strip()
     if not scenario:
         return {"error": "scenario is required"}
+    path = (args.get("path") or "").strip()
+    symbol = (args.get("symbol") or "").strip()
+    if len(path) > _EVIDENCE_MAX_FIELD_CHARS or len(symbol) > _EVIDENCE_MAX_FIELD_CHARS:
+        return {"error": "path/symbol too long"}
     ts = now()
     confidence = args.get("confidence")
     if confidence is not None:
@@ -3400,11 +3896,13 @@ def record_decision(args):
             return err
         cur = con.execute(
             "INSERT INTO decisions (category, subject, scenario, reasoning, outcome, confidence, "
-            "decision_maker, issue_ref, parent_decision_id, workspace_id, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "decision_maker, issue_ref, path, symbol, parent_decision_id, workspace_id, "
+            "created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (category, args.get("subject", ""), scenario, args.get("reasoning", ""),
              args.get("outcome", ""), confidence, args.get("decision_maker", ""),
-             args.get("issue_ref", ""), args.get("parent_decision_id"), workspace, ts, ts))
+             args.get("issue_ref", ""), path, symbol, args.get("parent_decision_id"),
+             workspace, ts, ts))
         con.commit()
         return {"id": cur.lastrowid, "category": category, "scenario": scenario,
                 "created_at": ts}
@@ -3413,7 +3911,7 @@ def record_decision(args):
 
 
 def query_decisions(args):
-    sql = "SELECT id, category, subject, scenario, reasoning, outcome, confidence, decision_maker, issue_ref, parent_decision_id, created_at FROM decisions WHERE 1=1"
+    sql = "SELECT id, category, subject, scenario, reasoning, outcome, confidence, decision_maker, issue_ref, path, symbol, parent_decision_id, created_at FROM decisions WHERE 1=1"
     params = []
     ws = _workspace(args)
     sql += _ws_filter("decisions", ws)
@@ -3423,6 +3921,10 @@ def query_decisions(args):
         if args.get(key):
             sql += f" AND {key}=?"
             params.append(args[key])
+    for key in ("path", "symbol"):
+        if args.get(key):
+            sql += f" AND decisions.{key} LIKE ? ESCAPE '\\'"
+            params.append("%" + _like_escape(args[key]) + "%")
     sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
     limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
     if err:
@@ -3446,6 +3948,7 @@ def find_precedents(args):
     scenario = (args.get("scenario") or "").strip()
     if not scenario:
         return {"error": "scenario is required"}
+    t0 = time.monotonic()
     terms = fts_terms(scenario)
     if not terms:
         return {"error": "scenario has no searchable terms", "count": 0, "precedents": []}
@@ -3499,6 +4002,8 @@ def find_precedents(args):
                                 for fid, score in ranked]
                 except Exception:
                     pass
+        _record_access(ws, "find_precedents", scenario, len(rows),
+                       time.monotonic() - t0)
         return {"count": len(rows), "precedents": rows,
                 "semantic": bool(args.get("semantic")),
                 "memory_policy": "advisory_only",
@@ -3604,6 +4109,7 @@ def _evidence_anchor_fields(args):
 
 
 def get_provenance(args):
+    t0 = time.monotonic()
     con = get_db()
     try:
         ws = _workspace(args)
@@ -3625,6 +4131,9 @@ def get_provenance(args):
             "start_line, start_col, end_line, end_col, selected_text_hash, "
             "resolution_status, created_at FROM evidence "
             "WHERE fact_id=? ORDER BY created_at", (fact["id"],))]
+        _record_access(ws, "get_provenance",
+                       str(args.get("fact_id") or args.get("sha256") or ""), 1,
+                       time.monotonic() - t0)
         return {"fact": dict(fact), "evidence": evidence}
     finally:
         con.close()
@@ -4056,9 +4565,27 @@ def stats(_args=None):
                                      ws_params).fetchone()[0],
             "evidence": con.execute("SELECT COUNT(*) FROM evidence e JOIN facts f ON f.id=e.fact_id "
                                     "WHERE 1=1" + _ws_check("f", ws), ws_params).fetchone()[0],
+            "runs": con.execute("SELECT COUNT(*) FROM runs WHERE 1=1" + _ws_check("runs", ws),
+                                ws_params).fetchone()[0],
         }
+        access = {"events": 0, "by_site": {}, "last_at": ""}
+        try:
+            access["events"] = con.execute(
+                "SELECT COUNT(*) FROM memory_access_events WHERE 1=1" +
+                _ws_check("memory_access_events", ws), ws_params).fetchone()[0]
+            access["by_site"] = {r["site"]: r["n"] for r in con.execute(
+                "SELECT site, COUNT(*) n FROM memory_access_events WHERE 1=1" +
+                _ws_check("memory_access_events", ws) + " GROUP BY site ORDER BY n DESC",
+                ws_params)}
+            last = con.execute(
+                "SELECT created_at FROM memory_access_events WHERE 1=1" +
+                _ws_check("memory_access_events", ws) +
+                " ORDER BY created_at DESC, id DESC LIMIT 1", ws_params).fetchone()
+            access["last_at"] = last["created_at"] if last else ""
+        except sqlite3.DatabaseError:
+            pass  # telemetry table missing on very old stores — stats still works
         return {"total": total, "strong": strong, "by_trust": by_trust, "by_domain": by_domain,
-                "counts": counts}
+                "counts": counts, "access": access}
     finally:
         con.close()
 
@@ -4779,6 +5306,91 @@ TOOLS = {
             "required": ["handoff_ref", "actor", "workspace"],
         },
     },
+    "run_begin": {
+        "description": "Open a run record (one execution window, e.g. an issue/task turn). Idempotent per (workspace, run_id).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "maxLength": 256, "description": "Opaque unique id for this run"},
+                "workspace": {"type": "string", "description": "Project scope id"},
+                "issue_ref": {"type": "string", "maxLength": 256, "description": "Optional issue/ticket reference"},
+                "pr_ref": {"type": "string", "maxLength": 256, "description": "Optional pull-request reference"},
+                "session_id": {"type": "string", "maxLength": 256},
+                "cwd": {"type": "string", "maxLength": 1024},
+                "source": {"type": "string", "maxLength": 256, "description": "Origin: runtime/client"},
+            },
+            "required": ["run_id"],
+        },
+    },
+    "run_end": {
+        "description": "Close a run with bounded client-supplied git facts (base/head sha, changed files, diff). The server never shells out to git.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "maxLength": 256},
+                "workspace": {"type": "string", "description": "Project scope id"},
+                "base_sha": {"type": "string", "maxLength": 64},
+                "head_sha": {"type": "string", "maxLength": 64},
+                "files_changed": {"type": "array", "maxItems": 200, "items": {"type": "string", "maxLength": 1024}},
+                "diff": {"type": "string", "description": "Unified diff text; capped at 64 KiB (truncated flag is set)"},
+                "issue_ref": {"type": "string", "maxLength": 256},
+                "pr_ref": {"type": "string", "maxLength": 256},
+            },
+            "required": ["run_id"],
+        },
+    },
+    "link_run": {
+        "description": "Bind a run to issue/PR references (at least one is required; empty values keep the existing one).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "maxLength": 256},
+                "workspace": {"type": "string", "description": "Project scope id"},
+                "issue_ref": {"type": "string", "maxLength": 256},
+                "pr_ref": {"type": "string", "maxLength": 256},
+            },
+            "required": ["run_id"],
+        },
+    },
+    "query_run": {
+        "description": "Run record(s): one by run_id, or a filtered list (state/issue_ref). Diffs are clipped to bounded slices.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "maxLength": 256},
+                "workspace": {"type": "string", "description": "Project scope id"},
+                "state": {"type": "string", "enum": ["open", "closed"]},
+                "issue_ref": {"type": "string", "maxLength": 256},
+                "limit": {"type": "integer", "default": 20},
+            },
+        },
+    },
+    "prepare_summary": {
+        "description": "Assemble a ready-to-post markdown summary from a run's own records (decisions recorded in its window or bound to its issue_ref, event catalog). Posts nothing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "maxLength": 256},
+                "workspace": {"type": "string", "description": "Project scope id"},
+                "max_decisions": {"type": "integer", "default": 5, "minimum": 1, "maximum": 10},
+            },
+            "required": ["run_id"],
+        },
+    },
+    "query_anchored": {
+        "description": "Advisory lookup of facts (via evidence code anchors) and decisions (via their own path/symbol anchors) bound to a code path and/or symbol. Cannot authorize safety-critical operations.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "maxLength": 2048, "description": "File path fragment (case-insensitive substring match)"},
+                "symbol": {"type": "string", "maxLength": 2048, "description": "Exact symbol name (case-insensitive)"},
+                "repo": {"type": "string", "maxLength": 2048, "description": "Restrict to one repo (exact match)"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+                "limit": {"type": "integer", "default": 20},
+                "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed"},
+            },
+        },
+    },
     "search_facts": {
         "description": "Advisory full-text search over stored facts. It cannot authorize safety-critical operations. With semantic=true and MEMORY_MCP_EMBEDDINGS=1, merges lexical and embedding rankings (RRF) using the same eligibility filters.",
         "inputSchema": {
@@ -5072,6 +5684,8 @@ TOOLS = {
                 "confidence": {"type": "number"},
                 "decision_maker": {"type": "string"},
                 "issue_ref": {"type": "string"},
+                "path": {"type": "string", "maxLength": 2048, "description": "Optional code path anchor (queryable via query_anchored)"},
+                "symbol": {"type": "string", "maxLength": 2048, "description": "Optional symbol anchor (queryable via query_anchored)"},
                 "parent_decision_id": {"type": "integer"},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
@@ -5079,7 +5693,7 @@ TOOLS = {
         },
     },
     "query_decisions": {
-        "description": "List decisions with filters (category/subject/outcome/decision_maker/issue_ref).",
+        "description": "List decisions with filters (category/subject/outcome/decision_maker/issue_ref/path/symbol).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5088,6 +5702,8 @@ TOOLS = {
                 "outcome": {"type": "string"},
                 "decision_maker": {"type": "string"},
                 "issue_ref": {"type": "string"},
+                "path": {"type": "string", "description": "Path fragment (case-insensitive substring match)"},
+                "symbol": {"type": "string", "description": "Symbol fragment (case-insensitive substring match)"},
                 "limit": {"type": "integer", "default": 20},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
@@ -5303,6 +5919,12 @@ HANDLERS = {
     "list_handoffs": list_handoffs,
     "handoff_accept": handoff_accept,
     "handoff_cancel": handoff_cancel,
+    "run_begin": run_begin,
+    "run_end": run_end,
+    "link_run": link_run,
+    "query_run": query_run,
+    "prepare_summary": prepare_summary,
+    "query_anchored": query_anchored,
     "search_facts": search_facts,
     "search_semantic": search_semantic,
     "embed_backfill": embed_backfill,
@@ -5400,7 +6022,7 @@ def main():
                 "result": {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "memory-mcp", "version": "0.17.0"},
+                    "serverInfo": {"name": "memory-mcp", "version": "0.18.0"},
                 },
             }
         elif method == "tools/list":
