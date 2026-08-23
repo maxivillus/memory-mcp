@@ -349,8 +349,8 @@ the server:
 - `prepare_summary {run_id, workspace?, max_decisions?}` — assembles a
   ready-to-post markdown summary from the run's own records: decisions
   recorded inside its window or bound to its issue_ref, plus the window's
-  event catalog. It posts nothing (same boundary as `prepare_jira_comment`
-  in Coodra).
+  event catalog. It posts nothing (same boundary as a prepare-comment
+  helper).
 - `record_decision` and `query_decisions` now carry optional `path`/`symbol`
   code anchors (additive migration), and `query_anchored {path?, symbol?,
   repo?, workspace?, limit?, purpose?}` returns facts (via evidence anchors)
