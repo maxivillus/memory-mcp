@@ -19,8 +19,8 @@ pipeline into the server for runtimes that have no client patches.
   ingestion with `new` / `duplicate` / `related` classification. Preview is
   the default; `commit:true` only writes `new` items and leaves related,
   update, and contradiction candidates for review.
-- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?, chunk_chars?}` —
-  FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors.
+- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?, chunk_chars?, purpose?}` —
+  advisory FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors.
   `chunk_chars?` optionally adds bounded, offset-addressable chunks to hits.
 - `chunk_fact {id | fact_id | sha256, workspace?, chunk_chars?, chunk_overlap?, start_chunk?, max_chunks?}` — read one active fact through a bounded page API
 - `list_facts {project?, domain?, category?, limit?}` — recent non-archived facts
@@ -43,6 +43,11 @@ pipeline into the server for runtimes that have no client patches.
 - `handoff_begin {content, owner, workspace, source?, checksum?, ttl_seconds?, cwd?, shared?, idempotency_key?}` — create an expiring typed handoff over immutable context
 - `list_handoffs {workspace, owner?, state?, limit?}` — list open and terminal handoff metadata; expired rows are marked safely
 - `handoff_accept {handoff_ref, actor, workspace, cwd?, max_chars?}` / `handoff_cancel {handoff_ref, actor, workspace}` — one-shot owner-scoped accept or cancel transitions
+
+Retrieval is advisory only. `compose_recall`, `search_facts`, semantic search, and
+precedent lookup reject `purpose: "safety_critical"` fail-closed. Memory never
+authorizes registry writes, route selection, lock validity, or hash acceptance.
+Those decisions must use current Multica state and local lock/hash checks.
 
 `attach_evidence` accepts optional code-local fields (`repo`, `ref`, `path`,
 `symbol`, line/column range, `selected_text` or its SHA-256, and
@@ -478,10 +483,12 @@ pipeline modules below move each of them into the server when enabled:
   remembering — client-side by default, or `ingest_turn` (extract.py).
 - **Prompt injection / recall assembly** — the store is read on demand
   (`search_facts`, `summarize_index`) or via the client's own recall pipeline;
-  `compose_recall` (recall.py) returns a ready-to-inject block, so the client
-  only inserts it.
+  `compose_recall` (recall.py) returns a ready-to-inject advisory block, so the
+  client only inserts it. It sanitizes transcript input and leads retrieval
+  with the latest user intent instead of system/tool noise.
 - **Truth verification** — `trust`/`strong` are client-set metadata and query
-  filters, not a verification or protection mechanism.
+  filters, not a verification or protection mechanism. They never turn memory
+  into an authorization source.
 - **Semantic search** — optional module (`embeddings.py`, gated by
   `MEMORY_MCP_EMBEDDINGS=1`): `search_semantic` + hybrid `search_facts
   semantic=true` (RRF merge). The core stays lexical (FTS5 + BM25) with zero
@@ -506,8 +513,10 @@ activate only when set, and every failure degrades to store-only.
   `MEMORY_MCP_EXTRACT_MIN_CHARS` (default 800). When `MEMORY_MCP_VERIFY=1`,
   new facts are cross-checked and superseded ones archived.
 - **Recall assembly** (`MEMORY_MCP_RECALL=1`): `compose_recall {turn_text,
-  limit?, chars?, semantic?}` returns a ready-to-inject `<memory-recall>`
-  block (authoritative + background tiers, reasonix-compatible format);
+  limit?, chars?, semantic?, purpose?}` returns a ready-to-inject advisory
+  `<memory-recall>` block (authoritative + background tiers,
+  reasonix-compatible format); transcript noise is removed before retrieval and
+  `purpose: "safety_critical"` is rejected;
   `sweep_freshness {}` archives facts past their type's hard window (strong
   facts kept): reference 45d, user/feedback 365d, project 180d.
 - **Verification** (`MEMORY_MCP_VERIFY=1`): `verify_facts {text}` LLM

@@ -35,6 +35,68 @@ _PREAMBLE_BG = ("Automatically recalled low-authority background facts. They may
                 "details before relying on them.\n")
 
 _LOCAL_HOME = re.compile(r"(?i)(?:[a-z]:[\\/](?:users|documents and settings)[\\/][^\\/\s]+|/(?:users|home)/[^/\s]+)")
+_TOOL_NOISE_PREFIXES = (
+    "[tool:",
+    "[tool error:",
+    "[result:",
+    "[image]",
+    "[openai native compaction]",
+)
+
+
+def focus_turn_text(raw):
+    """Strip transcript noise and lead retrieval with the latest user intent.
+
+    Callers sometimes pass a complete session window to compose_recall even
+    though the operation is defined in terms of the current user turn. Keep
+    the transformation deterministic and return no query when the input
+    contains no recognizable prose.
+    """
+    raw = str(raw or "").strip()
+    if not raw:
+        return ""
+
+    kept = []
+    user_blocks = []
+    current_role = ""
+    current_user_lines = []
+    in_reminder = False
+
+    def flush_user():
+        if current_user_lines:
+            block = "\n".join(current_user_lines).strip()
+            if block:
+                user_blocks.append(block)
+            current_user_lines.clear()
+
+    for line in raw.splitlines():
+        trimmed = line.strip()
+        if trimmed.startswith("<system-reminder>"):
+            flush_user()
+            in_reminder = "</system-reminder>" not in trimmed
+            continue
+        if in_reminder:
+            if "</system-reminder>" in trimmed:
+                in_reminder = False
+            continue
+        if trimmed in ("User:", "Assistant:"):
+            flush_user()
+            current_role = trimmed[:-1].lower()
+            continue
+        if not trimmed or any(trimmed.lower().startswith(prefix)
+                              for prefix in _TOOL_NOISE_PREFIXES):
+            continue
+
+        kept.append(trimmed)
+        if current_role == "user":
+            current_user_lines.append(trimmed)
+
+    flush_user()
+    # A complete session window can contain several old assistant turns. They
+    # are useful for extraction, but not for selecting the bounded retrieval
+    # candidate set. When role markers exist, use only the latest user block.
+    # For direct unlabelled input, retain the cleaned prose as the fallback.
+    return (user_blocks[-1] if user_blocks else "\n".join(kept)).strip()
 
 
 def _budget(value):
@@ -46,9 +108,11 @@ def _budget(value):
 
 
 def compose_recall(args):
-    turn_text = (args.get("turn_text") or "").strip()
-    if not turn_text:
+    raw_turn_text = (args.get("turn_text") or "").strip()
+    if not raw_turn_text:
         return {"error": "turn_text is required"}
+    turn_text = focus_turn_text(raw_turn_text)
+    query_mode = "focused_user" if turn_text != raw_turn_text else "direct_turn"
     from memory_mcp import _bounded_int_arg
     limit, err = _bounded_int_arg(args, "limit", 8, 1, 20)
     if err:
@@ -141,7 +205,10 @@ def compose_recall(args):
     return {"count": len(hits), "authoritative": len(authoritative),
             "background": len(background), "graph": len(graph),
             "session_expanded": len(session_expanded),
-            "chars": len(block), "block": block}
+            "chars": len(block), "block": block,
+            "query_mode": query_mode,
+            "memory_policy": "advisory_only",
+            "safety_critical_allowed": False}
 
 
 def _entry(f):

@@ -2238,6 +2238,30 @@ def _disabled(env):
     return {"error": "disabled (set %s=1)" % env}
 
 
+def _advisory_only_error(args, operation):
+    """Reject explicit attempts to use memory as an authorization source."""
+    purpose = str(args.get("purpose") or "advisory").strip().lower()
+    if purpose not in ("advisory", "safety_critical"):
+        return {"error": "purpose must be advisory or safety_critical",
+                "code": "invalid_memory_purpose", "fail_closed": True,
+                "operation": operation}
+    if purpose == "safety_critical" or args.get("safety_critical") is True:
+        return {
+            "error": "memory-mcp is advisory-only and cannot authorize safety-critical operations",
+            "code": "advisory_only",
+            "fail_closed": True,
+            "operation": operation,
+            "memory_policy": "advisory_only",
+            "safety_critical_allowed": False,
+            "source_of_truth": [
+                "live_multica_state",
+                "current_registry_reads",
+                "lock_and_hash_checks",
+            ],
+        }
+    return None
+
+
 def ingest_turn(args):
     m = _mod("extract", "MEMORY_MCP_EXTRACT")
     if m is None:
@@ -2253,6 +2277,9 @@ def ingest_turn(args):
 
 
 def compose_recall(args):
+    policy_error = _advisory_only_error(args, "compose_recall")
+    if policy_error:
+        return policy_error
     m = _mod("recall", "MEMORY_MCP_RECALL")
     if m is None:
         return _disabled("MEMORY_MCP_RECALL")
@@ -2706,6 +2733,9 @@ def absorb(args):
 
 
 def search_facts(args):
+    policy_error = _advisory_only_error(args, "search_facts")
+    if policy_error:
+        return policy_error
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query is required"}
@@ -2790,7 +2820,9 @@ def search_facts(args):
         if chunk_params:
             rows = _add_fact_chunks(rows, *chunk_params)
         _mark_hits(con, rows)
-        result = {"count": len(rows), "facts": rows}
+        result = {"count": len(rows), "facts": rows,
+                  "memory_policy": "advisory_only",
+                  "safety_critical_allowed": False}
         if args.get("graph"):
             result["graph"] = len(graph)
         return result
@@ -2802,6 +2834,9 @@ def search_facts(args):
 
 def search_semantic(args):
     """Semantic (embedding) search — enabled only with MEMORY_MCP_EMBEDDINGS=1."""
+    policy_error = _advisory_only_error(args, "search_semantic")
+    if policy_error:
+        return policy_error
     emb = _emb()
     if emb is None:
         return {"error": "semantic search is disabled (set MEMORY_MCP_EMBEDDINGS=1)"}
@@ -2822,6 +2857,9 @@ def search_semantic(args):
         rows = res.get("facts", []) if isinstance(res, dict) else res or []
         _revive_degraded(con, query, ws)
         _mark_hits(con, rows)
+        if isinstance(res, dict):
+            res["memory_policy"] = "advisory_only"
+            res["safety_critical_allowed"] = False
         return res
     finally:
         con.close()
@@ -3309,6 +3347,9 @@ def query_decisions(args):
 
 
 def find_precedents(args):
+    policy_error = _advisory_only_error(args, "find_precedents")
+    if policy_error:
+        return policy_error
     scenario = (args.get("scenario") or "").strip()
     if not scenario:
         return {"error": "scenario is required"}
@@ -3365,7 +3406,10 @@ def find_precedents(args):
                                 for fid, score in ranked]
                 except Exception:
                     pass
-        return {"count": len(rows), "precedents": rows, "semantic": bool(args.get("semantic"))}
+        return {"count": len(rows), "precedents": rows,
+                "semantic": bool(args.get("semantic")),
+                "memory_policy": "advisory_only",
+                "safety_critical_allowed": False}
     except sqlite3.OperationalError as e:
         return {"error": f"query failed: {e}", "count": 0, "precedents": []}
     finally:
@@ -4604,7 +4648,7 @@ TOOLS = {
         },
     },
     "search_facts": {
-        "description": "Full-text search over stored facts (FTS5, BM25 ranking). With semantic=true and MEMORY_MCP_EMBEDDINGS=1, merges lexical and embedding rankings (RRF).",
+        "description": "Advisory full-text search over stored facts. It cannot authorize safety-critical operations. With semantic=true and MEMORY_MCP_EMBEDDINGS=1, merges lexical and embedding rankings (RRF).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4621,18 +4665,20 @@ TOOLS = {
                 "chunk_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "description": "Optionally add bounded chunks to each hit"},
                 "chunk_overlap": {"type": "integer", "minimum": 0, "maximum": 15999, "default": 0},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+                "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed; live state and lock/hash checks remain authoritative"},
             },
             "required": ["query"],
         },
     },
     "search_semantic": {
-        "description": "Semantic (embedding) search over stored facts — cosine similarity, best first. Requires MEMORY_MCP_EMBEDDINGS=1 (see embeddings.py).",
+        "description": "Advisory semantic search over stored facts. It cannot authorize safety-critical operations. Requires MEMORY_MCP_EMBEDDINGS=1 (see embeddings.py).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
                 "limit": {"type": "integer", "default": 20},
                 "threshold": {"type": "number", "default": 0.0, "description": "Minimum cosine similarity"},
+                "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed"},
             },
             "required": ["query"],
         },
@@ -4656,7 +4702,7 @@ TOOLS = {
         },
     },
     "compose_recall": {
-        "description": "Build a ready-to-inject <memory-recall> block for a user turn (server-side scoring: lexical + semantic + entity-graph RRF; see recall.py). Requires MEMORY_MCP_RECALL=1.",
+        "description": "Build an advisory ready-to-inject <memory-recall> block. The server focuses transcript input on the latest user intent and rejects purpose=safety_critical. Requires MEMORY_MCP_RECALL=1.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4667,6 +4713,7 @@ TOOLS = {
                 "graph": {"type": "boolean", "default": False, "description": "Expand via the entity graph (third RRF source)"},
                 "session_expand": {"type": "integer", "default": 0, "description": "Pull up to N sibling facts from the top hits' sessions (background)"},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+                "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed; memory never authorizes writes, locks, routes, or hashes"},
             },
             "required": ["turn_text"],
         },
@@ -4908,7 +4955,7 @@ TOOLS = {
         },
     },
     "find_precedents": {
-        "description": "Semantic precedent lookup: FTS BM25 over decision scenario/reasoning (terms OR-joined; optional category filter; semantic=true adds embedding RRF when MEMORY_MCP_EMBEDDINGS=1).",
+        "description": "Advisory precedent lookup: FTS BM25 over decision scenario/reasoning. It cannot authorize safety-critical operations.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4917,6 +4964,7 @@ TOOLS = {
                 "limit": {"type": "integer", "default": 10},
                 "semantic": {"type": "boolean", "default": False},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+                "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed"},
             },
             "required": ["scenario"],
         },

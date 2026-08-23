@@ -308,6 +308,40 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("rho endpoint", res["block"])
         self.assertNotIn("garden watering", res["block"])
 
+    def test_compose_recall_focuses_latest_user_query(self):
+        mcp.remember_fact({"text": "legacy-hydra-route is unrelated workflow noise", "source": "t"})
+        mcp.remember_fact({"text": "wf-scope-borealis uses the project workspace", "source": "t"})
+        transcript = (
+            "<system-reminder>\n"
+            "legacy-hydra-route is unrelated workflow noise\n"
+            "</system-reminder>\n"
+            "Assistant:\n"
+            "I inspected the old route.\n"
+            "[Tool: read]\n"
+            "[Result: legacy-hydra-route]\n"
+            "User:\n"
+            "How does wf-scope-borealis use the project workspace?"
+        )
+        res = mcp.compose_recall({"turn_text": transcript, "limit": 5, "chars": 2000})
+        self.assertNotIn("error", res, res)
+        self.assertEqual(res["query_mode"], "focused_user")
+        self.assertIn("wf-scope-borealis", res["block"])
+        self.assertNotIn("legacy-hydra-route", res["block"])
+        self.assertEqual(res["memory_policy"], "advisory_only")
+
+    def test_retrieval_rejects_safety_critical_purpose(self):
+        res = mcp.compose_recall({"turn_text": "workflow registry", "purpose": "safety_critical"})
+        self.assertEqual(res["code"], "advisory_only")
+        self.assertTrue(res["fail_closed"])
+        self.assertFalse(res["safety_critical_allowed"])
+
+    def test_compose_recall_rejects_noise_only_transcript(self):
+        res = mcp.compose_recall({
+            "turn_text": "<system-reminder>only noise</system-reminder>\n[Tool: read]",
+        })
+        self.assertEqual(res["error"], "no searchable terms")
+        self.assertEqual(res["count"], 0)
+
     def test_compose_recall_disabled(self):
         os.environ.pop("MEMORY_MCP_RECALL", None)
         res = mcp.compose_recall({"turn_text": "anything"})
@@ -1406,4 +1440,3 @@ class CategoryIndexTest(unittest.TestCase):
         self._fact("docker-образ пересобран", category="runtimes", workspace="cat-ws")
         rows = mcp.list_facts({"workspace": "cat-ws"})["facts"]
         self.assertEqual(rows[0]["category"], "runtimes")
-
