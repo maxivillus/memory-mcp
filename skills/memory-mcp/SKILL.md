@@ -23,8 +23,10 @@ session is visible to every later session.
 - `ingest_turn {transcript, session_ref?}` — server-side extraction: send a
   conversation transcript, the server's LLM provider extracts durable facts
   and stores them with provenance (when enabled).
-- `compose_recall {turn_text}` — returns a ready-to-inject `<memory-recall>`
-  block (server-side scoring); `sweep_freshness` archives stale facts.
+- `compose_recall {turn_text, purpose?}` — returns an advisory ready-to-inject
+  `<memory-recall>` block (server-side scoring); transcript input is focused on
+  the latest user intent before retrieval and `purpose: "safety_critical"` is
+  rejected fail-closed. `sweep_freshness` archives stale facts.
 - `verify_facts {text}` — LLM cross-check for contradictions/supersessions
   before writing; superseded facts are invalidated (bi-temporal) on
   high-confidence verdicts — history stays via `fact_history {id}`.
@@ -57,6 +59,9 @@ session is visible to every later session.
 - `search_facts` with `semantic=true` merges lexical (FTS5/BM25) and embedding
   rankings (RRF); `search_semantic` is pure embedding search — use it for
   paraphrased or cross-language recall when embeddings are enabled.
+- Retrieval is advisory only. Never use memory to authorize registry writes,
+  route selection, lock validity, or hash acceptance. Use current runtime state
+  and local lock/hash checks for those decisions.
 - `summarize_index` gives a compact freshest-first index for prompt budgets.
 - `forget_fact` soft-deletes (archives) an obsolete fact.
 - Credential-bearing provider requests use HTTPS by default. Setting
