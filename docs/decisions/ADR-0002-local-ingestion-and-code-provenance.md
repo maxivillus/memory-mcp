@@ -1,6 +1,6 @@
 # ADR-0002: Local ingestion and code-local provenance
 
-- Status: Proposed (implementation complete; PM acceptance follows issue review)
+- Status: Accepted (implementation complete; PM acceptance recorded in NTL-682)
 - Date: 2026-08-22
 - Scope: `memory-mcp` product repository, v0.16 ingestion and v0.17 advisory retrieval
 - Request source: NTL-682 / issue `01a02764-bd87-7143-8073-8607ccd4e8c0`
