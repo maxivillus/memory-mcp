@@ -24,11 +24,6 @@ _FACT_TYPES = ("user", "feedback", "project", "reference")
 _TRUST_LEVELS = ("high", "medium", "low")
 
 
-def _as_bool(value):
-    if isinstance(value, bool):
-        return value
-    return str(value or "").strip().lower() in ("1", "true", "yes", "y")
-
 PROMPT = """You extract durable facts from a conversation transcript for an
 agent memory store. Return ONLY JSON matching this schema:
 {"facts": [{"text": "...", "type": "user|feedback|project|reference", "trust": "high|medium|low", "strong": false, "scope": "project|global", "importance": 0.5}]}
@@ -42,6 +37,8 @@ Rules:
 - trust: high only for explicitly confirmed facts; medium default; low for
   unverified claims.
 - strong: true only for user-confirmed critical facts.
+- The server applies a human-confirmation gate to trust and strong metadata;
+  treat these fields as candidate confidence, not authorization.
 - importance: 0..1 — how valuable this fact is for future work (1 = likely
   needed again soon, 0 = barely worth keeping). Default 0.5.
 - scope: global only when the fact applies to every project.
@@ -62,11 +59,15 @@ def _remember(text, source, project, domain, importance=None, workspace="",
     from memory_mcp import remember_fact
     fact_type = fact_type if fact_type in _FACT_TYPES else "project"
     trust = trust if trust in _TRUST_LEVELS else "medium"
+    # Model confidence is advisory; only a human confirmation may grant the
+    # high-trust or strong authority used by retention and recall policy.
+    if trust == "high":
+        trust = "medium"
     effective_domain = domain or fact_type
     effective_workspace = "" if scope == "global" else workspace
     args = {"text": text, "source": source or "ingest_turn",
             "project": project or "", "domain": effective_domain,
-            "trust": trust, "strong": _as_bool(strong),
+            "trust": trust, "strong": False,
             "workspace": effective_workspace}
     if importance is not None:
         args["importance"] = importance

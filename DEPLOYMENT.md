@@ -60,6 +60,9 @@ Notes:
 - The DB dir must be writable by the container uid (e.g. `1001` for a
   codex-style user). Multiple containers can share the same DB — SQLite WAL +
   `busy_timeout 5000` handle multi-writer.
+- The server creates `backups/` with mode `0700`, writes database/JSON backup
+  files with mode `0600`, and publishes them atomically. Keep the mounted DB
+  directory private even when backups are not enabled.
 - `MEMORY_MCP_DB` is mandatory in containers: the script's default is
   script-relative and would point at the read-only mount.
 

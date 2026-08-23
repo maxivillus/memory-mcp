@@ -1260,10 +1260,17 @@ class DatabaseIsolationTest(unittest.TestCase):
         self.assertEqual(lst["evidence"], 1)
         bk = mcp.backup_workspace({"workspace": "iso-bk"})
         self.assertNotIn("error", bk, bk)
-        self.assertEqual(bk["counts"], {"facts": 1, "entities": 1, "relations": 0,
-                                        "decisions": 1, "evidence": 1,
-                                        "contexts": 0, "context_lineage": 0,
-                                        "lifecycle_events": 0, "handoffs": 0})
+        expected_counts = {"facts": 1, "entities": 1, "relations": 0,
+                           "decisions": 1, "evidence": 1,
+                           "contexts": 0, "context_lineage": 0,
+                           "lifecycle_events": 0, "handoffs": 0}
+        self.assertEqual({key: bk["counts"][key] for key in expected_counts},
+                         expected_counts)
+        self.assertIn("categories", bk["counts"])
+        self.assertIn("fact_embeddings", bk["counts"])
+        self.assertIn("decision_embeddings", bk["counts"])
+        self.assertIn("workspaces", bk["counts"])
+        self.assertIn("activity_days", bk["counts"])
         # the JSON on disk carries the same counts + rows
         import json as _json
         with open(os.path.join(os.path.dirname(mcp.DB_PATH), "backups",
