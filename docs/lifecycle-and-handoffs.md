@@ -109,8 +109,15 @@ through `read_context`.
   workspace is reactivated with `create_workspace`.
 - Hard workspace reset/archive removes lifecycle rows, handoff rows, and their
   context artifacts in the same FK-safe transaction as existing memory data.
-- `backup_workspace` includes metadata and payload rows for both new tables;
-  treat backup files as sensitive local data and protect the backup directory.
+- `backup_workspace` is a versioned, schema-complete JSON export. It includes
+  the workspace registry row, categories, every fact field (including
+  temporal validity, confirmation, and decay state), graph, decisions,
+  evidence, contexts, lifecycle rows, handoffs, fact/decision embeddings, and
+  the global activity-day table. Binary embedding values are base64 encoded and
+  `counts` covers every exported table.
+- Backups are sensitive local artifacts. The server enforces a `0700` backup
+  directory, `0600` files, and atomic temp-file publication; consumers should
+  still keep the database directory private.
 - No package, network, model, or deployment dependency was added. Existing
   SQLite WAL and `busy_timeout` settings cover concurrent runtime writers.
 

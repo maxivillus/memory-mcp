@@ -47,7 +47,8 @@ Tools:
   absorb {facts, workspace?, dry_run?, commit?, verify?}
   detect_conflicts {text}
 """
-import fnmatch, hashlib, json, os, re, sqlite3, sys
+import base64
+import fnmatch, hashlib, json, os, re, sqlite3, sys, tempfile
 from datetime import datetime, timedelta, timezone
 
 def default_db_path():
@@ -440,6 +441,12 @@ CREATE TABLE IF NOT EXISTS activity_days (
 _EMBED_SCHEMA = """
 CREATE TABLE IF NOT EXISTS fact_embeddings (
   fact_id INTEGER PRIMARY KEY REFERENCES facts(id) ON DELETE CASCADE,
+  vec BLOB NOT NULL,
+  model TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS decision_embeddings (
+  decision_id INTEGER PRIMARY KEY REFERENCES decisions(id) ON DELETE CASCADE,
   vec BLOB NOT NULL,
   model TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -2101,8 +2108,63 @@ def _db_dir():
 def _backup_dir():
     """Directory of backups — sibling of the active DB file."""
     d = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
-    os.makedirs(d, exist_ok=True)
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+    except OSError as e:
+        print(f"memory-mcp: cannot secure backup directory {d!r}: {e}", file=sys.stderr)
+        raise RuntimeError("backup directory is not writable or cannot be secured")
     return d
+
+
+def _atomic_sqlite_backup(src, dest):
+    """Create a private SQLite backup and publish it with one rename."""
+    temp_path = None
+    fd = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=".database-", suffix=".tmp",
+                                         dir=os.path.dirname(dest))
+        os.close(fd)
+        fd = None
+        src_con = sqlite3.connect(src, timeout=10)
+        try:
+            dst_con = sqlite3.connect(temp_path)
+            try:
+                src_con.backup(dst_con)
+            finally:
+                dst_con.close()
+        finally:
+            src_con.close()
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, dest)
+        temp_path = None
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _atomic_json_write(dest, payload):
+    """Serialize a JSON backup to a private temp file, then publish atomically."""
+    temp_path = None
+    fd = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=".workspace-", suffix=".tmp",
+                                         dir=os.path.dirname(dest))
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, dest)
+        temp_path = None
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 def _db_file(name):
@@ -2732,6 +2794,22 @@ def absorb(args):
     return result
 
 
+def _fact_search_filters(args, workspace):
+    """Normalize filters shared by lexical and semantic fact search."""
+    trust_min = args.get("trust_min")
+    if trust_min and trust_min not in VALID_TRUST:
+        return None, {"error": "trust_min must be one of %s" % (VALID_TRUST,)}
+    return {
+        "workspace": workspace,
+        "valid_at": args.get("valid_at"),
+        "trust_min": trust_min,
+        "strong_only": bool(args.get("strong_only")),
+        "project": args.get("project"),
+        "domain": args.get("domain"),
+        "category": args.get("category"),
+    }, None
+
+
 def search_facts(args):
     policy_error = _advisory_only_error(args, "search_facts")
     if policy_error:
@@ -2750,41 +2828,42 @@ def search_facts(args):
         # Search pagination is controlled by the result limit; only the
         # chunk-size and overlap portion of the fact paging contract applies.
         chunk_params = chunk_params[:2]
+    ws = _workspace(args)
+    filters, err = _fact_search_filters(args, ws)
+    if err:
+        return err
     sql = ("SELECT f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong, "
            "f.importance, f.confirmed, f.invalid_at, f.created_at, "
            "c.name AS category, bm25(facts_fts) AS rank "
            "FROM facts_fts JOIN facts f ON f.id = facts_fts.rowid "
            "LEFT JOIN categories c ON c.id = f.category_id "
            "WHERE facts_fts MATCH ? AND f.archived=0 AND f.lifecycle='active'")
-    ws = _workspace(args)
     params = [query]
     sql += _ws_filter("f", ws)
     if ws:
         params.append(ws)
-    if args.get("valid_at"):
+    if filters["valid_at"]:
         # bi-temporal: also include facts that were still valid at that time
         sql += " AND (f.invalid_at='' OR f.invalid_at >= ?)"
-        params.append(args["valid_at"])
+        params.append(filters["valid_at"])
     else:
         sql += " AND f.invalid_at=''"
-    if args.get("trust_min"):
-        if args["trust_min"] not in VALID_TRUST:
-            return {"error": "trust_min must be one of %s" % (VALID_TRUST,)}
+    if filters["trust_min"]:
         order = {"high": 0, "medium": 1, "low": 2}
-        allowed = [t for t in VALID_TRUST if order[t] <= order[args["trust_min"]]]
+        allowed = [t for t in VALID_TRUST if order[t] <= order[filters["trust_min"]]]
         sql += f" AND f.trust IN ({','.join('?' * len(allowed))})"
         params += allowed
-    if args.get("strong_only"):
+    if filters["strong_only"]:
         sql += " AND f.strong=1"
-    if args.get("project"):
+    if filters["project"]:
         sql += " AND f.project=?"
-        params.append(args["project"])
-    if args.get("domain"):
+        params.append(filters["project"])
+    if filters["domain"]:
         sql += " AND f.domain=?"
-        params.append(args["domain"])
-    if args.get("category"):
+        params.append(filters["domain"])
+    if filters["category"]:
         sql += " AND c.name=?"
-        params.append(args["category"])
+        params.append(filters["category"])
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
     con = get_db()
@@ -2812,10 +2891,12 @@ def search_facts(args):
         emb = _emb()
         if emb is not None and args.get("semantic"):
             if rows:
-                res = emb.hybrid_rerank(con, query, rows, limit=limit, workspace=ws)
+                res = emb.hybrid_rerank(con, query, rows, limit=limit, workspace=ws,
+                                        filters=filters)
             else:
                 # No lexical hits: fall back to semantic ranking alone.
-                res = emb.search_semantic(con, query, limit=limit, workspace=ws)
+                res = emb.search_semantic(con, query, limit=limit, workspace=ws,
+                                          filters=filters)
             rows = res.get("facts", []) if isinstance(res, dict) else res or []
         if chunk_params:
             rows = _add_fact_chunks(rows, *chunk_params)
@@ -2851,9 +2932,13 @@ def search_semantic(args):
     except (TypeError, ValueError):
         return {"error": "threshold must be a number"}
     ws = _workspace(args)
+    filters, err = _fact_search_filters(args, ws)
+    if err:
+        return err
     con = get_db()
     try:
-        res = emb.search_semantic(con, query, limit=limit, threshold=threshold, workspace=ws)
+        res = emb.search_semantic(con, query, limit=limit, threshold=threshold,
+                                  workspace=ws, filters=filters)
         rows = res.get("facts", []) if isinstance(res, dict) else res or []
         _revive_degraded(con, query, ws)
         _mark_hits(con, rows)
@@ -2870,9 +2955,13 @@ def embed_backfill(args):
     emb = _emb()
     if emb is None:
         return {"error": "semantic search is disabled (set MEMORY_MCP_EMBEDDINGS=1)"}
+    ws = _workspace(args)
     con = get_db()
     try:
-        return emb.embed_backfill(con, workspace=_workspace(args))
+        inactive = _ws_inactive_error(con, ws)
+        if inactive:
+            return inactive
+        return emb.embed_backfill(con, workspace=ws)
     finally:
         con.close()
 
@@ -3057,9 +3146,13 @@ def search_index(args):
         emb = _emb()
         if emb is not None and args.get("semantic"):
             if rows:
-                res = emb.hybrid_rerank(con, query, rows, limit=limit, workspace=ws)
+                res = emb.hybrid_rerank(
+                    con, query, rows, limit=limit, workspace=ws,
+                    filters={"workspace": ws, "category": args.get("category")})
             else:
-                res = emb.search_semantic(con, query, limit=limit, workspace=ws)
+                res = emb.search_semantic(
+                    con, query, limit=limit, workspace=ws,
+                    filters={"workspace": ws, "category": args.get("category")})
             rows = res.get("facts", []) if isinstance(res, dict) else res or []
             if rows:
                 # Semantic rerank rows carry only id/text/score — rehydrate the
@@ -4106,19 +4199,12 @@ def backup_database(args):
             label = name + ".db.archived"
         else:
             return {"error": f"database {name} not found"}
-    dest = os.path.join(_backup_dir(), label + "." + _ts_stamp() + ".db")
     try:
-        src_con = sqlite3.connect(src, timeout=10)
-        try:
-            dst_con = sqlite3.connect(dest)
-            try:
-                src_con.backup(dst_con)
-            finally:
-                dst_con.close()
-        finally:
-            src_con.close()
-    except sqlite3.DatabaseError as e:
-        return {"error": f"backup failed: {e}"}
+        dest = os.path.join(_backup_dir(), label + "." + _ts_stamp() + ".db")
+        _atomic_sqlite_backup(src, dest)
+    except (OSError, RuntimeError, sqlite3.DatabaseError) as e:
+        print(f"memory-mcp: database backup failed: {e}", file=sys.stderr)
+        return {"error": "backup failed: backups/ is not writable or the database could not be copied"}
     return {"database": label, "backup": os.path.basename(dest), "size": os.path.getsize(dest)}
 
 
@@ -4307,9 +4393,21 @@ def backup_workspace(args):
         return {"error": err}
     con = get_db()
     try:
+        workspaces = [dict(r) for r in con.execute(
+            "SELECT id, status, created_at, updated_at FROM workspaces WHERE id=?", [name])]
+        categories = [dict(r) for r in con.execute(
+            "SELECT id, name, workspace_id, created_at, updated_at "
+            "FROM categories WHERE workspace_id=? ORDER BY id", [name])]
         facts = [dict(r) for r in con.execute(
-            "SELECT id, sha256, text, source, project, domain, trust, strong, importance, workspace_id, "
-            "created_at, updated_at, archived FROM facts WHERE workspace_id=? ORDER BY id", [name])]
+            "SELECT id, sha256, text, source, project, domain, trust, strong, importance, "
+            "invalid_at, superseded_by, confirmed, workspace_id, created_at, updated_at, "
+            "archived, last_accessed_at, access_count, revival_count, lifecycle, category_id "
+            "FROM facts WHERE workspace_id=? ORDER BY id", [name])]
+        fact_embeddings = [dict(r) for r in con.execute(
+            "SELECT e.fact_id, e.vec, e.model, e.updated_at FROM fact_embeddings e "
+            "JOIN facts f ON f.id=e.fact_id WHERE f.workspace_id=? ORDER BY e.fact_id", [name])]
+        for row in fact_embeddings:
+            row["vec"] = base64.b64encode(bytes(row["vec"])).decode("ascii")
         entities = [dict(r) for r in con.execute(
             "SELECT id, name, type, aliases, workspace_id, created_at, updated_at "
             "FROM entities WHERE workspace_id=? ORDER BY id", [name])]
@@ -4320,45 +4418,79 @@ def backup_workspace(args):
             "SELECT id, category, subject, scenario, reasoning, outcome, confidence, decision_maker, "
             "issue_ref, parent_decision_id, workspace_id, created_at, updated_at "
             "FROM decisions WHERE workspace_id=? ORDER BY id", [name])]
+        decision_embeddings = [dict(r) for r in con.execute(
+            "SELECT e.decision_id, e.vec, e.model, e.updated_at FROM decision_embeddings e "
+            "JOIN decisions d ON d.id=e.decision_id WHERE d.workspace_id=? ORDER BY e.decision_id",
+            [name])]
+        for row in decision_embeddings:
+            row["vec"] = base64.b64encode(bytes(row["vec"])).decode("ascii")
         evidence = [dict(r) for r in con.execute(
             "SELECT e.id, e.fact_id, e.source_ref, e.source_checksum, e.fetched_at, "
             "e.repo, e.ref, e.path, e.symbol, e.start_line, e.start_col, e.end_line, "
             "e.end_col, e.selected_text_hash, e.resolution_status, e.created_at "
             "FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE f.workspace_id=? ORDER BY e.id", [name])]
         contexts = [dict(r) for r in con.execute(
-            "SELECT ref, name, content, schema_json, source, sha256, workspace_id, "
+            "SELECT id, ref, name, content, schema_json, source, sha256, workspace_id, "
             "created_at, expires_at, size_bytes FROM contexts WHERE workspace_id=? ORDER BY id", [name])]
         context_lineage = [dict(r) for r in con.execute(
-            "SELECT parent_ref, child_ref, relation, workspace_id, created_at "
+            "SELECT id, parent_ref, child_ref, relation, workspace_id, created_at "
             "FROM context_lineage WHERE workspace_id=? ORDER BY id", [name])]
         lifecycle_events = [dict(r) for r in con.execute(
-            "SELECT idempotency_key, event_kind, event_id, session_id, source, cwd, path, "
+            "SELECT id, idempotency_key, event_kind, event_id, session_id, source, cwd, path, "
             "tool_name, context_ref, workspace_id, sha256, payload_bytes, "
             "payload_truncated, created_at FROM lifecycle_events "
             "WHERE workspace_id=? ORDER BY id", [name])]
         handoffs = [dict(r) for r in con.execute(
-            "SELECT ref, context_ref, owner, session_id, cwd, source, sha256, workspace_id, "
+            "SELECT id, ref, context_ref, owner, session_id, cwd, source, sha256, workspace_id, "
             "shared, state, idempotency_key, created_at, expires_at, accepted_at, "
             "accepted_by, cancelled_at, cancelled_by FROM handoffs "
             "WHERE workspace_id=? ORDER BY id", [name])]
+        activity_days = [dict(r) for r in con.execute(
+            "SELECT day FROM activity_days ORDER BY day")]
     finally:
         con.close()
-    counts = {"facts": len(facts), "entities": len(entities), "relations": len(relations),
-              "decisions": len(decisions), "evidence": len(evidence),
-              "contexts": len(contexts), "context_lineage": len(context_lineage),
-              "lifecycle_events": len(lifecycle_events), "handoffs": len(handoffs)}
-    if sum(counts.values()) == 0:
+
+    tables = {
+        "categories": categories,
+        "facts": facts,
+        "fact_embeddings": fact_embeddings,
+        "entities": entities,
+        "relations": relations,
+        "decisions": decisions,
+        "decision_embeddings": decision_embeddings,
+        "evidence": evidence,
+        "contexts": contexts,
+        "context_lineage": context_lineage,
+        "lifecycle_events": lifecycle_events,
+        "handoffs": handoffs,
+        "workspaces": workspaces,
+        "activity_days": activity_days,
+    }
+    counts = {table: len(rows) for table, rows in tables.items()}
+    data_tables = tuple(table for table in tables
+                        if table not in ("workspaces", "activity_days"))
+    if sum(counts[table] for table in data_tables) == 0:
         return {"error": f"workspace {name} has no data"}
-    dest = os.path.join(_backup_dir(), f"workspace-{name}-{_ts_stamp()}.json")
+
+    payload = {
+        "manifest": {
+            "format": "memory-mcp.workspace-backup",
+            "version": 1,
+            "tables": list(tables),
+            "binary_fields": {
+                "fact_embeddings.vec": "base64",
+                "decision_embeddings.vec": "base64",
+            },
+        },
+        "workspace": name,
+        "exported_at": now(),
+        "counts": counts,
+    }
+    payload.update(tables)
     try:
-        with open(dest, "w", encoding="utf-8") as f:
-            json.dump({"workspace": name, "exported_at": now(), "counts": counts,
-                       "facts": facts, "entities": entities, "relations": relations,
-                       "decisions": decisions, "evidence": evidence,
-                       "contexts": contexts, "context_lineage": context_lineage,
-                       "lifecycle_events": lifecycle_events, "handoffs": handoffs},
-                      f, ensure_ascii=False, indent=2)
-    except OSError as e:
+        dest = os.path.join(_backup_dir(), f"workspace-{name}-{_ts_stamp()}.json")
+        _atomic_json_write(dest, payload)
+    except (OSError, RuntimeError, TypeError, ValueError) as e:
         # No host paths in client-visible errors (repo rule).
         print(f"memory-mcp: workspace backup write failed: {e}", file=sys.stderr)
         return {"error": "workspace backup failed: backups/ is not writable or disk is full"}
@@ -4648,7 +4780,7 @@ TOOLS = {
         },
     },
     "search_facts": {
-        "description": "Advisory full-text search over stored facts. It cannot authorize safety-critical operations. With semantic=true and MEMORY_MCP_EMBEDDINGS=1, merges lexical and embedding rankings (RRF).",
+        "description": "Advisory full-text search over stored facts. It cannot authorize safety-critical operations. With semantic=true and MEMORY_MCP_EMBEDDINGS=1, merges lexical and embedding rankings (RRF) using the same eligibility filters.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4678,6 +4810,13 @@ TOOLS = {
                 "query": {"type": "string"},
                 "limit": {"type": "integer", "default": 20},
                 "threshold": {"type": "number", "default": 0.0, "description": "Minimum cosine similarity"},
+                "trust_min": {"type": "string", "enum": list(VALID_TRUST)},
+                "strong_only": {"type": "boolean", "default": False},
+                "project": {"type": "string"},
+                "domain": {"type": "string"},
+                "category": {"type": "string", "description": "Topic category filter (see list_categories)"},
+                "valid_at": {"type": "string", "description": "RFC3339: include facts that were still valid at that time (bi-temporal)"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
                 "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed"},
             },
             "required": ["query"],
@@ -4688,7 +4827,7 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {}},
     },
     "ingest_turn": {
-        "description": "Server-side fact extraction from a conversation transcript (LLM provider, see extract.py). Requires MEMORY_MCP_EXTRACT=1.",
+        "description": "Server-side fact extraction from a conversation transcript (LLM provider, see extract.py). Model authority claims remain unconfirmed until confirm_fact. Requires MEMORY_MCP_EXTRACT=1.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -5120,7 +5259,7 @@ TOOLS = {
         }, "required": ["workspace"]},
     },
     "backup_workspace": {
-        "description": "Export ALL workspace data (facts incl. archived, entities, relations, decisions, evidence) as JSON with per-table counts to backups/workspace-<name>-<ts>.json.",
+        "description": "Export versioned, schema-complete workspace data as JSON with counts for every table; embedding BLOBs are base64 encoded and the private backup is published atomically.",
         "inputSchema": {"type": "object", "properties": {
             "workspace": {"type": "string"},
         }, "required": ["workspace"]},
@@ -5216,6 +5355,23 @@ HANDLERS = {
 }
 
 
+def _rpc_error(request_id, code, message):
+    return {"jsonrpc": "2.0", "id": request_id,
+            "error": {"code": code, "message": message}}
+
+
+def _rpc_params(msg):
+    params = msg.get("params", {})
+    if not isinstance(params, dict):
+        return None, _rpc_error(msg.get("id"), -32602, "Invalid params")
+    return params, None
+
+
+def _write_rpc(reply):
+    sys.stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
 def main():
     for line in sys.stdin:
         line = line.strip()
@@ -5224,43 +5380,72 @@ def main():
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
+            _write_rpc(_rpc_error(None, -32700, "Parse error"))
             continue
-        if msg.get("method") == "initialize":
+        if not isinstance(msg, dict):
+            _write_rpc(_rpc_error(None, -32600, "Invalid Request"))
+            continue
+
+        method = msg.get("method")
+        if not isinstance(method, str):
+            _write_rpc(_rpc_error(msg.get("id"), -32600, "Invalid Request"))
+            continue
+        if method == "initialize":
+            params, error = _rpc_params(msg)
+            if error:
+                _write_rpc(error)
+                continue
             reply = {
                 "jsonrpc": "2.0", "id": msg.get("id"),
                 "result": {
-                    "protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"),
+                    "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "memory-mcp", "version": "0.17.0"},
                 },
             }
-        elif msg.get("method") == "tools/list":
+        elif method == "tools/list":
+            _params, error = _rpc_params(msg)
+            if error:
+                _write_rpc(error)
+                continue
             reply = {"jsonrpc": "2.0", "id": msg.get("id"),
                      "result": {"tools": [{"name": k, "description": v["description"],
                                            "inputSchema": v["inputSchema"]} for k, v in TOOLS.items()]}}
-        elif msg.get("method") == "tools/call":
-            params = msg.get("params", {})
-            name, args = params.get("name"), params.get("arguments", {}) or {}
-            _register_activity_day()
+        elif method == "tools/call":
+            params, error = _rpc_params(msg)
+            if error:
+                _write_rpc(error)
+                continue
+            name = params.get("name")
+            args = params.get("arguments", {})
+            if not isinstance(name, str) or not name or not isinstance(args, dict):
+                _write_rpc(_rpc_error(msg.get("id"), -32602, "Invalid params"))
+                continue
             try:
-                result = HANDLERS[name](args) if name in HANDLERS else {"error": f"unknown tool {name}"}
+                _register_activity_day()
+                result = HANDLERS[name](
+                    args) if name in HANDLERS else {"error": f"unknown tool {name}"}
                 reply = {"jsonrpc": "2.0", "id": msg.get("id"),
                          "result": {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
                                     "isError": "error" in result}}
-            except Exception as e:  # noqa: BLE001 — surface any tool failure to the client
+            except Exception as e:  # noqa: BLE001 — keep protocol errors generic
+                print("memory-mcp: tool %r failed: %s" % (name, type(e).__name__), file=sys.stderr)
                 reply = {"jsonrpc": "2.0", "id": msg.get("id"),
-                         "result": {"content": [{"type": "text", "text": json.dumps({"error": str(e)})}],
-                                    "isError": True}}
-        elif msg.get("method") == "ping":
+                         "result": {"content": [{"type": "text", "text": json.dumps(
+                             {"error": "tool execution failed"})}], "isError": True}}
+        elif method == "ping":
+            _params, error = _rpc_params(msg)
+            if error:
+                _write_rpc(error)
+                continue
             reply = {"jsonrpc": "2.0", "id": msg.get("id"), "result": {}}
         else:
-            # notifications (e.g. notifications/initialized) and unknown methods
+            # Notifications (e.g. notifications/initialized) have no response.
             if "id" not in msg:
                 continue
-            reply = {"jsonrpc": "2.0", "id": msg.get("id"),
-                     "error": {"code": -32601, "message": f"method not found: {msg.get('method')}"}}
-        sys.stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+            reply = _rpc_error(msg.get("id"), -32601,
+                               "method not found: %s" % method)
+        _write_rpc(reply)
 
 
 if __name__ == "__main__":
