@@ -1,7 +1,7 @@
 # Documentation refresh roadmap
 
 - Mode: comprehensive-refresh
-- Baseline source: implementation commit `9ddffd1`
+- Baseline source: merged implementation commit `a762656`
 - Audience: agents and developers using the local `memory-mcp` MCP server
 - First successful action: preview candidate facts with `absorb`, then read or
   commit only the bounded result required by the task
@@ -37,6 +37,9 @@ Excluded surfaces:
 3. Verify paths, links, examples, skill structure, Python syntax, and the
    stdlib regression suite. Record any environment-dependent deviation rather
    than implying a broader integration test.
+4. Document the v0.17 focused retrieval contract, including the advisory-only
+   safety boundary, public `purpose` schema, noise-only behavior, and the
+   deployment smoke check.
 
 ## Verification record
 
@@ -44,8 +47,10 @@ The refresh passed internal Markdown path checks, project skill structure
 checks, `git diff --check`, and the local Python checks:
 
 - `MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -q` — 121 tests;
-- `python3 -m unittest -q test_memory_mcp` — 75 tests; and
+- `python3 -m unittest -q test_memory_mcp` — 78 tests; and
 - `python3 -m py_compile memory_mcp.py extract.py verify.py recall.py embeddings.py`.
+- Public stdio JSON-RPC smoke — `tools/list`, focused `compose_recall`,
+  noise-only rejection, and fail-closed `purpose: "safety_critical"`.
 - `python3 /usr/local/workflow-tools/skill_doctor.py --root skills/memory-mcp
   --output json` — exit 0; one expected warning notes that the project-local
   package has no global `registry-manifest.json`.
@@ -58,4 +63,5 @@ was not requested; this roadmap is the reviewable scope record for this pass.
 
 Provider-backed extraction, semantic search, and verification remain optional
 deployment paths. They are intentionally not expanded or enabled by this
-local-only documentation refresh.
+local-only documentation refresh. Retrieval output remains advisory even when
+those optional paths are enabled.

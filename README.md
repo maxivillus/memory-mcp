@@ -22,6 +22,9 @@ pipeline into the server for runtimes that have no client patches.
 - `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?, chunk_chars?, purpose?}` —
   advisory FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors.
   `chunk_chars?` optionally adds bounded, offset-addressable chunks to hits.
+- `search_semantic {query, limit?, threshold?, purpose?}` — advisory embedding
+  search when `MEMORY_MCP_EMBEDDINGS=1`; it cannot authorize safety-critical
+  operations.
 - `chunk_fact {id | fact_id | sha256, workspace?, chunk_chars?, chunk_overlap?, start_chunk?, max_chunks?}` — read one active fact through a bounded page API
 - `list_facts {project?, domain?, category?, limit?}` — recent non-archived facts
 - `summarize_index {project?, domain?, category?, trust_min?, strong_only?, limit?, max_chars?}` —
@@ -300,6 +303,27 @@ architecture records are
 and
 [`docs/decisions/ADR-0002-local-ingestion-and-code-provenance.md`](docs/decisions/ADR-0002-local-ingestion-and-code-provenance.md).
 
+### v0.17 — focused advisory retrieval and safety boundary (2026-08-23)
+
+Retrieval now has an explicit safety boundary for runtimes that use the
+optional server-side recall path:
+
+- `compose_recall`, `search_facts`, `search_semantic`, and `find_precedents`
+  accept `purpose: "advisory" | "safety_critical"`. The default is
+  `advisory`; `safety_critical` is rejected fail-closed.
+- `compose_recall` focuses a complete transcript on the latest user turn and
+  removes system reminders, tool/result markers, and older assistant turns
+  before selecting bounded candidates. A noise-only transcript produces no
+  searchable query.
+- Retrieval results are context only. They never authorize registry writes,
+  route selection, lock validity, or hash acceptance. Current runtime state
+  and local lock/hash checks remain authoritative.
+- The public MCP server reports `serverInfo.version = 0.17.0`.
+
+The operational contract is documented in
+[`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md), and
+deployment smoke checks are documented in `DEPLOYMENT.md`.
+
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
 Covers decision rationale, precedent search and evidence lineage with zero
@@ -313,8 +337,8 @@ new dependencies — just SQLite + FTS5.
   confidence?, decision_maker?, issue_ref?, parent_decision_id?}` — decision node;
   `parent_decision_id` builds causal chains
 - `query_decisions {category?, subject?, outcome?, decision_maker?, issue_ref?, limit?}`
-- `find_precedents {scenario, category?, limit?}` — similar decisions via FTS BM25
-  (OR-joined terms, ranked)
+- `find_precedents {scenario, category?, limit?, semantic?, purpose?}` — advisory
+  similar-decision lookup via FTS BM25 (OR-joined terms, ranked)
 - `get_causal_chain {decision_id}` — walk parent links to the root
 - `get_provenance {fact_id | sha256}` — fact + evidence rows
 - `attach_evidence {fact_id, source_ref, source_checksum?, fetched_at?}` — link a
