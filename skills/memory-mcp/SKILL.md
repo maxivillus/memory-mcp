@@ -174,18 +174,44 @@ source must be auditable.
   while the handoff is open. Accepted/cancelled/expired rows cannot transition
   again.
 
+## Runs, issue/PR links, and summaries (v0.18)
+
+- `run_begin {run_id, workspace?, issue_ref?, pr_ref?, session_id?, cwd?, source?}`
+  opens a run record — one client-side execution window (e.g. an issue/task
+  turn). Idempotent per (workspace, run_id); a closed run cannot be reopened.
+- `run_end {run_id, workspace?, base_sha?, head_sha?, files_changed?, diff?,
+  issue_ref?, pr_ref?}` closes the run with bounded client-supplied git facts.
+  The server never shells out to git: pass the base/head SHAs, the changed
+  paths, and a unified diff (capped at 64 KiB, `diff_truncated` is set when
+  clipped). Use `link_run {run_id, issue_ref?, pr_ref?}` to bind refs later
+  (at least one ref required; empty keeps the existing value).
+- `query_run {run_id?, workspace?, state?, issue_ref?, limit?}` returns one run
+  or a filtered list; diffs in responses are clipped to bounded slices.
+- `prepare_summary {run_id, workspace?, max_decisions?}` assembles a
+  ready-to-post markdown summary from the run's own records — decisions
+  recorded inside its window or bound to its issue_ref, and the window's event
+  catalog. It posts nothing: the client owns the write, so the summary stays
+  advisory like all retrieval.
+- After a long-session compaction, re-establish grounding: `capture_event` an
+  `event_kind: "post_compact"` envelope and call `compose_recall` again so the
+  compacted window is re-filled from the store instead of only the
+  summarizer's own output.
+
 ## Decisions — record_decision / query_decisions / find_precedents / get_causal_chain
 
 - `record_decision {category?, subject?, scenario, reasoning?, outcome?,
-  confidence?, decision_maker?, issue_ref?, parent_decision_id?}` — record a
-  consequential choice: scenario = the situation, reasoning = why, outcome =
-  what was chosen. Pass `parent_decision_id` when this decision follows from
-  an earlier one (builds causal chains).
+  confidence?, decision_maker?, issue_ref?, path?, symbol?,
+  parent_decision_id?}` — record a consequential choice: scenario = the
+  situation, reasoning = why, outcome = what was chosen. Pass
+  `parent_decision_id` when this decision follows from an earlier one (builds
+  causal chains). Optional `path`/`symbol` anchors make the decision
+  findable by code location via `query_anchored`.
 - `find_precedents {scenario, category?}` — before deciding, look up similar
   past scenarios; ranked precedents come back via BM25. Treat them as
   evidence, not authority — verify against the current card.
-- `query_decisions` filters by category/subject/outcome/maker/issue_ref;
-  `get_causal_chain` walks parent links from a decision to its root.
+- `query_decisions` filters by category/subject/outcome/maker/issue_ref and
+  path/symbol fragments; `get_causal_chain` walks parent links from a decision
+  to its root.
 
 ## Graph — remember_entity / remember_relation / search_graph
 
@@ -209,6 +235,25 @@ source must be auditable.
 - The anchor fields are additive and migration-safe. Keep `source_ref`
   stable, and treat stale/unresolved anchors as evidence requiring refresh,
   not as proof that the current code still matches.
+- `query_anchored {path?, symbol?, repo?, workspace?, limit?, purpose?}` finds
+  facts whose evidence carries a matching path fragment or exact symbol, plus
+  decisions with matching `path`/`symbol` anchors — one query for "everything
+  bound to this file". It is advisory retrieval (`safety_critical` is
+  rejected), fact texts come back clipped, and zero-result queries are still
+  logged by the access telemetry.
+
+## Memory access telemetry (v0.18)
+
+- Every pull through the main retrieval sites (`search_facts`, `search_semantic`,
+  `find_precedents`, `get_provenance`, `query_anchored`) and the
+  `compose_recall` push is recorded in a bounded per-workspace log
+  (`memory_access_events`: channel, site, query hash, result count, latency).
+  Payloads are never stored; retention is capped at
+  `MEMORY_MCP_ACCESS_MAX_EVENTS` (default 5000) per workspace.
+- `stats` now reports the access log: total kept events, per-site counts, and
+  the last recorded access. Use it to tell whether memory is actually read —
+  inventory alone does not answer that.
+- Telemetry is best-effort: a recording failure never breaks retrieval.
 
 ## Conflicts — detect_conflicts
 
@@ -225,7 +270,8 @@ source must be auditable.
   verify_facts, forget_fact, confirm_fact, fact_history,
   get_provenance, fact_references, attach_evidence, detect_conflicts,
   absorb, chunk_fact, consolidate, export_facts, export_rdf, stats,
-  list_sessions, list_forgotten,
+  list_sessions, list_forgotten, query_anchored,
+  run_begin, run_end, link_run, query_run, prepare_summary,
   restore_fact, remember_entity, remember_relation, search_graph). Resolve it
   from your task context (the project id of the card/issue you work on).
 - Context operations (`put_context`, `list_context`, `resolve_context`,

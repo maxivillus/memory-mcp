@@ -10,9 +10,10 @@ This guide uses a **codex-style runtime container** as the example; the same
 pattern applies to any runtime that can spawn a process.
 
 The v0.16 ingestion, bounded fact retrieval, and code-local provenance paths,
-plus the v0.17 focused advisory retrieval boundary, run inside the existing
-local SQLite-backed server. They do not require a UI, cloud service, separate
-code graph, or another external product. The detailed request flow is in
+plus the v0.17 focused advisory retrieval boundary and the v0.18 runs,
+anchored queries, and access telemetry, run inside the existing local
+SQLite-backed server. They do not require a UI, cloud service, separate code
+graph, or another external product. The detailed request flow is in
 `docs/ingestion-and-provenance.md`; the optional runtime adapters below
 describe pre-existing deployment choices and are not required for the
 local-only path.

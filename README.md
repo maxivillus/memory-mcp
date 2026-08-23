@@ -32,7 +32,7 @@ pipeline into the server for runtimes that have no client patches.
   description clipped at 120 chars, total capped at `max_chars` (default 4000,
   cut at line boundary) — mirrors the reasonix index-cap for prompt budgets
 - `forget_fact {id | sha256}` — soft delete (archived=1)
-- `stats {}` — totals by trust/domain plus v0.3 counts (entities/relations/decisions/evidence)
+- `stats {}` — totals by trust/domain plus v0.3 counts (entities/relations/decisions/evidence), v0.18 run counts, and the memory-access log (kept events, per-site counts, last access)
 - `export {}` — all facts incl. archived (migration/backup)
 - `put_context {name, content, workspace, schema?, source?, checksum?, ttl_seconds?, parent_refs?}` — store an immutable named context artifact and return its `ctx_...` ref
 - `list_context {workspace, name?, limit?}` — catalog metadata only; payloads are never returned
@@ -46,11 +46,17 @@ pipeline into the server for runtimes that have no client patches.
 - `handoff_begin {content, owner, workspace, source?, checksum?, ttl_seconds?, cwd?, shared?, idempotency_key?}` — create an expiring typed handoff over immutable context
 - `list_handoffs {workspace, owner?, state?, limit?}` — list open and terminal handoff metadata; expired rows are marked safely
 - `handoff_accept {handoff_ref, actor, workspace, cwd?, max_chars?}` / `handoff_cancel {handoff_ref, actor, workspace}` — one-shot owner-scoped accept or cancel transitions
+- `run_begin {run_id, workspace?, issue_ref?, pr_ref?, session_id?, cwd?, source?}` / `run_end {run_id, workspace?, base_sha?, head_sha?, files_changed?, diff?, issue_ref?, pr_ref?}` — open/close a run record with bounded client-supplied git facts (the server never shells out to git)
+- `link_run {run_id, workspace?, issue_ref?, pr_ref?}` — bind a run to issue/PR references (at least one required)
+- `query_run {run_id?, workspace?, state?, issue_ref?, limit?}` — one run record or a filtered list; diffs are clipped to bounded slices
+- `prepare_summary {run_id, workspace?, max_decisions?}` — assemble a ready-to-post markdown summary from a run's own records (decisions in its window or bound to its issue_ref, event catalog); posts nothing
+- `query_anchored {path?, symbol?, repo?, workspace?, limit?, purpose?}` — advisory lookup of facts (via evidence code anchors) and decisions (via their own path/symbol anchors) bound to a code location
 
-Retrieval is advisory only. `compose_recall`, `search_facts`, semantic search, and
-precedent lookup reject `purpose: "safety_critical"` fail-closed. Memory never
-authorizes registry writes, route selection, lock validity, or hash acceptance.
-Those decisions must use current Multica state and local lock/hash checks.
+Retrieval is advisory only. `compose_recall`, `search_facts`, semantic search,
+`find_precedents`, and `query_anchored` reject `purpose: "safety_critical"`
+fail-closed. Memory never authorizes registry writes, route selection, lock
+validity, or hash acceptance. Those decisions must use current Multica state
+and local lock/hash checks.
 
 `attach_evidence` accepts optional code-local fields (`repo`, `ref`, `path`,
 `symbol`, line/column range, `selected_text` or its SHA-256, and
@@ -324,6 +330,45 @@ optional server-side recall path:
   and local lock/hash checks remain authoritative.
 - The public MCP server reports `serverInfo.version = 0.17.0`.
 
+### v0.18 — runs, issue/PR links, anchored queries, and access telemetry (2026-08-23)
+
+Lightweight, additive execution context for runtimes that work issue/task
+shaped turns — no new dependencies, no optional modules, no git access from
+the server:
+
+- `run_begin {run_id, workspace?, issue_ref?, pr_ref?, session_id?, cwd?,
+  source?}` / `run_end {run_id, workspace?, base_sha?, head_sha?,
+  files_changed?, diff?, issue_ref?, pr_ref?}` — open/close a run record.
+  Git facts are **client-supplied** (the server never shells out to git);
+  the diff is capped at 64 KiB with a `diff_truncated` flag and changed
+  paths are deduplicated (max 200).
+- `link_run {run_id, workspace?, issue_ref?, pr_ref?}` binds an issue/PR
+  reference after the fact (at least one ref required; empty keeps the
+  existing value). `query_run {run_id?, state?, issue_ref?, limit?}` reads
+  one record or a filtered list with clipped diffs.
+- `prepare_summary {run_id, workspace?, max_decisions?}` — assembles a
+  ready-to-post markdown summary from the run's own records: decisions
+  recorded inside its window or bound to its issue_ref, plus the window's
+  event catalog. It posts nothing (same boundary as `prepare_jira_comment`
+  in Coodra).
+- `record_decision` and `query_decisions` now carry optional `path`/`symbol`
+  code anchors (additive migration), and `query_anchored {path?, symbol?,
+  repo?, workspace?, limit?, purpose?}` returns facts (via evidence anchors)
+  and decisions bound to a code location. Advisory-only like all retrieval;
+  fact texts are clipped to bounded slices.
+- **Memory access telemetry**: the main retrieval sites (`search_facts`,
+  `search_semantic`, `find_precedents`, `get_provenance`, `query_anchored`)
+  and `compose_recall` record one bounded row per pull/push in
+  `memory_access_events` (channel, site, query hash, result count, latency —
+  never payloads). Retention is capped per workspace
+  (`MEMORY_MCP_ACCESS_MAX_EVENTS`, default 5000); `stats` reports the
+  log. Recording is best-effort and never breaks retrieval.
+- **Post-compaction re-grounding**: `capture_event` accepts
+  `event_kind: "post_compact"` — the documented pattern for long sessions is
+  to re-run `compose_recall` after a compaction so the window is re-filled
+  from the store instead of only the summarizer's output.
+- The public MCP server reports `serverInfo.version = 0.18.0`.
+
 The operational contract is documented in
 [`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md), and
 deployment smoke checks are documented in `DEPLOYMENT.md`.
@@ -395,6 +440,16 @@ v0.13 additions (additive — existing stores create these tables on open):
   sha256, workspace_id, state, expires_at, accepted_at, cancelled_at)` with
   one-shot state transitions and workspace-scoped optional idempotency.
 
+v0.18 additions (additive — existing stores migrate in place):
+
+- `decisions.path` / `decisions.symbol` — optional code anchors
+  (`_migrate_decisions_anchors` adds the columns to existing stores)
+- `runs(run_id, issue_ref, pr_ref, session_id, cwd, source, base_sha, head_sha,
+  files_changed, diff, diff_truncated, state, workspace_id, created_at,
+  ended_at)` with `UNIQUE(workspace_id, run_id)`
+- `memory_access_events(workspace_id, channel, site, query_hash, result_count,
+  latency_ms, created_at)` — bounded per-workspace retrieval log
+
 ## Environment
 
 - `MEMORY_MCP_DB` — SQLite path. Default is **script-relative**: `<repo>/data/facts.db`
@@ -423,6 +478,10 @@ v0.13 additions (additive — existing stores create these tables on open):
 - `MEMORY_MCP_HANDOFF_DEFAULT_TTL` / `_MAX_TTL` — handoff TTL defaults and
   hard maximum in seconds (defaults 86400 / 604800).
 - `MEMORY_MCP_HANDOFF_MAX_CONTENT_BYTES` — handoff payload cap (default 262144).
+- `MEMORY_MCP_RUN_MAX_FIELD_CHARS` / `_MAX_FILES` / `_MAX_DIFF_BYTES` — run
+  field caps and the client-supplied diff cap (defaults 256 / 200 / 65536).
+- `MEMORY_MCP_ACCESS_MAX_EVENTS` — newest memory-access telemetry rows kept
+  per workspace (default 5000).
 - `MEMORY_MCP_LLM_KEY` / `MEMORY_MCP_EMBED_KEY` — bearer tokens for
   OpenAI-compatible providers. Credential-bearing plaintext HTTP is rejected
   unless `MEMORY_MCP_ALLOW_INSECURE_HTTP=1` is explicitly set.
