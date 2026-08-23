@@ -9,12 +9,13 @@ and writes the same fact store.
 This guide uses a **codex-style runtime container** as the example; the same
 pattern applies to any runtime that can spawn a process.
 
-The v0.16 ingestion, bounded fact retrieval, and code-local provenance paths
-run inside the existing local SQLite-backed server. They do not require a UI,
-cloud service, separate code graph, or another external product. The detailed
-request flow is in `docs/ingestion-and-provenance.md`; the optional runtime
-adapters below describe pre-existing deployment choices and are not required
-for the local-only path.
+The v0.16 ingestion, bounded fact retrieval, and code-local provenance paths,
+plus the v0.17 focused advisory retrieval boundary, run inside the existing
+local SQLite-backed server. They do not require a UI, cloud service, separate
+code graph, or another external product. The detailed request flow is in
+`docs/ingestion-and-provenance.md`; the optional runtime adapters below
+describe pre-existing deployment choices and are not required for the
+local-only path.
 
 ## 1. Compose service
 
@@ -77,6 +78,15 @@ Expect `{"result":{"content":[{"type":"text","text":"{...\"index\":...}"}]}}`
 with one `#<id> trust [category] [domain] text` line per fact (v0.10:
 `[category]` tags are included when a fact has one).
 
+When `MEMORY_MCP_RECALL=1`, also verify the advisory retrieval boundary with
+`compose_recall`. A normal request may use `purpose: "advisory"`; a request
+with `purpose: "safety_critical"` must return an error payload with
+`code: "advisory_only"` and `fail_closed: true`. A complete transcript is
+focused on its latest user turn before candidate retrieval. System reminders,
+tool/result markers, and older assistant turns must not expand the bounded
+candidate query. Do not use any memory result as authority for writes, routes,
+locks, or hashes.
+
 For the v0.13 seams, use a disposable workspace and send an event with a
 stable idempotency key, then accept a short handoff as the same owner:
 
@@ -112,13 +122,16 @@ env = { MEMORY_MCP_DB = "/opt/memory-shared/facts.db" }
 - **write** — sync auto-extracted facts into the shared store (best-effort);
 - **read** — swap the prompt index for the capped `summarize_index` and merge
   per-turn `search_facts` results into automatic recall (dual-read; native
-  facts win on duplicate text). All failures degrade silently to native-only.
+  facts win on duplicate text). These results are advisory context only and
+  must not choose routes or authorize writes, locks, or hashes. All failures
+  degrade silently to native-only.
 
 ## 5. Run the tests
 
 ```sh
 cd <repo>
 MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -v
+python3 -m unittest -v test_memory_mcp.py
 ```
 
 Zero external dependencies (stdlib only).
