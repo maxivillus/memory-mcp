@@ -247,12 +247,15 @@ def sweep_freshness(args):
     (claude-mem-style): past the window, only low-importance facts are
     archived; anything 3x past the window goes regardless. Strong and
     human-confirmed facts are never auto-archived."""
-    from memory_mcp import get_db
+    from memory_mcp import _ws_inactive_error, get_db
     workspace = (args.get("workspace") or "").strip()
     ws_clause = " AND workspace_id IN (?, '')" if workspace else " AND workspace_id = ''"
     ws_params = [workspace] if workspace else []
     con = get_db()
     try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
         rows = con.execute(
             "SELECT id, text, domain, strong, confirmed, importance, updated_at "
             "FROM facts WHERE archived=0 AND invalid_at=''" + ws_clause,

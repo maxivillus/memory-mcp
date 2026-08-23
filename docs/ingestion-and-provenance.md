@@ -24,6 +24,16 @@ Every fact operation should receive the exact project `workspace`. Keep source
 references, paths, idempotency keys, and payloads free of credentials or other
 secrets.
 
+## Server-side extraction authority gate
+
+`ingest_turn` is an optional convenience path, not a human confirmation
+boundary. The LLM response is treated as a candidate even when it claims
+`trust: "high"` or `strong: true`: the server stores that fact with
+`trust: "medium"`, `strong: false`, and `confirmed: 0`. Review the result with
+`review_pending` and call `confirm_fact` only after a person verifies it.
+Importance, category, scope, provenance, and the extracted text remain subject
+to the normal fact/workspace rules.
+
 ## Safe batch ingestion
 
 Use `absorb` when a client already has candidate fact text and needs a bounded,
@@ -137,6 +147,17 @@ returns `no searchable terms` instead of searching on the noise.
 The returned `<memory-recall>` block remains low-authority context. Consumers
 must validate changing details against the current authoritative source before
 acting on them.
+
+When embeddings are enabled, `search_semantic` and hybrid `search_facts`
+apply the same workspace, lifecycle, archived, temporal-validity, trust,
+strength, project, domain, and category filters as the lexical path. Semantic
+results retain category and fact-state metadata, so enabling embeddings does
+not widen the eligible fact set.
+
+The stdio boundary returns JSON-RPC `-32700` for parse errors, `-32600` for a
+non-object request, and `-32602` for scalar/array `params` or invalid tool-call
+arguments. The process continues after these errors; tool execution failures
+use a generic client-facing message and keep implementation details on stderr.
 
 ## Code-local evidence anchors
 

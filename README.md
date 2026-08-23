@@ -19,12 +19,12 @@ pipeline into the server for runtimes that have no client patches.
   ingestion with `new` / `duplicate` / `related` classification. Preview is
   the default; `commit:true` only writes `new` items and leaves related,
   update, and contradiction candidates for review.
-- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?, chunk_chars?, purpose?}` —
+- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?, valid_at?, workspace?, chunk_chars?, purpose?}` —
   advisory FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors.
   `chunk_chars?` optionally adds bounded, offset-addressable chunks to hits.
-- `search_semantic {query, limit?, threshold?, purpose?}` — advisory embedding
-  search when `MEMORY_MCP_EMBEDDINGS=1`; it cannot authorize safety-critical
-  operations.
+- `search_semantic {query, limit?, threshold?, workspace?, valid_at?, trust_min?, strong_only?, project?, domain?, category?, purpose?}` — advisory embedding
+  search when `MEMORY_MCP_EMBEDDINGS=1`; its eligibility filters match
+  `search_facts`, and it cannot authorize safety-critical operations.
 - `chunk_fact {id | fact_id | sha256, workspace?, chunk_chars?, chunk_overlap?, start_chunk?, max_chunks?}` — read one active fact through a bounded page API
 - `list_facts {project?, domain?, category?, limit?}` — recent non-archived facts
 - `summarize_index {project?, domain?, category?, trust_min?, strong_only?, limit?, max_chars?}` —
@@ -101,10 +101,13 @@ it create/reset/archive/backup semantics.
   its data, status='archived'; `hard:true` purges facts, evidence, graph and
   decisions, lifecycle events, handoffs, and contexts permanently (requires
   `confirm:true`; per-table deleted counts)
-- `backup_workspace {workspace}` — JSON export of ALL workspace data (facts
-  incl. archived, entities, relations, decisions, evidence, contexts, lifecycle
-  events, and handoffs) with per-table counts to
-  `backups/workspace-<name>-<ts>.json`
+- `backup_workspace {workspace}` — versioned, schema-complete JSON export of
+  all workspace data (facts incl. temporal/decay/confirmation fields,
+  categories, embeddings, graph, decisions, evidence, contexts, lifecycle
+  events, handoffs, the workspace registry row, and activity-day metadata) with
+  per-table counts to `backups/workspace-<name>-<ts>.json`. Embedding BLOBs are
+  base64 encoded; the backup directory is `0700`, files are `0600`, and writes
+  are atomic.
 
 ### v0.7 — automatic decay (2026-08-17)
 
@@ -170,11 +173,12 @@ database:
 - `current_database {}` — reports the active selection; `list_databases`
   marks the selected one.
 
-Full workspace read-back (handoff item 3): `backup_workspace` now exports
-facts + entities + relations + decisions + evidence with per-table counts,
-and `list_workspaces` reports the same counts per workspace — so a hard
-cleanup is verifiable end-to-end (every scoped query returns 0 synthetic
-records afterwards).
+Full workspace read-back: `backup_workspace` exports a versioned,
+schema-complete JSON manifest with every workspace table, full fact state,
+optional embeddings (base64 encoded), the registry row, and activity-day
+metadata. Counts cover every table. The backup directory is private (`0700`),
+files are private (`0600`), and publication is atomic. `list_workspaces`
+continues to report the scoped data counts used to verify hard cleanup.
 
 ### v0.10 — topic categories: the library flow (2026-08-17)
 
@@ -511,8 +515,11 @@ pipeline modules below move each of them into the server when enabled:
   client only inserts it. It sanitizes transcript input and leads retrieval
   with the latest user intent instead of system/tool noise.
 - **Truth verification** — `trust`/`strong` are client-set metadata and query
-  filters, not a verification or protection mechanism. They never turn memory
-  into an authorization source.
+  filters, not a verification or protection mechanism. Server-side LLM
+  extraction treats model authority claims as unconfirmed: `trust=high` is
+  stored as `medium`, `strong=true` is stored as `false`, and `confirm_fact`
+  is required before a fact can become high-trust. They never turn memory into
+  an authorization source.
 - **Semantic search** — optional module (`embeddings.py`, gated by
   `MEMORY_MCP_EMBEDDINGS=1`): `search_semantic` + hybrid `search_facts
   semantic=true` (RRF merge). The core stays lexical (FTS5 + BM25) with zero
@@ -533,7 +540,9 @@ activate only when set, and every failure degrades to store-only.
 - **Extraction** (`MEMORY_MCP_EXTRACT=1`): `ingest_turn {transcript,
   session_ref?, project?, domain?}` sends the transcript to the LLM provider
   (see llm.py; ollama/openai/test) and stores extracted facts with provenance
-  (`attach_evidence`). Minimum transcript length:
+  (`attach_evidence`). Model output is always an unconfirmed candidate:
+  `trust=high` is downgraded to `medium` and `strong=true` to `false` until
+  `confirm_fact` is called after human review. Minimum transcript length:
   `MEMORY_MCP_EXTRACT_MIN_CHARS` (default 800). When `MEMORY_MCP_VERIFY=1`,
   new facts are cross-checked and superseded ones archived.
 - **Recall assembly** (`MEMORY_MCP_RECALL=1`): `compose_recall {turn_text,
@@ -541,8 +550,9 @@ activate only when set, and every failure degrades to store-only.
   `<memory-recall>` block (authoritative + background tiers,
   reasonix-compatible format); transcript noise is removed before retrieval and
   `purpose: "safety_critical"` is rejected;
-  `sweep_freshness {}` archives facts past their type's hard window (strong
-  facts kept): reference 45d, user/feedback 365d, project 180d.
+  `sweep_freshness {workspace?}` archives facts past their type's hard window
+  (strong facts kept): reference 45d, user/feedback 365d, project 180d.
+  Archived/reset workspaces are rejected before any shared-pool update.
 - **Verification** (`MEMORY_MCP_VERIFY=1`): `verify_facts {text}` LLM
   cross-checks a candidate against the store (conflicts/supersessions).
   `check_new_facts` (ingestion hook) archives superseded old facts
