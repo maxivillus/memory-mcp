@@ -10,6 +10,7 @@ Run:  MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -v
 import importlib
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -637,6 +638,139 @@ class LifecycleToolContractTest(unittest.TestCase):
                      "list_handoffs", "handoff_accept", "handoff_cancel"):
             self.assertIn(name, mcp.TOOLS)
             self.assertIn(name, mcp.HANDLERS)
+
+
+class RunsAnchorsAndAccessTest(unittest.TestCase):
+    """v0.18: runs + issue/PR links, anchored queries, access telemetry."""
+
+    def test_v018_tools_are_public(self):
+        for name in ("run_begin", "run_end", "link_run", "query_run",
+                     "prepare_summary", "query_anchored"):
+            self.assertIn(name, mcp.TOOLS)
+            self.assertIn(name, mcp.HANDLERS)
+
+    def test_run_lifecycle_and_issue_pr_links(self):
+        ws = "runs-ws"
+        begin = mcp.run_begin({"run_id": "run-1", "issue_ref": "NTL-1", "workspace": ws})
+        self.assertNotIn("error", begin, begin)
+        self.assertEqual(begin["run"]["state"], "open")
+        dup = mcp.run_begin({"run_id": "run-1", "workspace": ws})
+        self.assertTrue(dup["duplicate"])
+        self.assertEqual(dup["run"]["issue_ref"], "NTL-1")
+        end = mcp.run_end({"run_id": "run-1", "base_sha": "aaa", "head_sha": "bbb",
+                           "files_changed": ["src/a.py", "src/b.py"], "diff": "patch",
+                           "workspace": ws})
+        self.assertNotIn("error", end, end)
+        self.assertTrue(end["closed"])
+        self.assertEqual(end["run"]["files_changed"], ["src/a.py", "src/b.py"])
+        link = mcp.link_run({"run_id": "run-1", "pr_ref": "PR-7", "workspace": ws})
+        self.assertNotIn("error", link, link)
+        self.assertEqual(link["run"]["pr_ref"], "PR-7")
+        q = mcp.query_run({"run_id": "run-1", "workspace": ws})
+        self.assertEqual(q["run"]["head_sha"], "bbb")
+        lst = mcp.query_run({"workspace": ws, "state": "closed"})
+        self.assertEqual(lst["count"], 1)
+        # closed runs reject begin/end; link needs at least one ref
+        self.assertIn("error", mcp.run_begin({"run_id": "run-1", "workspace": ws}))
+        self.assertIn("error", mcp.run_end({"run_id": "run-1", "workspace": ws}))
+        self.assertIn("error", mcp.run_end({"run_id": "missing", "workspace": ws}))
+        self.assertIn("error", mcp.link_run({"run_id": "run-1", "workspace": ws}))
+        self.assertIn("error", mcp.query_run({"run_id": "missing", "workspace": ws}))
+
+    def test_prepare_summary_uses_run_window_and_issue_ref(self):
+        ws = "summary-ws"
+        mcp.run_begin({"run_id": "run-s", "issue_ref": "NTL-9", "workspace": ws})
+        dec = mcp.record_decision({"scenario": "db choice", "subject": "db",
+                                   "outcome": "sqlite", "issue_ref": "NTL-9",
+                                   "path": "src/db.py", "workspace": ws})
+        self.assertNotIn("error", dec, dec)
+        ev = mcp.capture_event({"idempotency_key": "e-s-1", "event_kind": "post_compact",
+                                "payload": "{}", "workspace": ws})
+        self.assertNotIn("error", ev, ev)
+        mcp.run_end({"run_id": "run-s", "workspace": ws})
+        s = mcp.prepare_summary({"run_id": "run-s", "workspace": ws})
+        self.assertNotIn("error", s, s)
+        self.assertIn("NTL-9", s["summary"])
+        self.assertIn("db", s["summary"])
+        self.assertEqual(len(s["decisions"]), 1)
+        self.assertEqual(len(s["events"]), 1)
+        self.assertEqual(s["events"][0]["event_kind"], "post-compact")
+        self.assertIn("error", mcp.prepare_summary({"run_id": "missing", "workspace": ws}))
+
+    def test_query_anchored_facts_via_evidence_and_decisions(self):
+        ws = "anchor-ws"
+        path = "src/anchored_probe/worker.py"
+        fact = mcp.remember_fact({"text": "retry logic lives in worker.py", "workspace": ws})
+        ev = mcp.attach_evidence({"fact_id": fact["id"], "source_ref": path,
+                                  "path": path, "symbol": "AnchoredProbe.retry",
+                                  "repo": "repo-x", "workspace": ws})
+        self.assertNotIn("error", ev, ev)
+        dec = mcp.record_decision({"scenario": "retry policy", "subject": "retry",
+                                   "outcome": "3 attempts", "path": path,
+                                   "symbol": "AnchoredProbe.retry", "workspace": ws})
+        self.assertNotIn("error", dec, dec)
+        by_path = mcp.query_anchored({"path": "anchored_probe", "workspace": ws})
+        self.assertNotIn("error", by_path, by_path)
+        self.assertEqual(by_path["count"], 2)
+        self.assertEqual(len(by_path["facts"]), 1)
+        self.assertEqual(len(by_path["decisions"]), 1)
+        self.assertEqual(by_path["facts"][0]["evidence"][0]["path"], path)
+        self.assertEqual(by_path["facts"][0]["evidence"][0]["symbol"], "AnchoredProbe.retry")
+        by_symbol = mcp.query_anchored({"symbol": "anchoredprobe.retry", "workspace": ws})
+        self.assertEqual(by_symbol["count"], 2)
+        # workspace isolation + advisory boundary + selector validation
+        self.assertEqual(mcp.query_anchored({"path": "anchored_probe",
+                                             "workspace": "other-ws"})["count"], 0)
+        self.assertIn("error", mcp.query_anchored(
+            {"path": "anchored_probe", "workspace": ws, "purpose": "safety_critical"}))
+        self.assertIn("error", mcp.query_anchored({"workspace": ws}))
+
+    def test_decisions_anchor_migration(self):
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        con = sqlite3.connect(tmp.name)
+        con.executescript("""
+            CREATE TABLE decisions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              category TEXT NOT NULL DEFAULT '',
+              subject TEXT NOT NULL DEFAULT '',
+              scenario TEXT NOT NULL,
+              reasoning TEXT NOT NULL DEFAULT '',
+              outcome TEXT NOT NULL DEFAULT '',
+              confidence REAL,
+              decision_maker TEXT NOT NULL DEFAULT '',
+              issue_ref TEXT NOT NULL DEFAULT '',
+              parent_decision_id INTEGER,
+              workspace_id TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+        """)
+        con.commit()
+        con.close()
+        try:
+            old = mcp._open_db(tmp.name)
+            cols = {r["name"] for r in old.execute("PRAGMA table_info(decisions)")}
+            self.assertIn("path", cols)
+            self.assertIn("symbol", cols)
+            old.close()
+        finally:
+            os.unlink(tmp.name)
+
+    def test_memory_access_telemetry(self):
+        ws = "tele-ws"
+        mcp.remember_fact({"text": "telemetry probe fact", "workspace": ws})
+        before = mcp.stats({"workspace": ws})["access"]["events"]
+        mcp.search_facts({"query": "telemetry probe", "workspace": ws})
+        mcp.search_facts({"query": "telemetry probe", "workspace": ws})
+        st = mcp.stats({"workspace": ws})
+        self.assertNotIn("error", st, st)
+        self.assertEqual(st["access"]["events"], before + 2)
+        # a zero-result anchored query still logs the pull
+        mcp.query_anchored({"path": "nothing_probe.py", "workspace": ws})
+        st2 = mcp.stats({"workspace": ws})
+        self.assertEqual(st2["access"]["by_site"].get("query_anchored", 0),
+                         st["access"]["by_site"].get("query_anchored", 0) + 1)
 
 
 if __name__ == "__main__":
