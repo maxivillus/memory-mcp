@@ -1,6 +1,6 @@
 # Ingestion, bounded retrieval, and code-local provenance
 
-This document is the operational contract for the v0.16, v0.17, and v0.19 additions to the
+This document is the operational contract for the v0.16, v0.17, v0.19, and v0.20 additions to the
 local `memory-mcp` server. The canonical behavior is implemented in
 `memory_mcp.py` and covered by `tests/test_memory_mcp.py`; this document keeps
 the client-facing flow concise.
@@ -228,6 +228,54 @@ runtime. `search_guard` accepts `action: "search"`, `"memory"`, or `"reset"`;
 after three searches by default it returns `warn: true`, while
 `blocking` remains false. `stats.access` exposes pull hit/miss counts and
 overall/per-site `hit_rate` values from the existing bounded telemetry rows.
+
+## Aggregate paired measurement (v0.20)
+
+Use the measurement tools to compare similar work with memory disabled and
+with trigger-enabled memory. This is an observation layer, not a workflow
+authority or a transcript store.
+
+`record_measurement` requires an exact `workspace`, a bounded
+`measurement_id`, a shared `sample_key` for the pair, `variant` equal to
+`baseline` or `memory`, and at least one bounded `run_id` or `issue_ref` link:
+
+```json
+{
+  "measurement_id": "paired-slice-2026-08",
+  "sample_key": "sample-001",
+  "variant": "memory",
+  "workspace": "project-id",
+  "issue_ref": "NTL-694",
+  "input_tokens": 12000,
+  "output_tokens": 1400,
+  "memory_calls": 2,
+  "external_tool_calls": 5,
+  "wall_time_ms": 185000,
+  "time_to_first_useful_ms": 42000,
+  "context_bytes": 28000,
+  "comment_bytes": 3200,
+  "memory_latency_ms": 38.5,
+  "quality_score": 0.9,
+  "safety_regression": 0
+}
+```
+
+The server accepts only the documented numeric counters, durations, rates,
+normalized quality score, and safety flag. It rejects unknown fields and does
+not store prompts, retrieved facts, comments, diffs, secrets, credentials, or
+arbitrary JSON. If `run_id` is supplied, it must already exist in the same
+workspace. The idempotency key is
+`(workspace, measurement_id, sample_key, variant)`; an identical retry is a
+no-op and a conflicting retry is rejected.
+
+`query_measurement` matches `sample_key` values that have both variants and
+returns only counts plus per-variant metric count, median, and p95. It returns
+`status: "not_claimed"` until both variants have at least `min_pairs`
+(default 10) complete pairs. Once that bar is reached it returns
+`ready_for_review`, which still does not claim token savings, adoption,
+latency benefit, or quality improvement; a human/PM must compare the
+predeclared quality and safety threshold. No savings delta is calculated by
+the server.
 
 ## Verification and recovery
 

@@ -38,6 +38,9 @@ Tools:
   link_run {run_id, workspace?, issue_ref?, pr_ref?}
   query_run {run_id?, workspace?, state?, issue_ref?, limit?}
   prepare_summary {run_id, workspace?, max_decisions?}
+  -- v0.20 aggregate paired measurement --
+  record_measurement {measurement_id, sample_key, variant, workspace, run_id?|issue_ref?, metrics...}
+  query_measurement {measurement_id, workspace, min_pairs?}
   query_anchored {path?, symbol?, repo?, repo_root?, workspace?, limit?, purpose?}
   auto_orient {turn_text, session_id?, workspace?}
   search_guard {session_id, action, threshold?, workspace?}
@@ -57,7 +60,7 @@ Tools:
   detect_conflicts {text}
 """
 import base64
-import fnmatch, hashlib, json, os, re, signal, sqlite3, sys, tempfile, threading, time
+import fnmatch, hashlib, json, math, os, re, signal, sqlite3, sys, tempfile, threading, time
 from datetime import datetime, timedelta, timezone
 
 def default_db_path():
@@ -142,6 +145,29 @@ _AUTO_ORIENT_MAX_HITS = 6
 _AUTO_ORIENT_MAX_CHARS = _env_int("MEMORY_MCP_AUTO_ORIENT_MAX_CHARS", 1400, 480)
 _AUTO_ORIENTED_SESSIONS = set()
 _SEARCH_GUARD_STATE = {}
+
+# v0.20 aggregate-only paired measurement. The observation table deliberately
+# has no free-text or payload column; every accepted value is a bounded number
+# or an opaque, length-limited reference.
+_MEASUREMENT_MAX_OBSERVATIONS = _env_int(
+    "MEMORY_MCP_MEASUREMENT_MAX_OBSERVATIONS", 10000, 1)
+_MEASUREMENT_MAX_VALUE = 1_000_000_000_000
+_MEASUREMENT_COUNTER_FIELDS = (
+    "input_tokens", "output_tokens", "memory_calls", "external_tool_calls",
+    "context_bytes", "comment_bytes", "qa_rework",
+)
+_MEASUREMENT_DURATION_FIELDS = (
+    "wall_time_ms", "time_to_first_useful_ms", "memory_latency_ms",
+)
+_MEASUREMENT_RATE_FIELDS = (
+    "duplicate_rate", "conflict_rate", "reference_resolution_rate",
+    "fallback_rate", "quality_score",
+)
+_MEASUREMENT_BOOLEAN_FIELDS = ("safety_regression",)
+_MEASUREMENT_METRIC_FIELDS = (
+    _MEASUREMENT_COUNTER_FIELDS + _MEASUREMENT_DURATION_FIELDS +
+    _MEASUREMENT_RATE_FIELDS + _MEASUREMENT_BOOLEAN_FIELDS
+)
 _ANCHOR_EXCLUDED_DIRS = {
     ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
     "node_modules", "data", "backups", "databases",
@@ -508,6 +534,55 @@ CREATE TABLE IF NOT EXISTS memory_access_events (
 );
 CREATE INDEX IF NOT EXISTS access_events_workspace_idx
   ON memory_access_events(workspace_id, created_at, id);
+
+-- v0.20 (2026-08-24): aggregate-only paired measurement observations.
+-- No prompt, retrieved payload, comment, diff, or other free-text payload is
+-- accepted by the public handler or represented in this table.
+CREATE TABLE IF NOT EXISTS measurement_observations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  measurement_id TEXT NOT NULL,
+  sample_key TEXT NOT NULL,
+  variant TEXT NOT NULL CHECK (variant IN ('baseline','memory')),
+  run_id TEXT NOT NULL DEFAULT '',
+  issue_ref TEXT NOT NULL DEFAULT '',
+  workspace_id TEXT NOT NULL,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  memory_calls INTEGER,
+  external_tool_calls INTEGER,
+  context_bytes INTEGER,
+  comment_bytes INTEGER,
+  wall_time_ms REAL,
+  time_to_first_useful_ms REAL,
+  memory_latency_ms REAL,
+  duplicate_rate REAL,
+  conflict_rate REAL,
+  reference_resolution_rate REAL,
+  fallback_rate REAL,
+  qa_rework INTEGER,
+  quality_score REAL,
+  safety_regression INTEGER,
+  created_at TEXT NOT NULL,
+  UNIQUE(workspace_id, measurement_id, sample_key, variant),
+  CHECK (input_tokens IS NULL OR input_tokens >= 0),
+  CHECK (output_tokens IS NULL OR output_tokens >= 0),
+  CHECK (memory_calls IS NULL OR memory_calls >= 0),
+  CHECK (external_tool_calls IS NULL OR external_tool_calls >= 0),
+  CHECK (context_bytes IS NULL OR context_bytes >= 0),
+  CHECK (comment_bytes IS NULL OR comment_bytes >= 0),
+  CHECK (wall_time_ms IS NULL OR wall_time_ms >= 0),
+  CHECK (time_to_first_useful_ms IS NULL OR time_to_first_useful_ms >= 0),
+  CHECK (memory_latency_ms IS NULL OR memory_latency_ms >= 0),
+  CHECK (duplicate_rate IS NULL OR duplicate_rate BETWEEN 0 AND 1),
+  CHECK (conflict_rate IS NULL OR conflict_rate BETWEEN 0 AND 1),
+  CHECK (reference_resolution_rate IS NULL OR reference_resolution_rate BETWEEN 0 AND 1),
+  CHECK (fallback_rate IS NULL OR fallback_rate BETWEEN 0 AND 1),
+  CHECK (qa_rework IS NULL OR qa_rework >= 0),
+  CHECK (quality_score IS NULL OR quality_score BETWEEN 0 AND 1),
+  CHECK (safety_regression IS NULL OR safety_regression IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS measurement_workspace_idx
+  ON measurement_observations(workspace_id, measurement_id, sample_key, id);
 """
 
 # Optional semantic search (embeddings.py) — created here so the schema is
@@ -593,6 +668,7 @@ def _open_db(path):
     _migrate_fts(con, preexisting_fts)
     _migrate_categories(con)
     _migrate_decisions_anchors(con)
+    _migrate_measurements(con)
     return con
 
 
@@ -626,6 +702,20 @@ def _migrate_decisions_anchors(con):
         con.execute("ALTER TABLE decisions ADD COLUMN path TEXT NOT NULL DEFAULT ''")
     if "symbol" not in existing:
         con.execute("ALTER TABLE decisions ADD COLUMN symbol TEXT NOT NULL DEFAULT ''")
+    con.commit()
+
+
+def _migrate_measurements(con):
+    """v0.20 additive migration for aggregate paired measurements.
+
+    The table is created by the main schema script so both fresh and existing
+    stores receive the same contract. This hook keeps the migration explicit
+    and repairs the bounded lookup index if an older partial upgrade omitted
+    it; no existing table is rebuilt and no payload data is introduced.
+    """
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS measurement_workspace_idx "
+        "ON measurement_observations(workspace_id, measurement_id, sample_key, id)")
     con.commit()
 
 
@@ -2144,6 +2234,228 @@ def query_run(args):
         params.append(limit)
         rows = [_run_meta(r) for r in con.execute(sql, params)]
         return {"count": len(rows), "runs": rows}
+    finally:
+        con.close()
+
+
+def _measurement_ref(args, name, required=False):
+    value = args.get(name, "") or ""
+    if not isinstance(value, str):
+        return None, {"error": "%s must be a string" % name}
+    value = value.strip()
+    if required and not value:
+        return None, {"error": "%s is required" % name}
+    if len(value) > _RUN_MAX_FIELD_CHARS:
+        return None, {"error": "%s is too long" % name}
+    return value, None
+
+
+def _measurement_values(args):
+    values = {}
+    for name in _MEASUREMENT_METRIC_FIELDS:
+        if name not in args or args[name] is None:
+            continue
+        value = args[name]
+        if name in _MEASUREMENT_COUNTER_FIELDS:
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None, {"error": "%s must be a non-negative integer" % name}
+            if value < 0 or value > _MEASUREMENT_MAX_VALUE:
+                return None, {"error": "%s is outside the allowed range" % name}
+            values[name] = value
+            continue
+        if name in _MEASUREMENT_BOOLEAN_FIELDS:
+            if isinstance(value, bool) or not isinstance(value, int) or value not in (0, 1):
+                return None, {"error": "%s must be 0 or 1" % name}
+            values[name] = value
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None, {"error": "%s must be a finite number" % name}
+        value = float(value)
+        if not math.isfinite(value) or value < 0 or value > _MEASUREMENT_MAX_VALUE:
+            return None, {"error": "%s is outside the allowed range" % name}
+        if name in _MEASUREMENT_RATE_FIELDS and not 0 <= value <= 1:
+            return None, {"error": "%s must be between 0 and 1" % name}
+        values[name] = value
+    if not values:
+        return None, {"error": "at least one aggregate metric is required"}
+    return values, None
+
+
+def _measurement_meta(row):
+    fields = ("id", "measurement_id", "sample_key", "variant", "run_id",
+              "issue_ref", "workspace_id") + _MEASUREMENT_METRIC_FIELDS + ("created_at",)
+    return {field: row[field] for field in fields}
+
+
+def record_measurement(args):
+    """Store one bounded aggregate observation for a paired measurement.
+
+    This is intentionally separate from retrieval and lifecycle payloads:
+    callers can submit token/call/timing/quality counters without giving the
+    server prompts, retrieved facts, comments, diffs, or arbitrary JSON.
+    """
+    allowed = {"measurement_id", "sample_key", "variant", "workspace",
+               "run_id", "issue_ref"} | set(_MEASUREMENT_METRIC_FIELDS)
+    unexpected = sorted(set(args) - allowed)
+    if unexpected:
+        return {"error": "unsupported measurement fields: %s" % ", ".join(unexpected)}
+    workspace = _workspace(args)
+    if not workspace:
+        return {"error": "workspace is required for measurement operations"}
+    measurement_id, err = _measurement_ref(args, "measurement_id", required=True)
+    if err:
+        return err
+    sample_key, err = _measurement_ref(args, "sample_key", required=True)
+    if err:
+        return err
+    variant, err = _measurement_ref(args, "variant", required=True)
+    if err:
+        return err
+    if variant not in ("baseline", "memory"):
+        return {"error": "variant must be baseline or memory"}
+    run_id, err = _measurement_ref(args, "run_id")
+    if err:
+        return err
+    issue_ref, err = _measurement_ref(args, "issue_ref")
+    if err:
+        return err
+    if not run_id and not issue_ref:
+        return {"error": "run_id or issue_ref is required"}
+    values, err = _measurement_values(args)
+    if err:
+        return err
+
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        con.execute("BEGIN IMMEDIATE")
+        if run_id:
+            linked = con.execute(
+                "SELECT id FROM runs WHERE workspace_id=? AND run_id=?",
+                (workspace, run_id)).fetchone()
+            if not linked:
+                con.rollback()
+                return {"error": "run_id was not found in the requested workspace"}
+        row = con.execute(
+            "SELECT * FROM measurement_observations "
+            "WHERE workspace_id=? AND measurement_id=? AND sample_key=? AND variant=?",
+            (workspace, measurement_id, sample_key, variant)).fetchone()
+        expected = {"measurement_id": measurement_id, "sample_key": sample_key,
+                    "variant": variant, "run_id": run_id, "issue_ref": issue_ref,
+                    "workspace_id": workspace}
+        expected.update({field: values.get(field) for field in _MEASUREMENT_METRIC_FIELDS})
+        if row:
+            same = all(row[field] == expected[field]
+                       for field in expected if field != "workspace_id")
+            con.rollback()
+            if same:
+                return {"observation": _measurement_meta(row), "duplicate": True}
+            return {"error": "measurement sample already recorded with different values"}
+        columns = ["measurement_id", "sample_key", "variant", "run_id", "issue_ref",
+                   "workspace_id"] + list(_MEASUREMENT_METRIC_FIELDS) + ["created_at"]
+        placeholders = ",".join("?" for _ in columns)
+        params = [measurement_id, sample_key, variant, run_id, issue_ref, workspace]
+        params.extend(values.get(field) for field in _MEASUREMENT_METRIC_FIELDS)
+        params.append(now())
+        con.execute(
+            "INSERT INTO measurement_observations (%s) VALUES (%s)" %
+            (", ".join(columns), placeholders), params)
+        con.execute(
+            "DELETE FROM measurement_observations WHERE workspace_id=? AND id NOT IN "
+            "(SELECT id FROM measurement_observations WHERE workspace_id=? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?)",
+            (workspace, workspace, _MEASUREMENT_MAX_OBSERVATIONS))
+        con.commit()
+        row = con.execute(
+            "SELECT * FROM measurement_observations WHERE workspace_id=? AND "
+            "measurement_id=? AND sample_key=? AND variant=?",
+            (workspace, measurement_id, sample_key, variant)).fetchone()
+        return {"observation": _measurement_meta(row), "duplicate": False}
+    except sqlite3.DatabaseError as e:
+        con.rollback()
+        return {"error": "measurement record failed: %s" % e}
+    finally:
+        con.close()
+
+
+def _measurement_percentile(values, quantile):
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        result = ordered[int(position)]
+    else:
+        weight = position - lower
+        result = ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+    return round(result, 3)
+
+
+def query_measurement(args):
+    """Summarize complete baseline/memory pairs without producing a claim."""
+    allowed = {"measurement_id", "workspace", "min_pairs"}
+    unexpected = sorted(set(args) - allowed)
+    if unexpected:
+        return {"error": "unsupported measurement fields: %s" % ", ".join(unexpected)}
+    workspace = _workspace(args)
+    if not workspace:
+        return {"error": "workspace is required for measurement operations"}
+    measurement_id, err = _measurement_ref(args, "measurement_id", required=True)
+    if err:
+        return err
+    min_pairs, err = _bounded_int_arg(args, "min_pairs", 10, 1, 1000)
+    if err:
+        return err
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        rows = con.execute(
+            "SELECT * FROM measurement_observations WHERE workspace_id=? "
+            "AND measurement_id=? ORDER BY sample_key, variant, id",
+            (workspace, measurement_id)).fetchall()
+        by_sample = {}
+        observations = {"baseline": 0, "memory": 0}
+        for row in rows:
+            by_sample.setdefault(row["sample_key"], {})[row["variant"]] = row
+            observations[row["variant"]] += 1
+        paired_keys = sorted(
+            sample for sample, variants in by_sample.items()
+            if "baseline" in variants and "memory" in variants)
+        paired = set(paired_keys)
+        variants = {}
+        for variant in ("baseline", "memory"):
+            metric_summary = {}
+            for field in _MEASUREMENT_METRIC_FIELDS:
+                values = [by_sample[sample][variant][field] for sample in paired_keys
+                           if by_sample[sample][variant][field] is not None]
+                if values:
+                    metric_summary[field] = {
+                        "count": len(values),
+                        "median": _measurement_percentile(values, 0.5),
+                        "p95": _measurement_percentile(values, 0.95),
+                    }
+            variant_keys = {sample for sample, value in by_sample.items()
+                            if variant in value}
+            variants[variant] = {
+                "observations": observations[variant],
+                "paired_samples": len(paired_keys),
+                "unpaired_samples": len(variant_keys - paired),
+                "metrics": metric_summary,
+            }
+        return {
+            "measurement_id": measurement_id,
+            "min_pairs": min_pairs,
+            "paired_samples": len(paired_keys),
+            "observations": observations,
+            "status": "ready_for_review" if len(paired_keys) >= min_pairs else "not_claimed",
+            "variants": variants,
+        }
     finally:
         con.close()
 
@@ -4920,6 +5232,9 @@ def stats(_args=None):
                                     "WHERE 1=1" + _ws_check("f", ws), ws_params).fetchone()[0],
             "runs": con.execute("SELECT COUNT(*) FROM runs WHERE 1=1" + _ws_check("runs", ws),
                                 ws_params).fetchone()[0],
+            "measurements": con.execute(
+                "SELECT COUNT(*) FROM measurement_observations WHERE workspace_id=?",
+                [ws] if ws else ["__unscoped__"]).fetchone()[0],
         }
         access = {"events": 0, "by_site": {}, "last_at": ""}
         try:
@@ -5744,6 +6059,50 @@ TOOLS = {
             },
         },
     },
+    "record_measurement": {
+        "description": "Record one aggregate-only baseline or memory observation for a paired sample. Only bounded numeric metrics and opaque run/issue references are accepted; prompts and payloads are rejected.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "measurement_id": {"type": "string", "maxLength": 256},
+                "sample_key": {"type": "string", "maxLength": 256},
+                "variant": {"type": "string", "enum": ["baseline", "memory"]},
+                "workspace": {"type": "string", "description": "Required exact project measurement scope"},
+                "run_id": {"type": "string", "maxLength": 256},
+                "issue_ref": {"type": "string", "maxLength": 256},
+                "input_tokens": {"type": "integer", "minimum": 0},
+                "output_tokens": {"type": "integer", "minimum": 0},
+                "memory_calls": {"type": "integer", "minimum": 0},
+                "external_tool_calls": {"type": "integer", "minimum": 0},
+                "context_bytes": {"type": "integer", "minimum": 0},
+                "comment_bytes": {"type": "integer", "minimum": 0},
+                "wall_time_ms": {"type": "number", "minimum": 0},
+                "time_to_first_useful_ms": {"type": "number", "minimum": 0},
+                "memory_latency_ms": {"type": "number", "minimum": 0},
+                "duplicate_rate": {"type": "number", "minimum": 0, "maximum": 1},
+                "conflict_rate": {"type": "number", "minimum": 0, "maximum": 1},
+                "reference_resolution_rate": {"type": "number", "minimum": 0, "maximum": 1},
+                "fallback_rate": {"type": "number", "minimum": 0, "maximum": 1},
+                "qa_rework": {"type": "integer", "minimum": 0},
+                "quality_score": {"type": "number", "minimum": 0, "maximum": 1},
+                "safety_regression": {"type": "integer", "enum": [0, 1]},
+            },
+            "required": ["measurement_id", "sample_key", "variant", "workspace"],
+            "anyOf": [{"required": ["run_id"]}, {"required": ["issue_ref"]}],
+        },
+    },
+    "query_measurement": {
+        "description": "Summarize complete baseline/memory pairs with bounded median and p95 numeric metrics. Returns not_claimed until min_pairs is present in both variants and never calculates a savings or efficacy claim.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "measurement_id": {"type": "string", "maxLength": 256},
+                "workspace": {"type": "string", "description": "Required exact project measurement scope"},
+                "min_pairs": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 10},
+            },
+            "required": ["measurement_id", "workspace"],
+        },
+    },
     "prepare_summary": {
         "description": "Assemble a ready-to-post markdown summary from a run's own records (decisions recorded in its window or bound to its issue_ref, event catalog). Posts nothing.",
         "inputSchema": {
@@ -6198,7 +6557,7 @@ TOOLS = {
         },
     },
     "stats": {
-        "description": "Store statistics (facts, provenance, runs, access counts, and pull hit-rate telemetry).",
+        "description": "Store statistics (facts, provenance, runs, aggregate measurement counts, access counts, and pull hit-rate telemetry).",
         "inputSchema": {"type": "object", "properties": {
             "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
         }},
@@ -6329,6 +6688,8 @@ HANDLERS = {
     "run_end": run_end,
     "link_run": link_run,
     "query_run": query_run,
+    "record_measurement": record_measurement,
+    "query_measurement": query_measurement,
     "prepare_summary": prepare_summary,
     "query_anchored": query_anchored,
     "search_facts": search_facts,
@@ -6430,7 +6791,7 @@ def main():
                 "result": {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "memory-mcp", "version": "0.19.0"},
+                    "serverInfo": {"name": "memory-mcp", "version": "0.20.0"},
                 },
             }
         elif method == "tools/list":
