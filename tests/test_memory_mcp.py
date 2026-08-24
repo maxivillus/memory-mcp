@@ -218,6 +218,44 @@ class MemoryMCPTest(unittest.TestCase):
         self.assertEqual(prov["evidence"][0]["path"], "src/worker.py")
         self.assertEqual(mcp.search_facts({"query": "backoff", "workspace": workspace})["count"], 0)
 
+    def test_absorb_admission_trace_is_opt_in_and_bounded(self):
+        name = "admission-trace-new-fact"
+        old_flag = os.environ.get("MEMORY_MCP_ADMISSION_TRACE")
+        try:
+            os.environ["MEMORY_MCP_ADMISSION_TRACE"] = "0"
+            disabled = mcp.absorb({"facts": [{
+                "text": name,
+                "source": "repo@abc:src/worker.py",
+                "evidence": {"repo": "repo", "ref": "abc",
+                             "path": "src/worker.py"},
+            }], "workspace": "admission-trace"})
+            self.assertNotIn("decision_trace", disabled["items"][0])
+
+            os.environ["MEMORY_MCP_ADMISSION_TRACE"] = "1"
+            traced = mcp.absorb({"facts": [{
+                "text": name + " second",
+                "source": "repo@abc:src/worker.py",
+                "evidence": {"repo": "repo", "ref": "abc",
+                             "path": "src/worker.py"},
+            }], "workspace": "admission-trace", "commit": True})
+            trace = traced["items"][0]["decision_trace"]
+            self.assertEqual(trace["reason_code"], "no_matching_candidates")
+            self.assertEqual(trace["action"], "create")
+            self.assertEqual(trace["verification"], "not_requested")
+            self.assertEqual(trace["evidence_count"], 1)
+            self.assertEqual(trace["evidence_refs"], ["repo@abc:src/worker.py"])
+
+            duplicate = mcp.absorb({"facts": [name + " second"],
+                                     "workspace": "admission-trace"})
+            duplicate_trace = duplicate["items"][0]["decision_trace"]
+            self.assertEqual(duplicate_trace["reason_code"], "exact_sha256_duplicate")
+            self.assertEqual(duplicate_trace["action"], "noop")
+        finally:
+            if old_flag is None:
+                os.environ.pop("MEMORY_MCP_ADMISSION_TRACE", None)
+            else:
+                os.environ["MEMORY_MCP_ADMISSION_TRACE"] = old_flag
+
     def test_fact_chunking_is_bounded_and_offset_addressable(self):
         text = "chunked fact alpha beta gamma delta epsilon zeta eta theta"
         fact = self.remember(text, workspace="fact-chunks")
@@ -647,7 +685,7 @@ class RunsAnchorsAndAccessTest(unittest.TestCase):
 
     def test_v018_tools_are_public(self):
         for name in ("run_begin", "run_end", "link_run", "query_run",
-                     "prepare_summary", "query_anchored"):
+                     "prepare_summary", "query_anchored", "context_map"):
             self.assertIn(name, mcp.TOOLS)
             self.assertIn(name, mcp.HANDLERS)
 
@@ -967,6 +1005,63 @@ class AnchorAndRuntimePolicyTest(unittest.TestCase):
         removed = mcp.query_anchored({"path": "removed.py", "workspace": "anchor-policy",
                                       "repo_root": self.repo})
         self.assertEqual(removed["facts"][0]["evidence"][0]["anchor_verdict"], "REMOVED")
+
+    def test_context_map_is_opt_in_freshness_aware_and_impact_bounded(self):
+        old_flag = os.environ.get("MEMORY_MCP_CONTEXT_MAP")
+        workspace = "context-map-policy"
+        path = "mapped.py"
+        content = "def mapped():\n    return 1\n"
+        with open(os.path.join(self.repo, path), "w", encoding="utf-8") as handle:
+            handle.write(content)
+        fact_result = mcp.remember_fact({"text": "mapped repository context fact",
+                                         "workspace": workspace})
+        self.assertNotIn("error", fact_result, fact_result)
+        fact = fact_result["id"]
+        evidence = mcp.attach_evidence({
+            "fact_id": fact, "source_ref": "repo-x@ref-1:mapped.py",
+            "repo": "repo-x", "ref": "ref-1", "path": path,
+            "symbol": "mapped", "workspace": workspace,
+        })
+        self.assertNotIn("error", evidence, evidence)
+        mcp.run_begin({"run_id": "context-map-run", "workspace": workspace})
+        mcp.run_end({"run_id": "context-map-run", "workspace": workspace,
+                     "files_changed": [path]})
+        checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        args = {
+            "repo": "repo-x", "ref": "ref-1", "view": "impact",
+            "repo_root": self.repo, "workspace": workspace,
+            "anchors": [{"path": path, "symbol": "mapped",
+                         "content_checksum": checksum,
+                         "relation": "dependent"}],
+        }
+        try:
+            os.environ.pop("MEMORY_MCP_CONTEXT_MAP", None)
+            disabled = mcp.context_map(args)
+            self.assertEqual(disabled["code"], "feature_disabled")
+
+            os.environ["MEMORY_MCP_CONTEXT_MAP"] = "1"
+            result = mcp.context_map(args)
+            self.assertNotIn("error", result, result)
+            self.assertTrue(result["bounded"])
+            self.assertEqual(result["manifest"][0]["anchor_verdict"], "STRONG")
+            self.assertEqual(result["manifest"][0]["checksum_verdict"], "MATCH")
+            self.assertEqual(result["freshness"]["STRONG"], 1)
+            self.assertEqual(result["impact"]["runs"][0]["matched_paths"], [path])
+            self.assertEqual(result["facts"][0]["id"], fact)
+
+            with open(os.path.join(self.repo, path), "w", encoding="utf-8") as handle:
+                handle.write("def mapped():\n    return 2\n")
+            stale = mcp.context_map(args)
+            self.assertEqual(stale["manifest"][0]["anchor_verdict"], "STALE")
+            self.assertEqual(stale["manifest"][0]["checksum_verdict"], "MISMATCH")
+
+            traversal = dict(args, anchors=[{"path": "../outside.py"}])
+            self.assertIn("must stay inside", mcp.context_map(traversal)["error"])
+        finally:
+            if old_flag is None:
+                os.environ.pop("MEMORY_MCP_CONTEXT_MAP", None)
+            else:
+                os.environ["MEMORY_MCP_CONTEXT_MAP"] = old_flag
 
     def test_metadata_only_anchor_is_weak_and_health_cli_fails_on_drift(self):
         fact_id = self._fact("weak anchor fact")
