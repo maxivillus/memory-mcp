@@ -42,6 +42,8 @@ Tools:
   record_measurement {measurement_id, sample_key, variant, workspace, run_id?|issue_ref?, metrics...}
   query_measurement {measurement_id, workspace, min_pairs?}
   query_anchored {path?, symbol?, repo?, repo_root?, workspace?, limit?, purpose?}
+  context_map {repo, ref, anchors, view?, impact_paths?, repo_root?, workspace?, purpose?}
+  -- v0.21 opt-in bounded repository context and admission explainability --
   auto_orient {turn_text, session_id?, workspace?}
   search_guard {session_id, action, threshold?, workspace?}
   -- v0.3 graph/decisions/provenance --
@@ -88,6 +90,14 @@ def _env_int(name, default, minimum):
     return max(minimum, value)
 
 
+def _env_flag(name, default=False):
+    """Read an opt-in boolean without making malformed values truthy."""
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 # Contexts are deliberately bounded at both storage and read time. The limits
 # are operational guardrails, not a substitute for the caller's workspace ACL.
 _CONTEXT_MAX_BYTES = _env_int("MEMORY_MCP_CONTEXT_MAX_BYTES", 16 * 1024 * 1024, 1)
@@ -111,6 +121,8 @@ _FACT_MAX_CHUNK_RESPONSE_CHARS = _env_int(
 _ABSORB_MAX_FACTS = _env_int("MEMORY_MCP_ABSORB_MAX_FACTS", 50, 1)
 _ABSORB_MAX_TEXT_CHARS = _env_int("MEMORY_MCP_ABSORB_MAX_TEXT_CHARS", 16000, 1)
 _EVIDENCE_MAX_FIELD_CHARS = _env_int("MEMORY_MCP_EVIDENCE_MAX_FIELD_CHARS", 2048, 1)
+_ADMISSION_TRACE_MAX_REFS = _env_int(
+    "MEMORY_MCP_ADMISSION_TRACE_MAX_REFS", 20, 1)
 
 # v0.13 lifecycle capture and typed handoffs. These limits keep the local
 # event spool useful between short runtime sessions without turning it into an
@@ -145,6 +157,16 @@ _AUTO_ORIENT_MAX_HITS = 6
 _AUTO_ORIENT_MAX_CHARS = _env_int("MEMORY_MCP_AUTO_ORIENT_MAX_CHARS", 1400, 480)
 _AUTO_ORIENTED_SESSIONS = set()
 _SEARCH_GUARD_STATE = {}
+
+# v0.21 opt-in repository context manifest. The server returns bounded
+# references and existing anchor/run evidence; it never builds or persists a
+# second code graph and the flags remain off by default for compatibility.
+_CONTEXT_MAP_MAX_ANCHORS = _env_int("MEMORY_MCP_CONTEXT_MAP_MAX_ANCHORS", 32, 1)
+_CONTEXT_MAP_MAX_PATHS = _env_int("MEMORY_MCP_CONTEXT_MAP_MAX_PATHS", 100, 1)
+_CONTEXT_MAP_MAX_RUNS = _env_int("MEMORY_MCP_CONTEXT_MAP_MAX_RUNS", 20, 1)
+_CONTEXT_MAP_MAX_RESULTS = _env_int("MEMORY_MCP_CONTEXT_MAP_MAX_RESULTS", 100, 1)
+_CONTEXT_MAP_VIEWS = ("orientation", "api", "callers", "dependents", "impact")
+_CONTEXT_MAP_RELATIONS = ("node", "caller", "callee", "dependent")
 
 # v0.20 aggregate-only paired measurement. The observation table deliberately
 # has no free-text or payload column; every accepted value is a bounded number
@@ -2647,6 +2669,311 @@ def query_anchored(args):
         con.close()
 
 
+def _context_map_path(value, name):
+    if not isinstance(value, str):
+        return None, {"error": "%s must be a string" % name}
+    value = value.strip()
+    if not value or os.path.isabs(value):
+        return None, {"error": "%s must be a repository-relative path" % name}
+    normalized = os.path.normpath(value.replace("/", os.sep)).replace(os.sep, "/")
+    if normalized in ("", ".", "..") or normalized.startswith("../"):
+        return None, {"error": "%s must stay inside the repository" % name}
+    if len(normalized) > _LIFECYCLE_MAX_PATH_CHARS:
+        return None, {"error": "%s is too long" % name}
+    return normalized, None
+
+
+def _context_map_sha(value, name):
+    if value in (None, ""):
+        return "", None
+    if not isinstance(value, str):
+        return None, {"error": "%s must be a SHA-256 string" % name}
+    value = value.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        return None, {"error": "%s must be a SHA-256 string" % name}
+    return value, None
+
+
+def _context_map_optional_int(value, name, minimum=0, maximum=1_000_000):
+    if value is None:
+        return None, None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, {"error": "%s must be an integer" % name}
+    if value < minimum or value > maximum:
+        return None, {"error": "%s is outside the allowed range" % name}
+    return value, None
+
+
+def _context_map_file_checksum(repo_root, path, expected):
+    """Compare a supplied full-file checksum without returning file content."""
+    if not expected or not repo_root:
+        return "UNVERIFIED"
+    candidate, _relative = _anchor_relative_path(repo_root, path)
+    if candidate is None or not os.path.isfile(candidate):
+        return "REMOVED"
+    try:
+        size = os.path.getsize(candidate)
+        if size > _ANCHOR_MAX_BYTES:
+            return "UNVERIFIED"
+        with open(candidate, "rb") as handle:
+            data = handle.read(_ANCHOR_MAX_BYTES + 1)
+        if len(data) > _ANCHOR_MAX_BYTES:
+            return "UNVERIFIED"
+    except OSError:
+        return "UNVERIFIED"
+    actual = hashlib.sha256(data).hexdigest()
+    return "MATCH" if actual == expected else "MISMATCH"
+
+
+def _context_map_impact(workspace, paths):
+    """Return bounded run-history matches for requested repository paths."""
+    if not paths:
+        return {"paths": [], "runs": []}
+    path_set = set(paths)
+    con = get_db()
+    try:
+        rows = con.execute(
+            "SELECT run_id, issue_ref, pr_ref, base_sha, head_sha, files_changed, "
+            "state, created_at, ended_at FROM runs WHERE workspace_id=? "
+            "ORDER BY COALESCE(ended_at, created_at) DESC, id DESC LIMIT ?",
+            (workspace, _CONTEXT_MAP_MAX_RUNS * 10)).fetchall()
+        runs = []
+        for row in rows:
+            try:
+                changed = json.loads(row["files_changed"] or "[]")
+            except (TypeError, ValueError):
+                changed = []
+            if not isinstance(changed, list):
+                continue
+            changed = [item for item in changed
+                       if isinstance(item, str) and item.strip()]
+            matched = [item for item in changed if item in path_set]
+            if not matched:
+                continue
+            runs.append({
+                "run_id": row["run_id"],
+                "issue_ref": row["issue_ref"],
+                "pr_ref": row["pr_ref"],
+                "base_sha": row["base_sha"],
+                "head_sha": row["head_sha"],
+                "matched_paths": matched[:_CONTEXT_MAP_MAX_PATHS],
+                "state": row["state"],
+                "created_at": row["created_at"],
+                "ended_at": row["ended_at"],
+            })
+            if len(runs) >= _CONTEXT_MAP_MAX_RUNS:
+                break
+        return {"paths": paths, "runs": runs}
+    finally:
+        con.close()
+
+
+def context_map(args):
+    """Return a bounded, advisory repository manifest over existing evidence."""
+    policy_error = _advisory_only_error(args, "context_map")
+    if policy_error:
+        return policy_error
+    if not _env_flag("MEMORY_MCP_CONTEXT_MAP"):
+        return {
+            "error": "context_map is disabled (set MEMORY_MCP_CONTEXT_MAP=1)",
+            "code": "feature_disabled",
+            "feature": "context_map",
+            "memory_policy": "advisory_only",
+        }
+
+    workspace_value = args.get("workspace")
+    if not isinstance(workspace_value, str) or not workspace_value.strip():
+        return {"error": "workspace is required for context_map"}
+    workspace = workspace_value.strip()
+    repo = args.get("repo")
+    ref = args.get("ref")
+    if not isinstance(repo, str) or not repo.strip():
+        return {"error": "repo is required for context_map"}
+    if not isinstance(ref, str) or not ref.strip():
+        return {"error": "ref is required for context_map"}
+    repo, ref = repo.strip(), ref.strip()
+    if len(repo) > _EVIDENCE_MAX_FIELD_CHARS or len(ref) > _EVIDENCE_MAX_FIELD_CHARS:
+        return {"error": "repo/ref is too long"}
+
+    view = args.get("view", "orientation")
+    if not isinstance(view, str) or view not in _CONTEXT_MAP_VIEWS:
+        return {"error": "view must be one of %s" % ", ".join(_CONTEXT_MAP_VIEWS)}
+    limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
+    if err:
+        return err
+    raw_anchors = args.get("anchors", args.get("manifest"))
+    if not isinstance(raw_anchors, list) or not raw_anchors:
+        return {"error": "anchors must be a non-empty array"}
+    if len(raw_anchors) > _CONTEXT_MAP_MAX_ANCHORS:
+        return {"error": "anchors may contain at most %d items" % _CONTEXT_MAP_MAX_ANCHORS}
+
+    repo_root_value = args.get("repo_root", "") or ""
+    if not isinstance(repo_root_value, str):
+        return {"error": "repo_root must be a string"}
+    if len(repo_root_value) > _LIFECYCLE_MAX_PATH_CHARS * 4:
+        return {"error": "repo_root is too long"}
+    repo_root = _anchor_root(repo_root_value)
+    if repo_root_value.strip() and not repo_root:
+        return {"error": "repo_root must be a readable directory"}
+
+    normalized = []
+    for index, raw in enumerate(raw_anchors):
+        if not isinstance(raw, dict):
+            return {"error": "anchors[%d] must be an object" % index}
+        raw_path = raw.get("path", "")
+        if raw_path is None:
+            raw_path = ""
+        path = raw_path
+        raw_symbol = raw.get("symbol", "")
+        if raw_symbol is None:
+            raw_symbol = ""
+        symbol = raw_symbol
+        if not isinstance(path, str):
+            return {"error": "anchors[%d].path must be a string" % index}
+        if not isinstance(symbol, str):
+            return {"error": "anchors[%d].symbol must be a string" % index}
+        symbol = symbol.strip()
+        if len(symbol) > _EVIDENCE_MAX_FIELD_CHARS:
+            return {"error": "anchors[%d].symbol is too long" % index}
+        if path:
+            path, path_err = _context_map_path(path, "anchors[%d].path" % index)
+            if path_err:
+                return path_err
+        else:
+            path = ""
+        if not path and not symbol:
+            return {"error": "anchors[%d] requires path or symbol" % index}
+        relation = raw.get("relation", "node")
+        if not isinstance(relation, str) or relation not in _CONTEXT_MAP_RELATIONS:
+            return {"error": "anchors[%d].relation must be one of %s" %
+                    (index, ", ".join(_CONTEXT_MAP_RELATIONS))}
+        selected_hash, hash_err = _context_map_sha(
+            raw.get("selected_text_hash", ""),
+            "anchors[%d].selected_text_hash" % index)
+        if hash_err:
+            return hash_err
+        content_checksum = raw.get("content_checksum", raw.get("source_checksum", ""))
+        content_checksum, checksum_err = _context_map_sha(
+            content_checksum, "anchors[%d].content_checksum" % index)
+        if checksum_err:
+            return checksum_err
+        if content_checksum and not path:
+            return {"error": "anchors[%d].content_checksum requires path" % index}
+        fields = {"path": path, "symbol": symbol,
+                  "selected_text_hash": selected_hash,
+                  "resolution_status": raw.get("resolution_status", "")}
+        if not isinstance(fields["resolution_status"], str):
+            return {"error": "anchors[%d].resolution_status must be a string" % index}
+        for name in ("start_line", "start_col", "end_line", "end_col"):
+            value, value_err = _context_map_optional_int(
+                raw.get(name), "anchors[%d].%s" % (index, name))
+            if value_err:
+                return value_err
+            if value is not None:
+                fields[name] = value
+        normalized.append({
+            "path": path,
+            "symbol": symbol,
+            "relation": relation,
+            "selected_text_hash": selected_hash,
+            "content_checksum": content_checksum,
+            "fields": fields,
+        })
+
+    if view == "api" and not any(item["symbol"] for item in normalized):
+        return {"error": "api view requires at least one symbol anchor"}
+    raw_impact_paths = args.get("impact_paths", [])
+    if raw_impact_paths is None:
+        raw_impact_paths = []
+    if not isinstance(raw_impact_paths, list):
+        return {"error": "impact_paths must be an array"}
+    if len(raw_impact_paths) > _CONTEXT_MAP_MAX_PATHS:
+        return {"error": "impact_paths may contain at most %d items" % _CONTEXT_MAP_MAX_PATHS}
+    impact_paths = []
+    for index, raw_path in enumerate(raw_impact_paths):
+        normalized_path, path_err = _context_map_path(
+            raw_path, "impact_paths[%d]" % index)
+        if path_err:
+            return path_err
+        if normalized_path not in impact_paths:
+            impact_paths.append(normalized_path)
+    if view == "impact" and not impact_paths:
+        impact_paths = list(dict.fromkeys(item["path"] for item in normalized if item["path"]))
+
+    facts, decisions = {}, {}
+    manifest = []
+    freshness = {name: 0 for name in ("STRONG", "WEAK", "STALE", "REBUILT", "REMOVED")}
+    for item in normalized:
+        fields = dict(item["fields"])
+        anchor_verdict = _verify_anchor(fields, repo_root)
+        checksum_verdict = _context_map_file_checksum(
+            repo_root, item["path"], item["content_checksum"])
+        final_verdict = anchor_verdict["verdict"]
+        final_reason = anchor_verdict["reason"]
+        if checksum_verdict == "MISMATCH":
+            final_verdict, final_reason = "STALE", "content_checksum_mismatch"
+        elif checksum_verdict == "REMOVED":
+            final_verdict, final_reason = "REMOVED", "path_not_found"
+        elif checksum_verdict == "MATCH" and final_verdict == "WEAK":
+            final_verdict, final_reason = "STRONG", "content_checksum_matches"
+        freshness[final_verdict] = freshness.get(final_verdict, 0) + 1
+        query = query_anchored({
+            "path": item["path"], "symbol": item["symbol"], "repo": repo,
+            "repo_root": repo_root, "workspace": workspace, "limit": limit,
+        })
+        if "error" in query:
+            return {"error": "context_map anchor lookup failed", "detail": query["error"]}
+        matched_fact_ids = []
+        matched_decision_ids = []
+        for fact in query.get("facts", []):
+            facts.setdefault(fact["id"], fact)
+            matched_fact_ids.append(fact["id"])
+        for decision in query.get("decisions", []):
+            decisions.setdefault(decision["id"], decision)
+            matched_decision_ids.append(decision["id"])
+        manifest.append({
+            "repo": repo,
+            "ref": ref,
+            "path": item["path"],
+            "symbol": item["symbol"],
+            "relation": item["relation"],
+            "selected_text_hash": item["selected_text_hash"],
+            "content_checksum": item["content_checksum"],
+            "checksum_verdict": checksum_verdict,
+            "anchor_verdict": final_verdict,
+            "anchor_verification_reason": final_reason,
+            "matched_fact_ids": matched_fact_ids[:_CONTEXT_MAP_MAX_RESULTS],
+            "matched_decision_ids": matched_decision_ids[:_CONTEXT_MAP_MAX_RESULTS],
+        })
+
+    facts_out = list(facts.values())[:_CONTEXT_MAP_MAX_RESULTS]
+    decisions_out = list(decisions.values())[:_CONTEXT_MAP_MAX_RESULTS]
+    impact = _context_map_impact(workspace, impact_paths) if (
+        view == "impact" or impact_paths) else {"paths": [], "runs": []}
+    result = {
+        "view": view,
+        "repo": repo,
+        "ref": ref,
+        "workspace": workspace,
+        "bounded": True,
+        "manifest": manifest,
+        "facts": facts_out,
+        "decisions": decisions_out,
+        "impact": impact,
+        "freshness": freshness,
+        "counts": {"anchors": len(manifest), "facts": len(facts_out),
+                   "decisions": len(decisions_out), "impact_runs": len(impact["runs"])},
+        "relationship_mode": "client_declared_anchor_relations" if view in (
+            "callers", "dependents") else "anchor_and_run_evidence",
+        "memory_policy": "advisory_only",
+        "safety_critical_allowed": False,
+        "source_of_truth": "current repository and live runtime state",
+    }
+    _record_access(workspace, "context_map", repo + "@" + ref,
+                   result["counts"]["facts"] + result["counts"]["decisions"], 0)
+    return result
+
+
 def put_context(args):
     """Store an immutable, named context artifact and optional parent refs."""
     workspace, err = _context_scope(args)
@@ -3750,6 +4077,30 @@ def _absorb_evidence_items(item, fallback_source=""):
     return evidence, None
 
 
+def _admission_reason_code(exact, candidates, verify_requested, verdict,
+                           verification_error, classification, action):
+    """Return a stable, human-readable reason without making it authoritative."""
+    if exact:
+        return "exact_sha256_duplicate"
+    if verification_error:
+        return "verification_unavailable"
+    if verify_requested and verdict is not None:
+        verdict_action = verdict.get("action")
+        reason = (verdict.get("reason") or "").lower()
+        if verdict_action == "add":
+            return "verification_add"
+        if verdict_action in ("update", "supersedes"):
+            return "verification_requires_review_update"
+        if verdict_action == "delete" or (verdict_action == "noop" and reason == "conflict"):
+            return "verification_requires_review_contradiction"
+        return "verification_review"
+    if candidates:
+        return "lexical_related_candidates"
+    if classification == "new" and action == "create":
+        return "no_matching_candidates"
+    return "review_required"
+
+
 def absorb(args):
     """Preview or explicitly commit a batch of candidate facts.
 
@@ -3891,6 +4242,25 @@ def absorb(args):
                 out["verdict"] = verdict
             if verification_error:
                 out["verification_error"] = verification_error
+            if _env_flag("MEMORY_MCP_ADMISSION_TRACE"):
+                trace_status = "not_requested"
+                if verify_requested:
+                    trace_status = "unavailable" if verification_error else (
+                        "completed" if verdict is not None else "not_needed")
+                out["decision_trace"] = {
+                    "reason_code": _admission_reason_code(
+                        exact, candidates, verify_requested, verdict,
+                        verification_error, classification, action),
+                    "classification": classification,
+                    "action": action,
+                    "candidate_count": len(candidates),
+                    "candidate_ids": [row["id"] for row in candidates],
+                    "evidence_refs": [e["source_ref"] for e in item["evidence"][
+                        :_ADMISSION_TRACE_MAX_REFS]],
+                    "evidence_count": len(item["evidence"]),
+                    "verification": trace_status,
+                    "review_required": action == "review",
+                }
             planned.append({"out": out, "item": item, "existing_id":
                             exact["id"] if exact else None})
     finally:
@@ -3922,6 +4292,8 @@ def absorb(args):
                 continue
             fid = stored["id"]
             out["id"] = fid
+            if _env_flag("MEMORY_MCP_ADMISSION_TRACE") and "decision_trace" in out:
+                out["decision_trace"]["resulting_fact_id"] = fid
             if stored.get("dedup"):
                 result["deduped"] += 1
             else:
@@ -6130,6 +6502,38 @@ TOOLS = {
             },
         },
     },
+    "context_map": {
+        "description": "Opt-in bounded repository context manifest over existing anchors and run history. Returns references, freshness verdicts, and advisory impact evidence; it never stores source code or builds an always-on graph.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "maxLength": 2048, "description": "Repository identity"},
+                "ref": {"type": "string", "maxLength": 2048, "description": "Immutable repository ref or commit"},
+                "view": {"type": "string", "enum": list(_CONTEXT_MAP_VIEWS), "default": "orientation"},
+                "anchors": {
+                    "type": "array", "minItems": 1, "maxItems": 32,
+                    "items": {"type": "object", "properties": {
+                        "path": {"type": "string", "maxLength": 1024},
+                        "symbol": {"type": "string", "maxLength": 2048},
+                        "relation": {"type": "string", "enum": list(_CONTEXT_MAP_RELATIONS), "default": "node"},
+                        "selected_text_hash": {"type": "string", "maxLength": 64},
+                        "content_checksum": {"type": "string", "maxLength": 64},
+                        "resolution_status": {"type": "string", "enum": ["", "resolved", "stale", "unresolved"]},
+                        "start_line": {"type": "integer", "minimum": 0},
+                        "start_col": {"type": "integer", "minimum": 0},
+                        "end_line": {"type": "integer", "minimum": 0},
+                        "end_col": {"type": "integer", "minimum": 0},
+                    }},
+                },
+                "impact_paths": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 1024}},
+                "repo_root": {"type": "string", "maxLength": 4096, "description": "Optional local root for read-only freshness verification"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                "workspace": {"type": "string", "description": "Required exact project scope"},
+                "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed"},
+            },
+            "required": ["repo", "ref", "anchors", "workspace"],
+        },
+    },
     "search_facts": {
         "description": "Advisory full-text search over stored facts. It cannot authorize safety-critical operations. With semantic=true and MEMORY_MCP_EMBEDDINGS=1, merges lexical and embedding rankings (RRF) using the same eligibility filters.",
         "inputSchema": {
@@ -6692,6 +7096,7 @@ HANDLERS = {
     "query_measurement": query_measurement,
     "prepare_summary": prepare_summary,
     "query_anchored": query_anchored,
+    "context_map": context_map,
     "search_facts": search_facts,
     "search_semantic": search_semantic,
     "embed_backfill": embed_backfill,
@@ -6791,7 +7196,7 @@ def main():
                 "result": {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "memory-mcp", "version": "0.20.0"},
+                    "serverInfo": {"name": "memory-mcp", "version": "0.21.0"},
                 },
             }
         elif method == "tools/list":
