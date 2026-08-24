@@ -38,7 +38,9 @@ Tools:
   link_run {run_id, workspace?, issue_ref?, pr_ref?}
   query_run {run_id?, workspace?, state?, issue_ref?, limit?}
   prepare_summary {run_id, workspace?, max_decisions?}
-  query_anchored {path?, symbol?, repo?, workspace?, limit?, purpose?}
+  query_anchored {path?, symbol?, repo?, repo_root?, workspace?, limit?, purpose?}
+  auto_orient {turn_text, session_id?, workspace?}
+  search_guard {session_id, action, threshold?, workspace?}
   -- v0.3 graph/decisions/provenance --
   remember_entity {name, type?, aliases?}
   remember_relation {subject, predicate, object, source_fact_id?}
@@ -55,7 +57,7 @@ Tools:
   detect_conflicts {text}
 """
 import base64
-import fnmatch, hashlib, json, os, re, sqlite3, sys, tempfile, time
+import fnmatch, hashlib, json, os, re, signal, sqlite3, sys, tempfile, threading, time
 from datetime import datetime, timedelta, timezone
 
 def default_db_path():
@@ -131,6 +133,19 @@ _RUN_MAX_FILES = _env_int("MEMORY_MCP_RUN_MAX_FILES", 200, 1)
 _RUN_MAX_DIFF_BYTES = _env_int("MEMORY_MCP_RUN_MAX_DIFF_BYTES", 64 * 1024, 1)
 _RUN_MAX_SUMMARY_DECISIONS = 10
 _ACCESS_MAX_EVENTS = _env_int("MEMORY_MCP_ACCESS_MAX_EVENTS", 5000, 1)
+_ANCHOR_MAX_FILES = _env_int("MEMORY_MCP_ANCHOR_MAX_FILES", 2000, 1)
+_ANCHOR_MAX_BYTES = _env_int("MEMORY_MCP_ANCHOR_MAX_BYTES", 32 * 1024 * 1024, 1024)
+_SEARCH_GUARD_THRESHOLD = _env_int("MEMORY_MCP_SEARCH_GUARD_THRESHOLD", 3, 1)
+_RUNTIME_STATE_MAX_SESSIONS = _env_int("MEMORY_MCP_RUNTIME_STATE_MAX_SESSIONS", 1024, 1)
+_AUTO_ORIENT_TIMEOUT_SECONDS = 2.5
+_AUTO_ORIENT_MAX_HITS = 6
+_AUTO_ORIENT_MAX_CHARS = _env_int("MEMORY_MCP_AUTO_ORIENT_MAX_CHARS", 1400, 480)
+_AUTO_ORIENTED_SESSIONS = set()
+_SEARCH_GUARD_STATE = {}
+_ANCHOR_EXCLUDED_DIRS = {
+    ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache",
+    "node_modules", "data", "backups", "databases",
+}
 _LIFECYCLE_EXCLUDED_GLOBS = (
     ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx",
     "id_rsa*", "credentials*", "secrets*",
@@ -1742,6 +1757,194 @@ def _like_escape(value):
     return (value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
 
 
+def _anchor_root(value):
+    """Return a canonical, readable repository root without exposing it."""
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if len(value) > _LIFECYCLE_MAX_PATH_CHARS * 4:
+        return ""
+    root = os.path.realpath(os.path.abspath(value))
+    return root if os.path.isdir(root) else ""
+
+
+def _anchor_relative_path(root, path):
+    """Resolve a repository-relative anchor while refusing path traversal."""
+    path = (path or "").strip()
+    if not path or os.path.isabs(path):
+        return None, None
+    normalized = os.path.normpath(path.replace("/", os.sep))
+    if normalized in ("", ".", os.pardir) or normalized.startswith(os.pardir + os.sep):
+        return None, None
+    candidate = os.path.realpath(os.path.join(root, normalized))
+    try:
+        if os.path.commonpath((root, candidate)) != root:
+            return None, None
+    except ValueError:
+        return None, None
+    return candidate, normalized.replace(os.sep, "/")
+
+
+def _read_anchor_file(path):
+    try:
+        size = os.path.getsize(path)
+        if size > _ANCHOR_MAX_BYTES:
+            return None, "file exceeds verification budget"
+        with open(path, "rb") as handle:
+            data = handle.read(_ANCHOR_MAX_BYTES + 1)
+        if len(data) > _ANCHOR_MAX_BYTES:
+            return None, "file exceeds verification budget"
+        return data.decode("utf-8"), ""
+    except (OSError, UnicodeDecodeError):
+        return None, "file is not readable text"
+
+
+def _anchor_selection(text, fields):
+    """Extract the bounded line/column selection used to create an anchor."""
+    start_line = fields.get("start_line")
+    end_line = fields.get("end_line")
+    if start_line is None and end_line is None:
+        return None
+    if start_line is None or end_line is None:
+        return None
+    lines = text.splitlines(keepends=True)
+    if start_line < 1 or end_line < start_line or end_line > len(lines):
+        return None
+    start_col = fields.get("start_col") or 0
+    end_col = fields.get("end_col")
+    if start_line == end_line:
+        selected = lines[start_line - 1][start_col:end_col]
+    else:
+        first = lines[start_line - 1][start_col:]
+        last = lines[end_line - 1][:end_col] if end_col is not None else lines[end_line - 1]
+        selected = first + "".join(lines[start_line:end_line - 1]) + last
+    return selected.rstrip("\r\n")
+
+
+def _anchor_hash_matches(text, fields):
+    expected = (fields.get("selected_text_hash") or "").strip().lower()
+    if not expected:
+        return None
+    selected = _anchor_selection(text, fields)
+    if selected is None:
+        # A hash without a range is only verifiable when it describes the
+        # complete file. Never pretend that an arbitrary snippet was found.
+        actual = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return actual == expected
+    actual = hashlib.sha256(selected.encode("utf-8")).hexdigest()
+    return actual == expected
+
+
+def _anchor_symbol_matches(text, symbol):
+    symbol = (symbol or "").strip()
+    if not symbol:
+        return False
+    leaf = symbol.rsplit(".", 1)[-1].rsplit("::", 1)[-1]
+    return bool(leaf and re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" %
+                                   re.escape(leaf), text))
+
+
+def _iter_anchor_files(root):
+    for current, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in _ANCHOR_EXCLUDED_DIRS and
+                   not d.startswith(".")]
+        for name in names:
+            if name.startswith("."):
+                continue
+            yield os.path.join(current, name)
+
+
+def _find_rebuilt_anchor(root, fields, original_path):
+    """Find an unchanged anchor after a bounded path move."""
+    scanned = 0
+    total_bytes = 0
+    original_real = os.path.realpath(original_path) if original_path else ""
+    for candidate in _iter_anchor_files(root):
+        if os.path.realpath(candidate) == original_real:
+            continue
+        if scanned >= _ANCHOR_MAX_FILES:
+            return None, False
+        try:
+            size = os.path.getsize(candidate)
+        except OSError:
+            continue
+        if size > _ANCHOR_MAX_BYTES or total_bytes + size > _ANCHOR_MAX_BYTES:
+            return None, False
+        scanned += 1
+        total_bytes += size
+        text, _reason = _read_anchor_file(candidate)
+        if text is None:
+            continue
+        if _anchor_hash_matches(text, fields) is True:
+            try:
+                relative = os.path.relpath(candidate, root).replace(os.sep, "/")
+            except ValueError:
+                continue
+            return relative, True
+    return None, True
+
+
+def _verify_anchor(fields, repo_root, allow_rebuild=True):
+    """Return a read-only confidence verdict for one code-local anchor.
+
+    STRONG means the current file and recorded selection agree. WEAK means
+    only metadata or a path could be checked. STALE means the anchored content
+    changed, REBUILT means it moved without changing, and REMOVED means no
+    bounded replacement was found.
+    """
+    path = (fields.get("path") or "").strip()
+    if not path:
+        return {"verdict": "WEAK", "reason": "path_missing"}
+    if not repo_root:
+        stored = (fields.get("resolution_status") or "").strip().lower()
+        if stored == "stale":
+            return {"verdict": "STALE", "reason": "stored_stale_without_filesystem_check"}
+        return {"verdict": "WEAK", "reason": "filesystem_root_not_provided"}
+    candidate, relative = _anchor_relative_path(repo_root, path)
+    if candidate is None:
+        return {"verdict": "WEAK", "reason": "path_outside_repository"}
+    exists = os.path.isfile(candidate)
+    if exists:
+        text, read_reason = _read_anchor_file(candidate)
+        expected = (fields.get("selected_text_hash") or "").strip()
+        if expected:
+            matched = _anchor_hash_matches(text, fields) if text is not None else None
+            if matched is True:
+                return {"verdict": "STRONG", "reason": "content_hash_matches",
+                        "resolved_path": relative}
+            if matched is False and allow_rebuild:
+                rebuilt, complete = _find_rebuilt_anchor(repo_root, fields, candidate)
+                if rebuilt:
+                    return {"verdict": "REBUILT", "reason": "content_hash_matches_after_move",
+                            "resolved_path": rebuilt}
+                if not complete:
+                    return {"verdict": "STALE", "reason": "content_hash_mismatch_rebuild_budget_exceeded",
+                            "resolved_path": relative}
+                return {"verdict": "STALE", "reason": "content_hash_mismatch",
+                        "resolved_path": relative}
+            if matched is False:
+                return {"verdict": "STALE", "reason": "content_hash_mismatch",
+                        "resolved_path": relative}
+            return {"verdict": "WEAK", "reason": read_reason or "anchor_not_addressable",
+                    "resolved_path": relative}
+        if text is not None and _anchor_symbol_matches(text, fields.get("symbol")):
+            return {"verdict": "STRONG", "reason": "path_and_symbol_present",
+                    "resolved_path": relative}
+        return {"verdict": "WEAK", "reason": "path_exists_without_content_hash",
+                "resolved_path": relative}
+
+    if allow_rebuild and (fields.get("selected_text_hash") or ""):
+        rebuilt, complete = _find_rebuilt_anchor(repo_root, fields, candidate)
+        if rebuilt:
+            return {"verdict": "REBUILT", "reason": "content_hash_matches_after_move",
+                    "resolved_path": rebuilt}
+        if not complete:
+            return {"verdict": "WEAK", "reason": "rebuild_budget_exceeded"}
+    return {"verdict": "REMOVED", "reason": "path_not_found"}
+
+
 def run_begin(args):
     """Open a run record; idempotent per (workspace, run_id)."""
     run_id, err = _run_field(args, "run_id")
@@ -2015,7 +2218,9 @@ def prepare_summary(args):
 
 def query_anchored(args):
     """Facts (via evidence code anchors) and decisions (via their own
-    path/symbol anchors) bound to a code path and/or symbol."""
+    path/symbol anchors) bound to a code path and/or symbol. When
+    ``repo_root`` is supplied, returned anchors are checked against the live
+    filesystem without changing their stored provenance."""
     policy_error = _advisory_only_error(args, "query_anchored")
     if policy_error:
         return policy_error
@@ -2028,6 +2233,14 @@ def query_anchored(args):
     repo = (args.get("repo") or "").strip()
     if len(repo) > _EVIDENCE_MAX_FIELD_CHARS:
         return {"error": "repo is too long"}
+    repo_root_value = args.get("repo_root", "")
+    if repo_root_value is None:
+        repo_root_value = ""
+    if not isinstance(repo_root_value, str):
+        return {"error": "repo_root must be a string"}
+    if len(repo_root_value) > _LIFECYCLE_MAX_PATH_CHARS * 4:
+        return {"error": "repo_root is too long"}
+    repo_root = _anchor_root(repo_root_value)
     limit, err = _bounded_int_arg(args, "limit", 20, 1, 100)
     if err:
         return err
@@ -2039,6 +2252,22 @@ def query_anchored(args):
         if inactive:
             return inactive
         facts = []
+        verification_cache = {}
+
+        def verified_anchor(anchor):
+            key = tuple(anchor.get(name) for name in (
+                "repo", "ref", "path", "symbol", "start_line", "start_col",
+                "end_line", "end_col", "selected_text_hash", "resolution_status"))
+            if key not in verification_cache:
+                verification_cache[key] = _verify_anchor(anchor, repo_root)
+            verdict = verification_cache[key]
+            out = dict(anchor)
+            out["anchor_verdict"] = verdict["verdict"]
+            out["anchor_verification_reason"] = verdict["reason"]
+            if verdict.get("resolved_path"):
+                out["resolved_path"] = verdict["resolved_path"]
+            return out
+
         if path or symbol:
             sql = ("SELECT DISTINCT f.id, f.text, f.source, f.project, f.domain, f.trust, "
                    "f.strong, f.created_at, c.name AS category "
@@ -2065,10 +2294,11 @@ def query_anchored(args):
                 text = fact["text"]
                 fact["text_clipped"] = len(text) > 500
                 fact["text"] = text[:500] + ("…" if fact["text_clipped"] else "")
-                fact["evidence"] = [dict(x) for x in con.execute(
-                    "SELECT source_ref, repo, ref, path, symbol, start_line, end_line, "
-                    "resolution_status FROM evidence WHERE fact_id=? "
-                    "ORDER BY created_at DESC LIMIT 5", (fact["id"],))]
+                fact["evidence"] = [verified_anchor(dict(x)) for x in con.execute(
+                    "SELECT source_ref, repo, ref, path, symbol, start_line, start_col, "
+                    "end_line, end_col, selected_text_hash, resolution_status "
+                    "FROM evidence WHERE fact_id=? ORDER BY created_at DESC LIMIT 5",
+                    (fact["id"],))]
                 facts.append(fact)
         sql = ("SELECT id, category, subject, scenario, reasoning, outcome, confidence, "
                "decision_maker, issue_ref, path, symbol, created_at "
@@ -2085,10 +2315,19 @@ def query_anchored(args):
             params.append(ws)
         sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
         params.append(limit)
-        decisions = [dict(r) for r in con.execute(sql, params)]
+        decisions = []
+        for row in con.execute(sql, params):
+            decision = dict(row)
+            verdict = _verify_anchor(decision, repo_root)
+            decision["anchor_verdict"] = verdict["verdict"]
+            decision["anchor_verification_reason"] = verdict["reason"]
+            if verdict.get("resolved_path"):
+                decision["resolved_path"] = verdict["resolved_path"]
+            decisions.append(decision)
         result = {"count": len(facts) + len(decisions), "facts": facts,
                   "decisions": decisions, "memory_policy": "advisory_only",
-                  "safety_critical_allowed": False}
+                  "safety_critical_allowed": False,
+                  "anchor_verification": "filesystem" if repo_root else "metadata_only"}
         _record_access(ws, "query_anchored", path or symbol, result["count"],
                        time.monotonic() - t0)
         return result
@@ -2834,6 +3073,120 @@ def compose_recall(args):
         _record_access(_workspace(args), "compose_recall", args.get("turn_text", ""),
                        res.get("count", 0), time.monotonic() - t0)
     return res
+
+
+class _AutoOrientTimeout(Exception):
+    pass
+
+
+def _timed_call(callable_, timeout_seconds):
+    """Run the bounded orientation call without leaving a worker behind."""
+    if not hasattr(signal, "SIGALRM") or threading.current_thread() is not threading.main_thread():
+        try:
+            return callable_(), ""
+        except Exception:
+            return None, "unavailable"
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+
+    def alarm_handler(_signum, _frame):
+        raise _AutoOrientTimeout()
+
+    try:
+        signal.signal(signal.SIGALRM, alarm_handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+        return callable_(), ""
+    except _AutoOrientTimeout:
+        return None, "timeout"
+    except Exception:
+        return None, "unavailable"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
+
+
+def auto_orient(args):
+    """Compose one capped, advisory orientation block per runtime session."""
+    policy_error = _advisory_only_error(args, "auto_orient")
+    if policy_error:
+        return policy_error
+    turn_text = args.get("turn_text")
+    if not isinstance(turn_text, str) or not turn_text.strip():
+        return {"error": "turn_text is required"}
+    workspace = _workspace(args)
+    session_id = args.get("session_id", "") or ""
+    if not isinstance(session_id, str):
+        return {"error": "session_id must be a string"}
+    session_id = session_id.strip()
+    if len(session_id) > _LIFECYCLE_MAX_FIELD_CHARS:
+        return {"error": "session_id is too long"}
+    # Without a caller session id, scope the once-only guard to this server
+    # process. Runtimes should pass their stable session id for isolation.
+    key = (workspace, session_id or "__process__")
+    if key in _AUTO_ORIENTED_SESSIONS:
+        return {"oriented": False, "skipped": "already_oriented", "count": 0,
+                "block": "", "session_id": session_id,
+                "memory_policy": "advisory_only", "safety_critical_allowed": False}
+    if len(_AUTO_ORIENTED_SESSIONS) >= _RUNTIME_STATE_MAX_SESSIONS:
+        _AUTO_ORIENTED_SESSIONS.pop()
+    _AUTO_ORIENTED_SESSIONS.add(key)
+
+    recall_args = {"turn_text": turn_text, "limit": _AUTO_ORIENT_MAX_HITS,
+                   "chars": _AUTO_ORIENT_MAX_CHARS}
+    if workspace:
+        recall_args["workspace"] = workspace
+    result, failure = _timed_call(lambda: compose_recall(recall_args),
+                                  _AUTO_ORIENT_TIMEOUT_SECONDS)
+    if failure or not isinstance(result, dict) or "error" in result:
+        return {"oriented": True, "degraded": True, "reason": failure or "unavailable",
+                "count": 0, "block": "", "session_id": session_id,
+                "memory_policy": "advisory_only", "safety_critical_allowed": False}
+    return {"oriented": True, "degraded": False,
+            "count": min(int(result.get("count", 0) or 0), _AUTO_ORIENT_MAX_HITS),
+            "authoritative": result.get("authoritative", 0),
+            "background": result.get("background", 0),
+            "chars": result.get("chars", 0), "block": result.get("block", ""),
+            "query_mode": result.get("query_mode", ""), "session_id": session_id,
+            "memory_policy": "advisory_only", "safety_critical_allowed": False}
+
+
+def search_guard(args):
+    """Track external search actions and emit a non-blocking memory hint."""
+    session_id = args.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return {"error": "session_id is required"}
+    session_id = session_id.strip()
+    if len(session_id) > _LIFECYCLE_MAX_FIELD_CHARS:
+        return {"error": "session_id is too long"}
+    action = args.get("action")
+    if action not in ("search", "memory", "reset"):
+        return {"error": "action must be search, memory, or reset"}
+    threshold, err = _bounded_int_arg(args, "threshold", _SEARCH_GUARD_THRESHOLD, 1, 20)
+    if err:
+        return err
+    key = (_workspace(args), session_id)
+    if action == "reset":
+        _SEARCH_GUARD_STATE.pop(key, None)
+        count = 0
+    elif action == "memory":
+        _SEARCH_GUARD_STATE[key] = 0
+        count = 0
+    else:
+        count = _SEARCH_GUARD_STATE.get(key, 0) + 1
+        _SEARCH_GUARD_STATE[key] = count
+    if len(_SEARCH_GUARD_STATE) > _RUNTIME_STATE_MAX_SESSIONS:
+        _SEARCH_GUARD_STATE.pop(next(iter(_SEARCH_GUARD_STATE)))
+    warn = action == "search" and count >= threshold
+    result = {"session_id": session_id, "action": action,
+              "consecutive_searches": count, "threshold": threshold,
+              "warn": warn, "blocking": False,
+              "memory_policy": "advisory_only"}
+    if warn:
+        result["message"] = ("Memory has not been consulted after %d consecutive searches; "
+                              "consider a bounded memory lookup." % count)
+    return result
 
 
 def sweep_freshness(args):
@@ -4582,6 +4935,32 @@ def stats(_args=None):
                 _ws_check("memory_access_events", ws) +
                 " ORDER BY created_at DESC, id DESC LIMIT 1", ws_params).fetchone()
             access["last_at"] = last["created_at"] if last else ""
+            pull_clause = " AND channel='pull'"
+            pull_params = list(ws_params)
+            pull_events = con.execute(
+                "SELECT COUNT(*) FROM memory_access_events WHERE 1=1" +
+                _ws_check("memory_access_events", ws) + pull_clause, pull_params).fetchone()[0]
+            pull_hits = con.execute(
+                "SELECT COUNT(*) FROM memory_access_events WHERE result_count > 0" +
+                _ws_check("memory_access_events", ws) + pull_clause, pull_params).fetchone()[0]
+            access["pull_events"] = pull_events
+            access["pull_hits"] = pull_hits
+            access["pull_misses"] = pull_events - pull_hits
+            access["hit_rate"] = round(pull_hits / pull_events, 3) if pull_events else 0.0
+            access["by_site_hits"] = {r["site"]: r["n"] for r in con.execute(
+                "SELECT site, COUNT(*) n FROM memory_access_events "
+                "WHERE result_count > 0 AND channel='pull'" +
+                _ws_check("memory_access_events", ws) + " GROUP BY site ORDER BY n DESC",
+                pull_params)}
+            access["by_site_hit_rate"] = {}
+            for row in con.execute(
+                    "SELECT site, COUNT(*) n, "
+                    "SUM(CASE WHEN result_count > 0 THEN 1 ELSE 0 END) hits "
+                    "FROM memory_access_events WHERE channel='pull'" +
+                    _ws_check("memory_access_events", ws) + " GROUP BY site",
+                    pull_params):
+                access["by_site_hit_rate"][row["site"]] = round(
+                    row["hits"] / row["n"], 3) if row["n"] else 0.0
         except sqlite3.DatabaseError:
             pass  # telemetry table missing on very old stores — stats still works
         return {"total": total, "strong": strong, "by_trust": by_trust, "by_domain": by_domain,
@@ -5385,6 +5764,7 @@ TOOLS = {
                 "path": {"type": "string", "maxLength": 2048, "description": "File path fragment (case-insensitive substring match)"},
                 "symbol": {"type": "string", "maxLength": 2048, "description": "Exact symbol name (case-insensitive)"},
                 "repo": {"type": "string", "maxLength": 2048, "description": "Restrict to one repo (exact match)"},
+                "repo_root": {"type": "string", "maxLength": 4096, "description": "Optional local repository root for read-only anchor verification"},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
                 "limit": {"type": "integer", "default": 20},
                 "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed"},
@@ -5467,6 +5847,32 @@ TOOLS = {
                 "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed; memory never authorizes writes, locks, routes, or hashes"},
             },
             "required": ["turn_text"],
+        },
+    },
+    "auto_orient": {
+        "description": "Build one bounded advisory recall block for the first input of a runtime session. It caps recall at six hits, times out after 2.5 seconds, and degrades silently on failure.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "turn_text": {"type": "string"},
+                "session_id": {"type": "string", "maxLength": 256, "description": "Stable runtime session id; omitted means once per server process"},
+                "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+                "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed"},
+            },
+            "required": ["turn_text"],
+        },
+    },
+    "search_guard": {
+        "description": "Non-blocking runtime policy hint after repeated external search actions without a memory lookup. Use action=memory after consulting memory to reset the counter.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string", "maxLength": 256},
+                "action": {"type": "string", "enum": ["search", "memory", "reset"]},
+                "threshold": {"type": "integer", "minimum": 1, "maximum": 20, "default": 3},
+                "workspace": {"type": "string", "description": "Project scope id"},
+            },
+            "required": ["session_id", "action"],
         },
     },
     "sweep_freshness": {
@@ -5792,7 +6198,7 @@ TOOLS = {
         },
     },
     "stats": {
-        "description": "Store statistics (total, by trust, by domain).",
+        "description": "Store statistics (facts, provenance, runs, access counts, and pull hit-rate telemetry).",
         "inputSchema": {"type": "object", "properties": {
             "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
         }},
@@ -5930,6 +6336,8 @@ HANDLERS = {
     "embed_backfill": embed_backfill,
     "ingest_turn": ingest_turn,
     "compose_recall": compose_recall,
+    "auto_orient": auto_orient,
+    "search_guard": search_guard,
     "sweep_freshness": sweep_freshness,
     "verify_facts": verify_facts,
     "consolidate": consolidate,
@@ -6022,7 +6430,7 @@ def main():
                 "result": {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "memory-mcp", "version": "0.18.0"},
+                    "serverInfo": {"name": "memory-mcp", "version": "0.19.0"},
                 },
             }
         elif method == "tools/list":

@@ -10,8 +10,8 @@ This guide uses a **codex-style runtime container** as the example; the same
 pattern applies to any runtime that can spawn a process.
 
 The v0.16 ingestion, bounded fact retrieval, and code-local provenance paths,
-plus the v0.17 focused advisory retrieval boundary and the v0.18 runs,
-anchored queries, and access telemetry, run inside the existing local
+plus the v0.17 focused advisory retrieval boundary, the v0.18 runs/telemetry,
+and the v0.19 live anchor checks and runtime policy helpers, run inside the existing local
 SQLite-backed server. They do not require a UI, cloud service, separate code
 graph, or another external product. The detailed request flow is in
 `docs/ingestion-and-provenance.md`; the optional runtime adapters below
@@ -90,6 +90,25 @@ focused on its latest user turn before candidate retrieval. System reminders,
 tool/result markers, and older assistant turns must not expand the bounded
 candidate query. Do not use any memory result as authority for writes, routes,
 locks, or hashes.
+
+For a checkout-mounted CI or release gate, verify code-local anchors against
+the mounted repository without starting an MCP session:
+
+```sh
+python3 /opt/memory-mcp/verify.py --health \
+  --root /opt/memory-mcp --repo <repo-id> --json
+```
+
+The command returns exit `1` for `STALE`, `REBUILT`, or `REMOVED` anchors and
+exit `0` when no drift is found. `WEAK` path-only anchors are reported but do
+not fail the gate. The scan is bounded and stays under the supplied root.
+
+Runtime clients may call `auto_orient` once with their stable `session_id` at
+the first user input. It is capped at six hits and 2.5 seconds, and provider
+or recall failures degrade to an empty advisory block. If the client exposes
+external grep/search actions, call `search_guard` with `action: "search"` and
+call it with `action: "memory"` after a memory lookup; the warning is advisory
+and never blocks a tool call.
 
 For the v0.13 seams, use a disposable workspace and send an event with a
 stable idempotency key, then accept a short handoff as the same owner:

@@ -8,10 +8,12 @@ Run:  MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -v
 """
 
 import importlib
+import hashlib
 import json
 import os
 import sqlite3
 import sys
+import subprocess
 import tempfile
 import unittest
 
@@ -771,6 +773,198 @@ class RunsAnchorsAndAccessTest(unittest.TestCase):
         st2 = mcp.stats({"workspace": ws})
         self.assertEqual(st2["access"]["by_site"].get("query_anchored", 0),
                          st["access"]["by_site"].get("query_anchored", 0) + 1)
+
+
+class AnchorAndRuntimePolicyTest(unittest.TestCase):
+    """Query-time anchors, first-input orientation, and runtime guardrails."""
+
+    def setUp(self):
+        self.old_db = mcp.DB_PATH
+        self.old_selected = mcp._SELECTED_DB[0]
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="mcp-anchor-")
+        self.db = os.path.join(self.tmpdir.name, "facts.db")
+        self.repo = os.path.join(self.tmpdir.name, "repo")
+        os.makedirs(self.repo)
+        mcp.DB_PATH = self.db
+        mcp._SELECTED_DB[0] = None
+
+    def tearDown(self):
+        mcp.DB_PATH = self.old_db
+        mcp._SELECTED_DB[0] = self.old_selected
+        self.tmpdir.cleanup()
+
+    def _fact(self, text):
+        result = mcp.remember_fact({"text": text, "workspace": "anchor-policy"})
+        self.assertNotIn("error", result, result)
+        return result["id"]
+
+    @staticmethod
+    def _hash(text):
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _anchor(self, fact_id, path, selected=None, start_line=None,
+                start_col=None, end_line=None, end_col=None):
+        args = {"fact_id": fact_id, "source_ref": "anchor-test:%s" % path,
+                "repo": "repo-x", "ref": "test-ref", "path": path,
+                "workspace": "anchor-policy"}
+        if selected is not None:
+            args.update({"selected_text": selected,
+                         "start_line": start_line, "start_col": start_col,
+                         "end_line": end_line, "end_col": end_col})
+        result = mcp.attach_evidence(args)
+        self.assertNotIn("error", result, result)
+
+    def test_query_time_verdicts_cover_live_move_and_drift(self):
+        live = "def retry():\n    return True\n"
+        live_path = os.path.join(self.repo, "live.py")
+        with open(live_path, "w", encoding="utf-8") as handle:
+            handle.write(live)
+        live_id = self._fact("live anchor fact")
+        self._anchor(live_id, "live.py", "return True", 2, 4, 2, 15)
+        result = mcp.query_anchored({"path": "live.py", "workspace": "anchor-policy",
+                                     "repo_root": self.repo})
+        evidence = result["facts"][0]["evidence"][0]
+        self.assertEqual(evidence["anchor_verdict"], "STRONG")
+
+        with open(live_path, "w", encoding="utf-8") as handle:
+            handle.write("def retry():\n    return False\n")
+        stale = mcp.query_anchored({"path": "live.py", "workspace": "anchor-policy",
+                                    "repo_root": self.repo})
+        self.assertEqual(stale["facts"][0]["evidence"][0]["anchor_verdict"], "STALE")
+
+        moved_id = self._fact("moved anchor fact")
+        moved_text = "def moved():\n    return 7\n"
+        old_path = os.path.join(self.repo, "old.py")
+        with open(old_path, "w", encoding="utf-8") as handle:
+            handle.write(moved_text)
+        self._anchor(moved_id, "old.py", "return 7", 2, 4, 2, 12)
+        os.unlink(old_path)
+        with open(os.path.join(self.repo, "new.py"), "w", encoding="utf-8") as handle:
+            handle.write(moved_text)
+        rebuilt = mcp.query_anchored({"path": "old.py", "workspace": "anchor-policy",
+                                      "repo_root": self.repo})
+        moved = [f for f in rebuilt["facts"] if f["id"] == moved_id][0]
+        self.assertEqual(moved["evidence"][0]["anchor_verdict"], "REBUILT")
+        self.assertEqual(moved["evidence"][0]["resolved_path"], "new.py")
+
+        removed_id = self._fact("removed anchor fact")
+        self._anchor(removed_id, "removed.py", "return 9", 1, 0, 1, 8)
+        removed = mcp.query_anchored({"path": "removed.py", "workspace": "anchor-policy",
+                                      "repo_root": self.repo})
+        self.assertEqual(removed["facts"][0]["evidence"][0]["anchor_verdict"], "REMOVED")
+
+    def test_metadata_only_anchor_is_weak_and_health_cli_fails_on_drift(self):
+        fact_id = self._fact("weak anchor fact")
+        self._anchor(fact_id, "weak.py")
+        weak = mcp.query_anchored({"path": "weak.py", "workspace": "anchor-policy"})
+        self.assertEqual(weak["facts"][0]["evidence"][0]["anchor_verdict"], "WEAK")
+
+        with open(os.path.join(self.repo, "weak.py"), "w", encoding="utf-8") as handle:
+            handle.write("def weak():\n    return 1\n")
+        from verify import anchor_health
+        health = anchor_health({"repo_root": self.repo, "repo": "repo-x",
+                                "workspace": "anchor-policy"})
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["counts"]["WEAK"], 1)
+
+        drift_id = self._fact("drift anchor fact")
+        drift_text = "return 2"
+        with open(os.path.join(self.repo, "drift.py"), "w", encoding="utf-8") as handle:
+            handle.write("def drift():\n    %s\n" % drift_text)
+        self._anchor(drift_id, "drift.py", drift_text, 2, 4, 2, 12)
+        with open(os.path.join(self.repo, "drift.py"), "w", encoding="utf-8") as handle:
+            handle.write("def drift():\n    return 3\n")
+        health = anchor_health({"repo_root": self.repo, "repo": "repo-x",
+                                "workspace": "anchor-policy"})
+        self.assertFalse(health["ok"])
+        self.assertEqual(health["counts"]["STALE"], 1)
+
+        env = os.environ.copy()
+        env["MEMORY_MCP_DB"] = self.db
+        cli = subprocess.run(
+            [sys.executable, "verify.py", "--root", self.repo, "--repo", "repo-x",
+             "--workspace", "anchor-policy", "--json"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(cli.returncode, 1, cli.stdout + cli.stderr)
+        self.assertIn('"ok": false', cli.stdout)
+
+    def test_anchor_verifier_rejects_traversal_and_symlink_escape(self):
+        outside = os.path.join(self.tmpdir.name, "outside.py")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("return outside\n")
+        traversal_id = self._fact("traversal anchor fact")
+        self._anchor(traversal_id, "../outside.py", "return outside", 1, 0, 1, 14)
+        traversal = mcp.query_anchored({"path": "../outside.py",
+                                        "workspace": "anchor-policy",
+                                        "repo_root": self.repo})
+        self.assertEqual(traversal["facts"][0]["evidence"][0]["anchor_verdict"], "WEAK")
+
+        link = os.path.join(self.repo, "outside-link.py")
+        try:
+            os.symlink(outside, link)
+        except (AttributeError, NotImplementedError, OSError):
+            self.skipTest("symbolic links are unavailable")
+        link_id = self._fact("symlink anchor fact")
+        self._anchor(link_id, "outside-link.py", "return outside", 1, 0, 1, 14)
+        escaped = mcp.query_anchored({"path": "outside-link.py",
+                                      "workspace": "anchor-policy",
+                                      "repo_root": self.repo})
+        self.assertEqual(escaped["facts"][0]["evidence"][0]["anchor_verdict"], "WEAK")
+
+    def test_auto_orient_is_first_input_bounded_and_quiet_when_disabled(self):
+        old_recall = os.environ.get("MEMORY_MCP_RECALL")
+        try:
+            os.environ["MEMORY_MCP_RECALL"] = "1"
+            mcp.remember_fact({"text": "orientation remembers the worker queue",
+                               "workspace": "orient-policy"})
+            first = mcp.auto_orient({"turn_text": "worker queue",
+                                     "session_id": "orient-session",
+                                     "workspace": "orient-policy"})
+            self.assertTrue(first["oriented"])
+            self.assertFalse(first["degraded"])
+            self.assertLessEqual(first["count"], 6)
+            second = mcp.auto_orient({"turn_text": "worker queue again",
+                                      "session_id": "orient-session",
+                                      "workspace": "orient-policy"})
+            self.assertEqual(second["skipped"], "already_oriented")
+
+            os.environ.pop("MEMORY_MCP_RECALL", None)
+            degraded = mcp.auto_orient({"turn_text": "disabled orientation",
+                                        "session_id": "orient-disabled"})
+            self.assertTrue(degraded["degraded"])
+            self.assertEqual(degraded["block"], "")
+            self.assertNotIn("error", degraded)
+        finally:
+            if old_recall is None:
+                os.environ.pop("MEMORY_MCP_RECALL", None)
+            else:
+                os.environ["MEMORY_MCP_RECALL"] = old_recall
+
+    def test_search_guard_warns_without_blocking_and_resets_on_memory(self):
+        sid = "grep-loop-session"
+        first = mcp.search_guard({"session_id": sid, "action": "search"})
+        second = mcp.search_guard({"session_id": sid, "action": "search"})
+        third = mcp.search_guard({"session_id": sid, "action": "search"})
+        self.assertFalse(first["warn"])
+        self.assertFalse(second["warn"])
+        self.assertTrue(third["warn"])
+        self.assertFalse(third["blocking"])
+        reset = mcp.search_guard({"session_id": sid, "action": "memory"})
+        self.assertEqual(reset["consecutive_searches"], 0)
+        self.assertFalse(mcp.search_guard({"session_id": sid, "action": "search"})["warn"])
+
+    def test_stats_reports_pull_hit_rate(self):
+        workspace = "hit-rate-policy"
+        mcp.remember_fact({"text": "hit rate telemetry fact", "workspace": workspace})
+        before = mcp.stats({"workspace": workspace})["access"]
+        mcp.search_facts({"query": "hit rate telemetry", "workspace": workspace})
+        mcp.search_facts({"query": "missing telemetry needle", "workspace": workspace})
+        access = mcp.stats({"workspace": workspace})["access"]
+        self.assertEqual(access["pull_events"], before.get("pull_events", 0) + 2)
+        self.assertEqual(access["pull_hits"], before.get("pull_hits", 0) + 1)
+        self.assertEqual(access["pull_misses"], before.get("pull_misses", 0) + 1)
+        self.assertEqual(access["hit_rate"], 0.5)
 
 
 if __name__ == "__main__":

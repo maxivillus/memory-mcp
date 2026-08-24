@@ -32,7 +32,7 @@ pipeline into the server for runtimes that have no client patches.
   description clipped at 120 chars, total capped at `max_chars` (default 4000,
   cut at line boundary) — mirrors the reasonix index-cap for prompt budgets
 - `forget_fact {id | sha256}` — soft delete (archived=1)
-- `stats {}` — totals by trust/domain plus v0.3 counts (entities/relations/decisions/evidence), v0.18 run counts, and the memory-access log (kept events, per-site counts, last access)
+- `stats {}` — totals by trust/domain plus v0.3 counts (entities/relations/decisions/evidence), v0.18 run counts, and the memory-access log (kept events, per-site counts, last access, pull hit-rate)
 - `export {}` — all facts incl. archived (migration/backup)
 - `put_context {name, content, workspace, schema?, source?, checksum?, ttl_seconds?, parent_refs?}` — store an immutable named context artifact and return its `ctx_...` ref
 - `list_context {workspace, name?, limit?}` — catalog metadata only; payloads are never returned
@@ -50,7 +50,9 @@ pipeline into the server for runtimes that have no client patches.
 - `link_run {run_id, workspace?, issue_ref?, pr_ref?}` — bind a run to issue/PR references (at least one required)
 - `query_run {run_id?, workspace?, state?, issue_ref?, limit?}` — one run record or a filtered list; diffs are clipped to bounded slices
 - `prepare_summary {run_id, workspace?, max_decisions?}` — assemble a ready-to-post markdown summary from a run's own records (decisions in its window or bound to its issue_ref, event catalog); posts nothing
-- `query_anchored {path?, symbol?, repo?, workspace?, limit?, purpose?}` — advisory lookup of facts (via evidence code anchors) and decisions (via their own path/symbol anchors) bound to a code location
+- `query_anchored {path?, symbol?, repo?, repo_root?, workspace?, limit?, purpose?}` — advisory lookup of facts (via evidence code anchors) and decisions (via their own path/symbol anchors) bound to a code location; an explicit local `repo_root` adds read-only filesystem verdicts
+- `auto_orient {turn_text, session_id?, workspace?}` — one first-input, six-hit, 2.5-second capped recall orientation with silent degradation
+- `search_guard {session_id, action, threshold?, workspace?}` — non-blocking warning after repeated external searches without a memory action
 
 Retrieval is advisory only. `compose_recall`, `search_facts`, semantic search,
 `find_precedents`, and `query_anchored` reject `purpose: "safety_critical"`
@@ -373,6 +375,33 @@ The operational contract is documented in
 [`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md), and
 deployment smoke checks are documented in `DEPLOYMENT.md`.
 
+### v0.19 — live anchor verification, session orientation, and search guard (2026-08-24)
+
+The v0.19 additions remain local, advisory, and dependency-free:
+
+- **Query-time anchor verdicts**: `query_anchored` accepts an optional
+  `repo_root`. With a repository-relative path and a stored selection hash it
+  returns `STRONG` when the live selection matches, `STALE` when it changed,
+  `REBUILT` when the same content is found after a bounded move, and `REMOVED`
+  when no replacement is found. Path-only or metadata-only checks are
+  `WEAK`. Stored `resolution_status` is preserved; verification is read-only.
+- **CI drift gate**: `python3 verify.py --health --root . --repo <repo-id>`
+  checks active fact and decision anchors. It exits `1` for `STALE`,
+  `REBUILT`, or `REMOVED`, emits bounded JSON with `--json`, and never stores
+  source snippets or reads outside the supplied root.
+- **First-input orientation**: `auto_orient` invokes `compose_recall` once
+  per `session_id`, with at most six hits and a 2.5-second deadline. Timeout,
+  disabled recall, and provider failures return an empty advisory block rather
+  than blocking the runtime.
+- **Search-loop hint**: `search_guard` tracks explicit external `search`
+  actions until a `memory` action resets the counter. The default threshold is
+  three and the response is always non-blocking.
+- **Hit-rate telemetry**: `stats.access` reports pull events, hits, misses,
+  overall `hit_rate`, and per-site hit rates. Telemetry remains bounded and
+  best-effort.
+
+The public MCP server reports `serverInfo.version = 0.19.0`.
+
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
 Covers decision rationale, precedent search and evidence lineage with zero
@@ -450,6 +479,10 @@ v0.18 additions (additive — existing stores migrate in place):
 - `memory_access_events(workspace_id, channel, site, query_hash, result_count,
   latency_ms, created_at)` — bounded per-workspace retrieval log
 
+v0.19 additions are schema-free: query-time anchor verdicts, first-input
+orientation, search-guard counters, and hit-rate fields use the existing
+evidence and access-log rows plus bounded in-process runtime state.
+
 ## Environment
 
 - `MEMORY_MCP_DB` — SQLite path. Default is **script-relative**: `<repo>/data/facts.db`
@@ -482,6 +515,13 @@ v0.18 additions (additive — existing stores migrate in place):
   field caps and the client-supplied diff cap (defaults 256 / 200 / 65536).
 - `MEMORY_MCP_ACCESS_MAX_EVENTS` — newest memory-access telemetry rows kept
   per workspace (default 5000).
+- `MEMORY_MCP_ANCHOR_MAX_FILES` / `_MAX_BYTES` — bounds for moved-anchor
+  verification scans (defaults 2000 files / 32 MiB).
+- `MEMORY_MCP_AUTO_ORIENT_MAX_CHARS` — maximum orientation block budget
+  (default 1400; timeout is fixed at 2.5 seconds and hits at 6).
+- `MEMORY_MCP_SEARCH_GUARD_THRESHOLD` — default warning threshold (3).
+- `MEMORY_MCP_RUNTIME_STATE_MAX_SESSIONS` — in-process orientation/guard
+  session-state cap (default 1024).
 - `MEMORY_MCP_LLM_KEY` / `MEMORY_MCP_EMBED_KEY` — bearer tokens for
   OpenAI-compatible providers. Credential-bearing plaintext HTTP is rejected
   unless `MEMORY_MCP_ALLOW_INSECURE_HTTP=1` is explicitly set.
