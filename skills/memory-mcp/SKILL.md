@@ -4,11 +4,12 @@ description: >-
   Use for durable cross-session agent memory: store and retrieve facts, record
   decisions with rationale for precedent lookup, link evidence to facts,
   safely absorb candidate facts, read bounded chunks, anchor facts to local
-  code, search the entity graph, and detect conflicting outcomes — via the
+  code, verify live anchor drift, orient new sessions, and detect conflicting
+  outcomes — via the
   memory-mcp MCP tools (shared SQLite+FTS5 store).
 metadata:
   author: reasonix
-  version: "1.3"
+  version: "1.4"
 ---
 
 # Shared Agent Memory (memory-mcp)
@@ -40,6 +41,13 @@ session is visible to every later session.
 - `facts_for_session {session_ref}` / `list_sessions` — session-scoped views;
   `compose_recall {session_expand}` adds same-session context.
 - `compose_recall {graph=true}` — entity-graph as a third recall source.
+- `auto_orient {turn_text, session_id?, workspace?}` — invoke a capped,
+  advisory `compose_recall` only for the first input of a session. It uses at
+  most six hits, has a 2.5-second deadline, and degrades silently to an empty
+  block when recall is unavailable.
+- `search_guard {session_id, action, threshold?, workspace?}` — track external
+  search actions and return a non-blocking warning after the threshold (three
+  by default); `action: "memory"` resets the counter.
 
 - `remember_fact {text, source?, project?, domain?, category?, trust?, strong?}` —
   store a durable fact (upsert, dedup by sha256 within a workspace). Use `strong=true` for
@@ -235,12 +243,14 @@ source must be auditable.
 - The anchor fields are additive and migration-safe. Keep `source_ref`
   stable, and treat stale/unresolved anchors as evidence requiring refresh,
   not as proof that the current code still matches.
-- `query_anchored {path?, symbol?, repo?, workspace?, limit?, purpose?}` finds
+- `query_anchored {path?, symbol?, repo?, repo_root?, workspace?, limit?, purpose?}` finds
   facts whose evidence carries a matching path fragment or exact symbol, plus
   decisions with matching `path`/`symbol` anchors — one query for "everything
   bound to this file". It is advisory retrieval (`safety_critical` is
   rejected), fact texts come back clipped, and zero-result queries are still
-  logged by the access telemetry.
+  logged by the access telemetry. When `repo_root` is supplied, each returned
+  anchor also carries a read-only `STRONG`, `WEAK`, `STALE`, `REBUILT`, or
+  `REMOVED` verdict; stored `resolution_status` is never overwritten.
 
 ## Memory access telemetry (v0.18)
 
@@ -250,10 +260,19 @@ source must be auditable.
   (`memory_access_events`: channel, site, query hash, result count, latency).
   Payloads are never stored; retention is capped at
   `MEMORY_MCP_ACCESS_MAX_EVENTS` (default 5000) per workspace.
-- `stats` now reports the access log: total kept events, per-site counts, and
-  the last recorded access. Use it to tell whether memory is actually read —
-  inventory alone does not answer that.
+- `stats` now reports the access log: total kept events, per-site counts, the
+  last recorded access, pull hits/misses, and overall/per-site `hit_rate`.
+  Use it to tell whether memory is actually read — inventory alone does not
+  answer that.
 - Telemetry is best-effort: a recording failure never breaks retrieval.
+
+## Anchor health gate
+
+- `python3 verify.py --health --root . --repo <repo-id> --json` checks active
+  fact and decision anchors against a checkout and exits `1` for
+  `STALE`/`REBUILT`/`REMOVED` drift. The scan is bounded by
+  `MEMORY_MCP_ANCHOR_MAX_FILES` and `MEMORY_MCP_ANCHOR_MAX_BYTES`, remains
+  inside the supplied root, and never stores source snippets.
 
 ## Conflicts — detect_conflicts
 

@@ -1,6 +1,6 @@
 # Ingestion, bounded retrieval, and code-local provenance
 
-This document is the operational contract for the v0.16 and v0.17 additions to the
+This document is the operational contract for the v0.16, v0.17, and v0.19 additions to the
 local `memory-mcp` server. The canonical behavior is implemented in
 `memory_mcp.py` and covered by `tests/test_memory_mcp.py`; this document keeps
 the client-facing flow concise.
@@ -13,7 +13,11 @@ and SQLite store:
 - `absorb` plans and optionally commits candidate facts;
 - `chunk_fact` and chunked `search_facts` deliver bounded fact slices; and
 - `attach_evidence` / `get_provenance` can retain structured code-local
-  anchors without storing the selected source snippet.
+  anchors without storing the selected source snippet;
+- `query_anchored` can verify those anchors against an explicitly supplied
+  local repository root; and
+- `auto_orient`, `search_guard`, and `stats` provide bounded runtime policy
+  and retrieval-quality signals.
 
 No UI, cloud synchronization service, separate code graph, or other external
 product is required or introduced by these operations. Existing optional
@@ -191,6 +195,40 @@ signal to refresh evidence, not proof that the current source still matches.
 The schema migration is additive. Existing evidence remains readable, and
 existing stores do not need a destructive migration or a new dependency.
 
+At query time, pass `repo_root` to `query_anchored` when the caller has the
+corresponding checkout. The stored status is never overwritten. The response
+adds one of these read-only verdicts to each returned anchor:
+
+- `STRONG` — the recorded selection hash or symbol is present in the live file;
+- `WEAK` — only metadata/path existence could be checked, or no root was given;
+- `STALE` — the addressed content no longer matches;
+- `REBUILT` — the content hash was found at another repository-relative path;
+- `REMOVED` — the path and bounded replacement scan no longer find the anchor.
+
+Moved-file scans are bounded by `MEMORY_MCP_ANCHOR_MAX_FILES` and
+`MEMORY_MCP_ANCHOR_MAX_BYTES`, skip generated/database directories, and never
+read outside `repo_root`. A client should treat `REBUILT` as a refresh finding,
+not as permission to silently rewrite provenance.
+
+For CI, run the same checker without an MCP session:
+
+```sh
+python3 verify.py --health --root . --repo <repo-id> --json
+```
+
+The command exits `1` for `STALE`, `REBUILT`, or `REMOVED`, `0` when there is
+no drift, and `2` for invalid command input. Weak/path-only anchors are
+reported for review but do not fail the drift gate.
+
+`auto_orient` is an optional first-input helper. The caller supplies a stable
+`session_id`; only the first call for that session invokes `compose_recall`,
+with a six-hit cap and a 2.5-second deadline. A timeout or disabled provider
+returns an empty advisory block with `degraded: true` and does not block the
+runtime. `search_guard` accepts `action: "search"`, `"memory"`, or `"reset"`;
+after three searches by default it returns `warn: true`, while
+`blocking` remains false. `stats.access` exposes pull hit/miss counts and
+overall/per-site `hit_rate` values from the existing bounded telemetry rows.
+
 ## Verification and recovery
 
 Run the project tests with an explicit migration source so the suite does not
@@ -200,6 +238,7 @@ depend on a host-specific `~/.reasonix/projects` directory:
 MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -q
 python3 -m unittest -v test_memory_mcp.py
 python3 -m py_compile memory_mcp.py extract.py verify.py recall.py embeddings.py
+python3 verify.py --health --root . --repo <repo-id> --json
 ```
 
 The local core does not need a network, model, UI, or separate product for

@@ -13,8 +13,10 @@ Env:
   MEMORY_MCP_VERIFY_MIN_CONFIDENCE       threshold to auto-apply (default 0.8)
 """
 
+import argparse
 import json
 import os
+import sys
 
 import llm
 
@@ -248,3 +250,108 @@ def check_new_facts(new_facts):
                 ev["workspace"] = nf["workspace"]
             attach_evidence(ev)
     return summary
+
+
+def anchor_health(args):
+    """Read-only anchor drift check used by CI and local health checks."""
+    from memory_mcp import (_anchor_root, _verify_anchor, _ws_check,
+                            _ws_inactive_error, _workspace, get_db)
+
+    root_value = args.get("repo_root", args.get("root", ""))
+    if not isinstance(root_value, str) or not root_value.strip():
+        return {"error": "repo_root is required"}
+    root = _anchor_root(root_value)
+    if not root:
+        return {"error": "repo_root is not an accessible directory"}
+    workspace = _workspace(args)
+    repo = args.get("repo", "") or ""
+    if not isinstance(repo, str):
+        return {"error": "repo must be a string"}
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        facts_sql = (
+            "SELECT e.id, e.fact_id, e.repo, e.ref, e.path, e.symbol, "
+            "e.start_line, e.start_col, e.end_line, e.end_col, "
+            "e.selected_text_hash, e.resolution_status "
+            "FROM evidence e JOIN facts f ON f.id=e.fact_id "
+            "WHERE f.archived=0 AND f.invalid_at='' AND f.lifecycle='active' "
+            "AND e.path != ''"
+        )
+        facts_params = []
+        facts_sql += _ws_check("f", workspace)
+        if workspace:
+            facts_params.append(workspace)
+        if repo:
+            facts_sql += " AND e.repo=?"
+            facts_params.append(repo)
+        rows = list(con.execute(facts_sql, facts_params))
+
+        decisions_sql = "SELECT id, path, symbol FROM decisions WHERE path != ''"
+        decisions_params = []
+        decisions_sql += _ws_check("decisions", workspace)
+        if workspace:
+            decisions_params.append(workspace)
+        decision_rows = list(con.execute(decisions_sql, decisions_params))
+
+        counts = {name: 0 for name in ("STRONG", "WEAK", "STALE", "REBUILT", "REMOVED")}
+        drift = []
+        weak = []
+
+        def record(kind, row):
+            fields = dict(row)
+            verdict = _verify_anchor(fields, root)
+            name = verdict["verdict"]
+            counts[name] = counts.get(name, 0) + 1
+            item = {"kind": kind, "id": row["id"], "path": row["path"],
+                    "verdict": name, "reason": verdict["reason"]}
+            if verdict.get("resolved_path"):
+                item["resolved_path"] = verdict["resolved_path"]
+            if name in ("STALE", "REBUILT", "REMOVED"):
+                drift.append(item)
+            elif name == "WEAK":
+                weak.append(item)
+
+        for row in rows:
+            record("fact_anchor", row)
+        for row in decision_rows:
+            record("decision_anchor", row)
+        return {"ok": not drift, "checked": sum(counts.values()),
+                "counts": counts, "drift": drift[:100], "weak": weak[:100],
+                "drift_truncated": len(drift) > 100,
+                "weak_truncated": len(weak) > 100,
+                "workspace": workspace, "repo": repo}
+    finally:
+        con.close()
+
+
+def _health_main(argv=None):
+    parser = argparse.ArgumentParser(description="Check memory-mcp code anchors for filesystem drift")
+    parser.add_argument("--health", action="store_true", help="run the read-only anchor health check (default)")
+    parser.add_argument("--root", dest="repo_root", default=".",
+                        help="local repository root used for verification")
+    parser.add_argument("--repo", default="", help="optional exact repository id/URL filter")
+    parser.add_argument("--workspace", default="", help="optional workspace scope")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="emit machine-readable JSON")
+    opts = parser.parse_args(argv)
+    result = anchor_health({"repo_root": opts.repo_root, "repo": opts.repo,
+                            "workspace": opts.workspace})
+    if opts.as_json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    elif "error" in result:
+        print("anchor health: ERROR: %s" % result["error"], file=sys.stderr)
+    else:
+        status = "PASS" if result["ok"] else "FAIL"
+        print("anchor health: %s (checked=%d, strong=%d, weak=%d, drift=%d)" %
+              (status, result["checked"], result["counts"]["STRONG"],
+               result["counts"]["WEAK"], len(result["drift"])))
+    if "error" in result:
+        return 2
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_health_main())
