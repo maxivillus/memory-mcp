@@ -4,12 +4,12 @@ description: >-
   Use for durable cross-session agent memory: store and retrieve facts, record
   decisions with rationale for precedent lookup, link evidence to facts,
   safely absorb candidate facts, read bounded chunks, anchor facts to local
-  code, verify live anchor drift, orient new sessions, and detect conflicting
-  outcomes — via the
+  code, verify live anchor drift, orient new sessions, detect conflicting
+  outcomes, and collect aggregate paired measurements — via the
   memory-mcp MCP tools (shared SQLite+FTS5 store).
 metadata:
   author: reasonix
-  version: "1.4"
+  version: "1.5"
 ---
 
 # Shared Agent Memory (memory-mcp)
@@ -205,6 +205,31 @@ source must be auditable.
   compacted window is re-filled from the store instead of only the
   summarizer's own output.
 
+## Aggregate paired measurement (v0.20)
+
+- Use `record_measurement` to record one observation for a comparable sample
+  in `variant: "baseline"` (memory disabled) or `variant: "memory"
+  (trigger-enabled memory). Always pass the exact project `workspace`, a
+  shared opaque `measurement_id` and `sample_key`, and at least one existing
+  `run_id` or `issue_ref`.
+- Record only aggregate counters, durations, bounded rates, normalized
+  `quality_score` (`0..1`), and `safety_regression` (`0` or `1`):
+  `input_tokens`, `output_tokens`, `memory_calls`, `external_tool_calls`,
+  `context_bytes`, `comment_bytes`, `wall_time_ms`,
+  `time_to_first_useful_ms`, `memory_latency_ms`, `duplicate_rate`,
+  `conflict_rate`, `reference_resolution_rate`, `fallback_rate`, and
+  `qa_rework`. Prompts, retrieved facts, comments, diffs, secrets, and
+  arbitrary JSON are rejected and never stored.
+- Retries are idempotent by `(workspace, measurement_id, sample_key,
+  variant)`; a retry with different values is rejected. `query_measurement`
+  matches only complete baseline/memory pairs and reports counts, median, and
+  p95. It remains `status: "not_claimed"` until `min_pairs` (default 10) is
+  complete; `ready_for_review` is not a savings, adoption, quality, or safety
+  claim.
+- Keep the threshold and cohort definition outside the memory store as the
+  authoritative experiment decision. Memory evidence remains advisory and
+  cannot authorize gates, routing, acceptance, registry writes, or `done`.
+
 ## Decisions — record_decision / query_decisions / find_precedents / get_causal_chain
 
 - `record_decision {category?, subject?, scenario, reasoning?, outcome?,
@@ -291,6 +316,7 @@ source must be auditable.
   absorb, chunk_fact, consolidate, export_facts, export_rdf, stats,
   list_sessions, list_forgotten, query_anchored,
   run_begin, run_end, link_run, query_run, prepare_summary,
+  record_measurement, query_measurement,
   restore_fact, remember_entity, remember_relation, search_graph). Resolve it
   from your task context (the project id of the card/issue you work on).
 - Context operations (`put_context`, `list_context`, `resolve_context`,

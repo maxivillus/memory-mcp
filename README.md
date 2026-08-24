@@ -32,7 +32,7 @@ pipeline into the server for runtimes that have no client patches.
   description clipped at 120 chars, total capped at `max_chars` (default 4000,
   cut at line boundary) — mirrors the reasonix index-cap for prompt budgets
 - `forget_fact {id | sha256}` — soft delete (archived=1)
-- `stats {}` — totals by trust/domain plus v0.3 counts (entities/relations/decisions/evidence), v0.18 run counts, and the memory-access log (kept events, per-site counts, last access, pull hit-rate)
+- `stats {}` — totals by trust/domain plus v0.3 counts (entities/relations/decisions/evidence), v0.18 run counts, v0.20 measurement counts, and the memory-access log (kept events, per-site counts, last access, pull hit-rate)
 - `export {}` — all facts incl. archived (migration/backup)
 - `put_context {name, content, workspace, schema?, source?, checksum?, ttl_seconds?, parent_refs?}` — store an immutable named context artifact and return its `ctx_...` ref
 - `list_context {workspace, name?, limit?}` — catalog metadata only; payloads are never returned
@@ -49,6 +49,8 @@ pipeline into the server for runtimes that have no client patches.
 - `run_begin {run_id, workspace?, issue_ref?, pr_ref?, session_id?, cwd?, source?}` / `run_end {run_id, workspace?, base_sha?, head_sha?, files_changed?, diff?, issue_ref?, pr_ref?}` — open/close a run record with bounded client-supplied git facts (the server never shells out to git)
 - `link_run {run_id, workspace?, issue_ref?, pr_ref?}` — bind a run to issue/PR references (at least one required)
 - `query_run {run_id?, workspace?, state?, issue_ref?, limit?}` — one run record or a filtered list; diffs are clipped to bounded slices
+- `record_measurement {measurement_id, sample_key, variant, workspace, run_id?|issue_ref?, input_tokens?, output_tokens?, memory_calls?, external_tool_calls?, context_bytes?, comment_bytes?, wall_time_ms?, time_to_first_useful_ms?, memory_latency_ms?, duplicate_rate?, conflict_rate?, reference_resolution_rate?, fallback_rate?, qa_rework?, quality_score?, safety_regression?}` — record one bounded aggregate observation for a `baseline` or `memory` sample; prompts, payloads, comments, diffs, and unknown fields are rejected
+- `query_measurement {measurement_id, workspace, min_pairs?}` — report complete-pair counts plus per-variant median/p95 numeric metrics; stays `not_claimed` until the configured paired slice is complete
 - `prepare_summary {run_id, workspace?, max_decisions?}` — assemble a ready-to-post markdown summary from a run's own records (decisions in its window or bound to its issue_ref, event catalog); posts nothing
 - `query_anchored {path?, symbol?, repo?, repo_root?, workspace?, limit?, purpose?}` — advisory lookup of facts (via evidence code anchors) and decisions (via their own path/symbol anchors) bound to a code location; an explicit local `repo_root` adds read-only filesystem verdicts
 - `auto_orient {turn_text, session_id?, workspace?}` — one first-input, six-hit, 2.5-second capped recall orientation with silent degradation
@@ -402,6 +404,32 @@ The v0.19 additions remain local, advisory, and dependency-free:
 
 The public MCP server reports `serverInfo.version = 0.19.0`.
 
+### v0.20 — aggregate paired measurement (2026-08-24)
+
+The v0.20 measurement layer makes the report's baseline-versus-memory
+experiment reproducible without turning the memory store into a transcript
+archive:
+
+- `record_measurement` requires an exact `workspace`, a bounded
+  `measurement_id`, a paired `sample_key`, `variant: "baseline" | "memory"`,
+  and at least one `run_id` or `issue_ref` link.
+- It accepts only bounded counters, durations, rates, a normalized
+  `quality_score`, and a `safety_regression` flag. Unknown fields — including
+  prompts, retrieved facts, comments, diffs, and arbitrary JSON — are rejected.
+- The idempotency key is `(workspace, measurement_id, sample_key, variant)`;
+  retries with the same values are no-ops and conflicting retries are
+  rejected. Retention is capped per workspace by
+  `MEMORY_MCP_MEASUREMENT_MAX_OBSERVATIONS` (default 10,000).
+- `query_measurement` matches only samples that have both variants and reports
+  observation counts plus median/p95 for each numeric metric. It returns
+  `status: "not_claimed"` until `min_pairs` (default 10) complete pairs exist;
+  `ready_for_review` is still not a token-savings or efficacy claim.
+- `stats.counts.measurements` exposes only the aggregate row count for the
+  requested workspace. The measurement API does not change retrieval,
+  workflow authority, gates, or acceptance decisions.
+
+The public MCP server reports `serverInfo.version = 0.20.0`.
+
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
 Covers decision rationale, precedent search and evidence lineage with zero
@@ -483,6 +511,14 @@ v0.19 additions are schema-free: query-time anchor verdicts, first-input
 orientation, search-guard counters, and hit-rate fields use the existing
 evidence and access-log rows plus bounded in-process runtime state.
 
+v0.20 additions (additive — existing stores create the table and index on
+open):
+
+- `measurement_observations(measurement_id, sample_key, variant, run_id,
+  issue_ref, workspace_id, aggregate metrics, created_at)` with a unique
+  `(workspace_id, measurement_id, sample_key, variant)` and bounded
+  per-workspace retention. The table contains no payload column.
+
 ## Environment
 
 - `MEMORY_MCP_DB` — SQLite path. Default is **script-relative**: `<repo>/data/facts.db`
@@ -522,6 +558,8 @@ evidence and access-log rows plus bounded in-process runtime state.
 - `MEMORY_MCP_SEARCH_GUARD_THRESHOLD` — default warning threshold (3).
 - `MEMORY_MCP_RUNTIME_STATE_MAX_SESSIONS` — in-process orientation/guard
   session-state cap (default 1024).
+- `MEMORY_MCP_MEASUREMENT_MAX_OBSERVATIONS` — maximum retained aggregate
+  measurement observations per workspace (default 10,000).
 - `MEMORY_MCP_LLM_KEY` / `MEMORY_MCP_EMBED_KEY` — bearer tokens for
   OpenAI-compatible providers. Credential-bearing plaintext HTTP is rejected
   unless `MEMORY_MCP_ALLOW_INSECURE_HTTP=1` is explicitly set.

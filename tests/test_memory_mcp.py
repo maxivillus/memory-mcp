@@ -775,6 +775,121 @@ class RunsAnchorsAndAccessTest(unittest.TestCase):
                          st["access"]["by_site"].get("query_anchored", 0) + 1)
 
 
+class PairedMeasurementTest(unittest.TestCase):
+    """v0.20: aggregate-only, workspace-scoped paired measurements."""
+
+    def test_v020_tools_and_schema_are_public(self):
+        for name in ("record_measurement", "query_measurement"):
+            self.assertIn(name, mcp.TOOLS)
+            self.assertIn(name, mcp.HANDLERS)
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            con = mcp._open_db(tmp.name)
+            columns = {row["name"] for row in con.execute(
+                "PRAGMA table_info(measurement_observations)")}
+            self.assertIn("measurement_id", columns)
+            self.assertIn("quality_score", columns)
+            self.assertNotIn("payload", columns)
+            con.close()
+        finally:
+            os.unlink(tmp.name)
+
+    def test_record_is_idempotent_and_rejects_payload_fields(self):
+        ws = "measurement-idempotency"
+        args = {
+            "measurement_id": "slice-1", "sample_key": "task-1",
+            "variant": "baseline", "issue_ref": "NTL-694", "workspace": ws,
+            "input_tokens": 100, "wall_time_ms": 250.0,
+        }
+        first = mcp.record_measurement(args)
+        self.assertNotIn("error", first, first)
+        self.assertFalse(first["duplicate"])
+        duplicate = mcp.record_measurement(dict(args))
+        self.assertTrue(duplicate["duplicate"])
+        conflict = dict(args, input_tokens=101)
+        self.assertIn("error", mcp.record_measurement(conflict))
+        bad = dict(args, sample_key="task-2", prompt="do not store this")
+        rejected = mcp.record_measurement(bad)
+        self.assertIn("unsupported measurement fields", rejected["error"])
+        summary = mcp.query_measurement({"measurement_id": "slice-1", "workspace": ws})
+        self.assertNotIn("error", summary, summary)
+        self.assertNotIn("prompt", json.dumps(summary))
+        self.assertEqual(mcp.stats({"workspace": ws})["counts"]["measurements"], 1)
+
+    def test_summary_requires_complete_pairs_and_reports_median_p95(self):
+        ws = "measurement-summary"
+
+        def record(sample, variant, tokens, wall):
+            result = mcp.record_measurement({
+                "measurement_id": "slice-2", "sample_key": sample,
+                "variant": variant, "issue_ref": "NTL-694", "workspace": ws,
+                "input_tokens": tokens, "output_tokens": tokens // 2,
+                "wall_time_ms": wall, "quality_score": 0.9,
+                "safety_regression": 0,
+            })
+            self.assertNotIn("error", result, result)
+
+        record("task-1", "baseline", 100, 250)
+        record("task-1", "memory", 80, 200)
+        partial = mcp.query_measurement({"measurement_id": "slice-2",
+                                          "workspace": ws, "min_pairs": 2})
+        self.assertEqual(partial["status"], "not_claimed")
+        self.assertEqual(partial["paired_samples"], 1)
+
+        record("task-2", "baseline", 200, 350)
+        record("task-2", "memory", 160, 300)
+        complete = mcp.query_measurement({"measurement_id": "slice-2",
+                                           "workspace": ws, "min_pairs": 2})
+        self.assertEqual(complete["status"], "ready_for_review")
+        self.assertEqual(complete["paired_samples"], 2)
+        self.assertEqual(complete["variants"]["baseline"]["metrics"]["input_tokens"],
+                         {"count": 2, "median": 150.0, "p95": 195.0})
+        self.assertEqual(complete["variants"]["memory"]["metrics"]["input_tokens"],
+                         {"count": 2, "median": 120.0, "p95": 156.0})
+        self.assertNotIn("savings", complete)
+
+    def test_workspace_isolation_and_run_link(self):
+        run_ws = "measurement-run-link"
+        mcp.run_begin({"run_id": "measurement-run", "workspace": run_ws})
+        linked = mcp.record_measurement({
+            "measurement_id": "slice-3", "sample_key": "task-1",
+            "variant": "memory", "run_id": "measurement-run",
+            "workspace": run_ws, "memory_calls": 2,
+        })
+        self.assertNotIn("error", linked, linked)
+        missing = mcp.record_measurement({
+            "measurement_id": "slice-3", "sample_key": "task-2",
+            "variant": "memory", "run_id": "missing-run",
+            "workspace": run_ws, "memory_calls": 1,
+        })
+        self.assertIn("run_id was not found", missing["error"])
+
+        other = mcp.record_measurement({
+            "measurement_id": "slice-3", "sample_key": "task-1",
+            "variant": "baseline", "issue_ref": "OTHER-1",
+            "workspace": "measurement-other", "input_tokens": 9,
+        })
+        self.assertNotIn("error", other, other)
+        own = mcp.query_measurement({"measurement_id": "slice-3", "workspace": run_ws})
+        self.assertEqual(own["observations"], {"baseline": 0, "memory": 1})
+        self.assertEqual(own["paired_samples"], 0)
+
+    def test_metric_validation(self):
+        common = {"measurement_id": "slice-4", "sample_key": "task-1",
+                  "variant": "baseline", "issue_ref": "NTL-694",
+                  "workspace": "measurement-validation"}
+        self.assertIn("outside the allowed range",
+                      mcp.record_measurement(dict(common, input_tokens=-1))["error"])
+        self.assertIn("between 0 and 1",
+                      mcp.record_measurement(dict(common, quality_score=1.1))["error"])
+        self.assertIn("outside the allowed range",
+                      mcp.record_measurement(dict(common, wall_time_ms=float("nan")))["error"])
+        self.assertIn("variant must be",
+                      mcp.record_measurement(dict(common, variant="control",
+                                                  input_tokens=1))["error"])
+
+
 class AnchorAndRuntimePolicyTest(unittest.TestCase):
     """Query-time anchors, first-input orientation, and runtime guardrails."""
 
