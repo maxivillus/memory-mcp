@@ -124,6 +124,11 @@ bounded `evidence[].selected_text`; the snippet is checked transiently and
 only its hash/metadata is stored. Rejected candidates are not written. Empty
 retrieval responses keep `result_status: "empty"` and add typed
 `retrieval_outcome: "abstained"`, `abstention_reason`, and `remedy` fields.
+Fact writes are capped by `MEMORY_MCP_FACT_MAX_TEXT_CHARS` (default 16000).
+Normal fact search also bounds legacy rows and marks clipped results with
+`text_truncated` and `text_length`; use `chunk_fact` for explicit pagination.
+`export_rdf.limit` counts complete source records and returns `truncated` when
+additional records remain.
 
 For a local document, first preview it with `commit:false` (or omit `commit`):
 

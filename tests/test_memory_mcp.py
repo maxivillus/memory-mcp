@@ -3425,6 +3425,100 @@ class AuditRegressionTest(unittest.TestCase):
         validate_http_url("http://provider.invalid/v1",
                           {"Authorization": "Bearer test-token"})
 
+    def test_fact_input_and_search_output_are_bounded_and_source_is_normalized(self):
+        workspace = "audit-fact-bounds"
+        too_long = mcp.remember_fact({
+            "text": "x" * (mcp._FACT_MAX_TEXT_CHARS + 1),
+            "source": "test", "workspace": workspace,
+        })
+        self.assertEqual(too_long["code"], "fact_text_too_long")
+        self.assertEqual(too_long["max_chars"], mcp._FACT_MAX_TEXT_CHARS)
+
+        stored = mcp.remember_fact({
+            "text": "normalized source marker",
+            "source": " source-ref ", "workspace": workspace,
+        })
+        self.assertNotIn("error", stored, stored)
+        con = mcp.get_db()
+        row = con.execute("SELECT source FROM facts WHERE id=?", [stored["id"]]).fetchone()
+        con.close()
+        self.assertEqual(row["source"], "source-ref")
+
+        legacy_text = "legacy payload marker " + "z" * (mcp._FACT_MAX_TEXT_CHARS + 100)
+        con = mcp.get_db()
+        con.execute(
+            "INSERT INTO facts (sha256, text, source, workspace_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (hashlib.sha256(legacy_text.encode("utf-8")).hexdigest(), legacy_text,
+             "legacy", workspace, mcp.now(), mcp.now()))
+        con.commit()
+        con.close()
+        result = mcp.search_facts({"query": "legacy payload marker", "workspace": workspace})
+        self.assertNotIn("error", result, result)
+        legacy = next(row for row in result["facts"] if row["source"] == "legacy")
+        self.assertTrue(legacy["text_truncated"])
+        self.assertEqual(legacy["text_length"], len(legacy_text))
+        self.assertLessEqual(len(legacy["text"]), mcp._FACT_MAX_TEXT_CHARS)
+
+    def test_export_rdf_limit_keeps_complete_records(self):
+        workspace = "audit-rdf-limit"
+        first = mcp.remember_fact({
+            "text": "rdf export first marker", "source": "test", "workspace": workspace,
+        })
+        second = mcp.remember_fact({
+            "text": "rdf export second marker", "source": "test", "workspace": workspace,
+        })
+        result = mcp.export_rdf({"workspace": workspace, "limit": 1})
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["records"], 1)
+        self.assertTrue(result["truncated"])
+        self.assertIn("mem:fact-%d a mem:Fact" % first["id"], result["rdf"])
+        self.assertIn("rdf export first marker", result["rdf"])
+        self.assertNotIn("mem:fact-%d a mem:Fact" % second["id"], result["rdf"])
+        self.assertTrue(result["rdf"].rstrip().endswith("."))
+
+    def test_record_decision_rejects_non_finite_confidence(self):
+        for confidence in ("not-a-number", float("nan"), float("inf"), True):
+            result = mcp.record_decision({
+                "scenario": "invalid confidence marker",
+                "confidence": confidence,
+                "workspace": "audit-decisions",
+            })
+            self.assertEqual(result["code"], "invalid_decision_confidence", result)
+
+    def test_retrieval_and_absorb_reuse_database_connections(self):
+        workspace = "audit-connection-reuse"
+        mcp.remember_fact({"text": "connection reuse search marker", "source": "test",
+                           "workspace": workspace})
+        original_get_db = mcp.get_db
+        calls = []
+
+        def counted_get_db(*args, **kwargs):
+            calls.append(True)
+            return original_get_db(*args, **kwargs)
+
+        from unittest.mock import patch
+        with patch.object(mcp, "get_db", side_effect=counted_get_db):
+            result = mcp.search_facts({
+                "query": "connection reuse search marker", "workspace": workspace,
+            })
+        self.assertNotIn("error", result, result)
+        self.assertEqual(len(calls), 1)
+
+        calls.clear()
+        with patch.object(mcp, "get_db", side_effect=counted_get_db):
+            result = mcp.absorb({
+                "facts": [
+                    "batch quantum zeppelin alpha",
+                    "batch orbit cactus beta",
+                    "batch mineral comet gamma",
+                ],
+                "source": "test", "workspace": workspace, "commit": True,
+            })
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["created"], 3)
+        self.assertEqual(len(calls), 2)
+
     def test_malformed_direct_handler_inputs_return_errors(self):
         self.assertIn("error", mcp.search_facts({"query": "x", "trust_min": "bogus"}))
         self.assertIn("error", mcp.list_facts({"limit": "not-an-int"}))

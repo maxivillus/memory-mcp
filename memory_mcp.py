@@ -121,12 +121,15 @@ _CONTEXT_MAX_SEARCH_QUERY = 256
 # but keeps its own knobs so a large fact cannot turn a search response into an
 # unbounded prompt payload.
 _FACT_DEFAULT_CHUNK_CHARS = _env_int("MEMORY_MCP_FACT_CHUNK_CHARS", 4000, 1)
+_FACT_MAX_TEXT_CHARS = _env_int("MEMORY_MCP_FACT_MAX_TEXT_CHARS", 16000, 1)
 _FACT_MAX_CHUNK_CHARS = _env_int("MEMORY_MCP_FACT_MAX_CHUNK_CHARS", 16000, 1)
 _FACT_MAX_CHUNKS = _env_int("MEMORY_MCP_FACT_MAX_CHUNKS", 32, 1)
 _FACT_MAX_CHUNK_RESPONSE_CHARS = _env_int(
     "MEMORY_MCP_FACT_MAX_CHUNK_RESPONSE_CHARS", 64 * 1024, 1)
 _ABSORB_MAX_FACTS = _env_int("MEMORY_MCP_ABSORB_MAX_FACTS", 50, 1)
-_ABSORB_MAX_TEXT_CHARS = _env_int("MEMORY_MCP_ABSORB_MAX_TEXT_CHARS", 16000, 1)
+_ABSORB_MAX_TEXT_CHARS = min(
+    _env_int("MEMORY_MCP_ABSORB_MAX_TEXT_CHARS", _FACT_MAX_TEXT_CHARS, 1),
+    _FACT_MAX_TEXT_CHARS)
 _EVIDENCE_MAX_FIELD_CHARS = _env_int("MEMORY_MCP_EVIDENCE_MAX_FIELD_CHARS", 2048, 1)
 _ADMISSION_TRACE_MAX_REFS = _env_int(
     "MEMORY_MCP_ADMISSION_TRACE_MAX_REFS", 20, 1)
@@ -1954,28 +1957,30 @@ def _run_meta(row):
     return meta
 
 
-def _record_access(ws, site, query, result_count, latency_ms):
+def _record_access(ws, site, query, result_count, latency_ms, con=None):
     """Append one bounded memory-access telemetry row. Best-effort by design:
     a telemetry failure must never break retrieval."""
+    owns_con = con is None
     try:
-        con = get_db()
-        try:
-            con.execute(
-                "INSERT INTO memory_access_events (workspace_id, channel, site, query_hash, "
-                "result_count, latency_ms, created_at) VALUES (?,?,?,?,?,?,?)",
-                (ws, "push" if site == "compose_recall" else "pull", site,
-                 hashlib.sha256((query or "").encode("utf-8")).hexdigest(),
-                 int(result_count or 0), round(float(latency_ms or 0), 3), now()))
-            con.execute(
-                "DELETE FROM memory_access_events WHERE workspace_id=? AND id NOT IN "
-                "(SELECT id FROM memory_access_events WHERE workspace_id=? "
-                " ORDER BY created_at DESC, id DESC LIMIT ?)",
-                (ws, ws, _ACCESS_MAX_EVENTS))
-            con.commit()
-        finally:
-            con.close()
+        if owns_con:
+            con = get_db()
+        con.execute(
+            "INSERT INTO memory_access_events (workspace_id, channel, site, query_hash, "
+            "result_count, latency_ms, created_at) VALUES (?,?,?,?,?,?,?)",
+            (ws, "push" if site == "compose_recall" else "pull", site,
+             hashlib.sha256((query or "").encode("utf-8")).hexdigest(),
+             int(result_count or 0), round(float(latency_ms or 0), 3), now()))
+        con.execute(
+            "DELETE FROM memory_access_events WHERE workspace_id=? AND id NOT IN "
+            "(SELECT id FROM memory_access_events WHERE workspace_id=? "
+            " ORDER BY created_at DESC, id DESC LIMIT ?)",
+            (ws, ws, _ACCESS_MAX_EVENTS))
+        con.commit()
     except Exception:
         pass
+    finally:
+        if owns_con and con is not None:
+            con.close()
 
 
 def _feedback_field(args, name, required=True):
@@ -2916,7 +2921,7 @@ def query_anchored(args):
                   "safety_critical_allowed": False,
                   "anchor_verification": "filesystem" if repo_root else "metadata_only"}
         _record_access(ws, "query_anchored", path or symbol, result["count"],
-                       time.monotonic() - t0)
+                       time.monotonic() - t0, con=con)
         return result
     finally:
         con.close()
@@ -3821,6 +3826,18 @@ def _add_fact_chunks(rows, chunk_chars, overlap):
     return rows
 
 
+def _bound_fact_search_text(rows):
+    """Keep search payloads bounded, including facts written by old versions."""
+    for row in rows:
+        text = row.get("text") if isinstance(row, dict) else None
+        if not isinstance(text, str) or len(text) <= _FACT_MAX_TEXT_CHARS:
+            continue
+        row["text_length"] = len(text)
+        row["text"] = text[:_FACT_MAX_TEXT_CHARS]
+        row["text_truncated"] = True
+    return rows
+
+
 def chunk_fact(args):
     """Read a bounded, paginated chunk sequence from one active fact."""
     if args.get("id") is None and args.get("fact_id") is None and not args.get("sha256"):
@@ -4428,11 +4445,23 @@ def _normalize_admission(value):
     return mode, None
 
 
-def remember_fact(args):
-    text = (args.get("text") or "").strip()
+def remember_fact(args, _con=None):
+    raw_text = args.get("text")
+    if raw_text is None:
+        raw_text = ""
+    if not isinstance(raw_text, str):
+        return {"error": "text must be a string"}
+    text = raw_text.strip()
     if not text:
         return {"error": "text is required"}
-    source = args.get("source") or ""
+    if len(text) > _FACT_MAX_TEXT_CHARS:
+        return {"error": "text is too long (max %d characters)" %
+                _FACT_MAX_TEXT_CHARS,
+                "code": "fact_text_too_long",
+                "max_chars": _FACT_MAX_TEXT_CHARS}
+    source = args.get("source", "")
+    if source is None:
+        source = ""
     if not isinstance(source, str):
         return {"error": "source must be a string"}
     source = source.strip()
@@ -4474,7 +4503,8 @@ def remember_fact(args):
     if not workspace:
         warning = (warning + "; " if warning else "") + \
             "no workspace provided; add workspace=<project_id> to scope this fact to your project"
-    con = get_db()
+    owns_con = _con is None
+    con = _con if _con is not None else get_db()
     try:
         err = _ws_inactive_error(con, workspace)
         if err:
@@ -4528,7 +4558,7 @@ def remember_fact(args):
         cur = con.execute(
             "INSERT INTO facts (sha256, text, source, project, domain, trust, strong, importance, workspace_id, created_at, updated_at, category_id) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (sha, text, args.get("source", ""), args.get("project", ""),
+            (sha, text, source, args.get("project", ""),
              args.get("domain", ""), trust, 1 if args.get("strong") else 0,
              importance, workspace, ts, ts, cat_id))
         try:
@@ -4557,7 +4587,8 @@ def remember_fact(args):
             out["warning"] = warning
         return out
     finally:
-        con.close()
+        if owns_con:
+            con.close()
 
 
 def _absorb_candidates(con, text, workspace):
@@ -4947,56 +4978,60 @@ def absorb(args):
         return result
 
     evidence_errors = []
-    for entry in planned:
-        out = entry["out"]
-        item = entry["item"]
-        fid = entry["existing_id"]
-        if out["classification"] == "rejected":
-            continue
-        if out["classification"] == "new":
-            stored = remember_fact(item["args"])
-            if item["admission"] == "strict" and stored.get("result_status") == "rejected":
-                out["classification"] = "rejected"
-                out["action"] = "reject"
-                out["code"] = stored.get("code", "admission_commit_failed")
-                out["admission"] = stored.get("admission", out.get("admission", {}))
-                result["rejected"] += 1
+    commit_con = get_db()
+    try:
+        for entry in planned:
+            out = entry["out"]
+            item = entry["item"]
+            fid = entry["existing_id"]
+            if out["classification"] == "rejected":
                 continue
-            if "error" in stored:
-                out["error"] = stored["error"]
-                continue
-            fid = stored["id"]
-            out["id"] = fid
-            if _env_flag("MEMORY_MCP_ADMISSION_TRACE") and "decision_trace" in out:
-                out["decision_trace"]["resulting_fact_id"] = fid
-            if stored.get("dedup"):
+            if out["classification"] == "new":
+                stored = remember_fact(item["args"], _con=commit_con)
+                if item["admission"] == "strict" and stored.get("result_status") == "rejected":
+                    out["classification"] = "rejected"
+                    out["action"] = "reject"
+                    out["code"] = stored.get("code", "admission_commit_failed")
+                    out["admission"] = stored.get("admission", out.get("admission", {}))
+                    result["rejected"] += 1
+                    continue
+                if "error" in stored:
+                    out["error"] = stored["error"]
+                    continue
+                fid = stored["id"]
+                out["id"] = fid
+                if _env_flag("MEMORY_MCP_ADMISSION_TRACE") and "decision_trace" in out:
+                    out["decision_trace"]["resulting_fact_id"] = fid
+                if stored.get("dedup"):
+                    result["deduped"] += 1
+                else:
+                    result["created"] += 1
+                if item["admission"] == "strict" and stored.get("admission"):
+                    out["admission"] = stored["admission"]
+                    result["evidence_attached"] += stored["admission"].get(
+                        "evidence_attached", 0)
+            elif out["classification"] == "duplicate":
                 result["deduped"] += 1
             else:
-                result["created"] += 1
-            if item["admission"] == "strict" and stored.get("admission"):
-                out["admission"] = stored["admission"]
-                result["evidence_attached"] += stored["admission"].get(
-                    "evidence_attached", 0)
-        elif out["classification"] == "duplicate":
-            result["deduped"] += 1
-        else:
-            continue
-        # Strict new facts attach evidence in the same transaction as the fact.
-        # Duplicates still use the normal idempotent evidence-link path.
-        evidence_items = [] if (
-            item["admission"] == "strict" and out["classification"] == "new"
-        ) else item["evidence"]
-        for evidence in evidence_items:
-            attach_args = dict(evidence)
-            attach_args["fact_id"] = fid
-            if workspace:
-                attach_args["workspace"] = workspace
-            attached = attach_evidence(attach_args)
-            if "error" in attached:
-                evidence_errors.append({"index": out["index"],
-                                        "error": attached["error"]})
-            elif not attached.get("dedup"):
-                result["evidence_attached"] += 1
+                continue
+            # Strict new facts attach evidence in the same transaction as the fact.
+            # Duplicates still use the normal idempotent evidence-link path.
+            evidence_items = [] if (
+                item["admission"] == "strict" and out["classification"] == "new"
+            ) else item["evidence"]
+            for evidence in evidence_items:
+                attach_args = dict(evidence)
+                attach_args["fact_id"] = fid
+                if workspace:
+                    attach_args["workspace"] = workspace
+                attached = attach_evidence(attach_args, _con=commit_con)
+                if "error" in attached:
+                    evidence_errors.append({"index": out["index"],
+                                            "error": attached["error"]})
+                elif not attached.get("dedup"):
+                    result["evidence_attached"] += 1
+    finally:
+        commit_con.close()
     result["committed"] = True
     result["result_status"] = (
         "rejected" if result["rejected"] == result["count"] else
@@ -5128,6 +5163,7 @@ def search_facts(args):
             rows = res.get("facts", []) if isinstance(res, dict) else res or []
         if chunk_params:
             rows = _add_fact_chunks(rows, *chunk_params)
+        rows = _bound_fact_search_text(rows)
         _mark_hits(con, rows)
         result = {"count": len(rows), "facts": rows,
                   "memory_policy": "advisory_only",
@@ -5137,7 +5173,8 @@ def search_facts(args):
         result.update(_retrieval_metadata(len(rows)))
         if args.get("graph"):
             result["graph"] = len(graph)
-        _record_access(ws, "search_facts", query, len(rows), time.monotonic() - t0)
+        _record_access(ws, "search_facts", query, len(rows),
+                       time.monotonic() - t0, con=con)
         return result
     except sqlite3.OperationalError as e:
         return {"error": f"query failed: {e}", "facts": []}
@@ -5178,6 +5215,7 @@ def search_semantic(args):
         res = emb.search_semantic(con, query, limit=limit, threshold=threshold,
                                   workspace=ws, filters=filters)
         rows = res.get("facts", []) if isinstance(res, dict) else res or []
+        rows = _bound_fact_search_text(rows)
         _revive_degraded(con, query, ws)
         _mark_hits(con, rows)
         if isinstance(res, dict):
@@ -5186,7 +5224,8 @@ def search_semantic(args):
             res["profile"] = profile
             res["result_status"] = "ok" if rows else "empty"
             res.update(_retrieval_metadata(len(rows)))
-        _record_access(ws, "search_semantic", query, len(rows), time.monotonic() - t0)
+        _record_access(ws, "search_semantic", query, len(rows),
+                       time.monotonic() - t0, con=con)
         return res
     finally:
         con.close()
@@ -5643,7 +5682,17 @@ def record_decision(args):
     ts = now()
     confidence = args.get("confidence")
     if confidence is not None:
-        confidence = float(confidence)
+        if isinstance(confidence, bool):
+            return {"error": "confidence must be a finite number",
+                    "code": "invalid_decision_confidence"}
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            return {"error": "confidence must be a finite number",
+                    "code": "invalid_decision_confidence"}
+        if not math.isfinite(confidence):
+            return {"error": "confidence must be a finite number",
+                    "code": "invalid_decision_confidence"}
     con = get_db()
     try:
         workspace = _workspace(args)
@@ -5768,7 +5817,7 @@ def find_precedents(args):
                 except Exception:
                     pass
         _record_access(ws, "find_precedents", scenario, len(rows),
-                       time.monotonic() - t0)
+                       time.monotonic() - t0, con=con)
         result = {"count": len(rows), "precedents": rows,
                   "semantic": bool(args.get("semantic")),
                   "memory_policy": "advisory_only",
@@ -5903,7 +5952,7 @@ def get_provenance(args):
             "WHERE fact_id=? ORDER BY created_at", (fact["id"],))]
         _record_access(ws, "get_provenance",
                        str(args.get("fact_id") or args.get("sha256") or ""), 1,
-                       time.monotonic() - t0)
+                       time.monotonic() - t0, con=con)
         return {"fact": dict(fact), "evidence": evidence}
     finally:
         con.close()
@@ -5931,7 +5980,7 @@ def _insert_evidence_rows(con, fact_id, evidence):
     return attached
 
 
-def attach_evidence(args):
+def attach_evidence(args, _con=None):
     fact_id = args.get("fact_id")
     source_ref = args.get("source_ref") or ""
     if not isinstance(source_ref, str):
@@ -5953,7 +6002,8 @@ def attach_evidence(args):
     if err:
         return err
     ws = _workspace(args)
-    con = get_db()
+    owns_con = _con is None
+    con = _con if _con is not None else get_db()
     try:
         err = _ws_inactive_error(con, ws)
         if err:
@@ -5976,7 +6026,8 @@ def attach_evidence(args):
         return {"fact_id": fact_id, "source_ref": source_ref,
                 "dedup": cur.rowcount == 0}
     finally:
-        con.close()
+        if owns_con:
+            con.close()
 
 
 def detect_conflicts(args):
@@ -6190,7 +6241,8 @@ def fact_references(args):
 
 def export_rdf(args):
     """W3C PROV-flavoured Turtle export: facts, entities/relations, decisions,
-    evidence, and bi-temporal supersession edges."""
+    evidence, and bi-temporal supersession edges. ``limit`` bounds complete
+    source records, not output lines."""
     limit, err = _bounded_int_arg(args, "limit", 5000, 1, 50000)
     if err:
         return err
@@ -6204,62 +6256,87 @@ def export_rdf(args):
         out.append("@prefix prov: <http://www.w3.org/ns/prov#> .")
         out.append("@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .")
         out.append("@prefix mem: <https://memory-mcp.dev/vocab#> .")
-        n = 0
+        remaining = limit
+        records = 0
+        truncated = False
+
         def esc(v):
             return (str(v).replace("\\", "\\\\").replace('"', '\\"')
                     .replace("\r", " ").replace("\n", " "))
-        def add(line):
-            out.append(line)
-        for r in con.execute("SELECT id, text, source, trust, strong, importance, confirmed, "
-                             "invalid_at, superseded_by, created_at, updated_at FROM facts "
-                             "WHERE 1=1" + _ws_check("facts", ws) + " ORDER BY id",
-                             [ws] if ws else []):
+
+        def take(sql, params):
+            """Read at most the remaining record budget and probe later tables."""
+            nonlocal remaining, truncated
+            if truncated:
+                return []
+            if remaining <= 0:
+                if con.execute(sql + " LIMIT 1", params).fetchone():
+                    truncated = True
+                return []
+            rows = con.execute(sql + " LIMIT ?", list(params) + [remaining + 1]).fetchall()
+            if len(rows) > remaining:
+                rows = rows[:remaining]
+                truncated = True
+            remaining -= len(rows)
+            return rows
+
+        def add_record(lines):
+            nonlocal records
+            out.extend(lines)
+            records += 1
+
+        fact_sql = ("SELECT id, text, source, trust, strong, importance, confirmed, "
+                    "invalid_at, superseded_by, created_at, updated_at FROM facts "
+                    "WHERE 1=1" + _ws_check("facts", ws) + " ORDER BY id")
+        for r in take(fact_sql, [ws] if ws else []):
             f = dict(r)
-            add("mem:fact-%d a mem:Fact ;" % f["id"])
-            add("    mem:text \"%s\" ;" % esc(f["text"][:400]))
-            add("    mem:trust \"%s\" ;" % f["trust"])
-            add("    mem:importance \"%s\"^^xsd:decimal ;" % f["importance"])
+            lines = ["mem:fact-%d a mem:Fact ;" % f["id"],
+                     "    mem:text \"%s\" ;" % esc(f["text"][:400]),
+                     "    mem:trust \"%s\" ;" % f["trust"],
+                     "    mem:importance \"%s\"^^xsd:decimal ;" % f["importance"]]
             if f["source"]:
-                add("    prov:wasGeneratedBy [ a prov:Activity ; prov:used \"%s\" ] ;" % esc(f["source"]))
-            add("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % f["created_at"])
+                lines.append("    prov:wasGeneratedBy [ a prov:Activity ; prov:used \"%s\" ] ;" % esc(f["source"]))
+            lines.append("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % f["created_at"])
             if f["invalid_at"]:
-                add("mem:fact-%d prov:invalidatedAtTime \"%s\"^^xsd:dateTime ." % (f["id"], f["invalid_at"]))
+                lines.append("mem:fact-%d prov:invalidatedAtTime \"%s\"^^xsd:dateTime ." % (f["id"], f["invalid_at"]))
             if f["superseded_by"]:
-                add("mem:fact-%d mem:supersededBy mem:fact-%d ." % (f["id"], f["superseded_by"]))
-        ent_ws = _ws_check("entities", ws)
-        ent_params = [ws] if ws else []
-        for r in con.execute("SELECT id, name, type FROM entities WHERE 1=1" + ent_ws + " ORDER BY id",
-                             ent_params):
-            add("mem:entity-%d a mem:Entity ; mem:name \"%s\" ; mem:type \"%s\" ."
-                % (r["id"], esc(r["name"]), esc(r["type"] or "")))
-        for r in con.execute("SELECT id, subject_id, predicate, object_id FROM relations "
-                             "WHERE 1=1" + _ws_check("relations", ws) + " ORDER BY id",
-                             [ws] if ws else []):
-            add("mem:entity-%d mem:relatedTo mem:entity-%d ; mem:predicate \"%s\" ."
-                % (r["subject_id"], r["object_id"], esc(r["predicate"])))
-        for r in con.execute("SELECT id, category, subject, scenario, outcome, "
-                             "parent_decision_id, created_at FROM decisions "
-                             "WHERE 1=1" + _ws_check("decisions", ws) + " ORDER BY id",
-                             [ws] if ws else []):
-            add("mem:decision-%d a mem:Decision ;" % r["id"])
-            add("    mem:scenario \"%s\" ;" % esc(r["scenario"][:300]))
+                lines.append("mem:fact-%d mem:supersededBy mem:fact-%d ." % (f["id"], f["superseded_by"]))
+            add_record(lines)
+        ent_sql = ("SELECT id, name, type FROM entities WHERE 1=1" +
+                   _ws_check("entities", ws) + " ORDER BY id")
+        for r in take(ent_sql, [ws] if ws else []):
+            add_record(["mem:entity-%d a mem:Entity ; mem:name \"%s\" ; mem:type \"%s\" ."
+                        % (r["id"], esc(r["name"]), esc(r["type"] or ""))])
+        relation_sql = ("SELECT id, subject_id, predicate, object_id FROM relations "
+                        "WHERE 1=1" + _ws_check("relations", ws) + " ORDER BY id")
+        for r in take(relation_sql, [ws] if ws else []):
+            add_record(["mem:entity-%d mem:relatedTo mem:entity-%d ; mem:predicate \"%s\" ."
+                        % (r["subject_id"], r["object_id"], esc(r["predicate"]))])
+        decision_sql = ("SELECT id, category, subject, scenario, outcome, "
+                        "parent_decision_id, created_at FROM decisions "
+                        "WHERE 1=1" + _ws_check("decisions", ws) + " ORDER BY id")
+        for r in take(decision_sql, [ws] if ws else []):
+            lines = ["mem:decision-%d a mem:Decision ;" % r["id"],
+                     "    mem:scenario \"%s\" ;" % esc(r["scenario"][:300])]
             if r["subject"]:
-                add("    mem:subject \"%s\" ;" % esc(r["subject"]))
+                lines.append("    mem:subject \"%s\" ;" % esc(r["subject"]))
             if r["outcome"]:
-                add("    mem:outcome \"%s\" ;" % esc(r["outcome"]))
+                lines.append("    mem:outcome \"%s\" ;" % esc(r["outcome"]))
             if r["parent_decision_id"]:
-                add("    prov:wasDerivedFrom mem:decision-%d ;" % r["parent_decision_id"])
-            add("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % r["created_at"])
-        for r in con.execute(
-                "SELECT e.id, e.fact_id, e.source_ref, e.source_checksum, e.repo, e.ref, e.path, "
-                "e.symbol, e.start_line, e.start_col, e.end_line, e.end_col, "
-                "e.selected_text_hash, e.resolution_status, e.created_at "
-                "FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE 1=1" +
-                _ws_check("f", ws) + " ORDER BY e.fact_id", [ws] if ws else []):
-            add("mem:fact-%d prov:wasDerivedFrom [ a prov:Entity ; "
-                "prov:atLocation \"%s\" ; prov:value \"%s\" ] ;"
-                % (r["fact_id"], esc(r["source_ref"]), esc(r["source_checksum"])))
-            add("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % r["created_at"])
+                lines.append("    prov:wasDerivedFrom mem:decision-%d ;" % r["parent_decision_id"])
+            lines.append("    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % r["created_at"])
+            add_record(lines)
+        evidence_sql = (
+            "SELECT e.id, e.fact_id, e.source_ref, e.source_checksum, e.repo, e.ref, e.path, "
+            "e.symbol, e.start_line, e.start_col, e.end_line, e.end_col, "
+            "e.selected_text_hash, e.resolution_status, e.created_at "
+            "FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE 1=1" +
+            _ws_check("f", ws) + " ORDER BY e.fact_id")
+        for r in take(evidence_sql, [ws] if ws else []):
+            lines = ["mem:fact-%d prov:wasDerivedFrom [ a prov:Entity ; "
+                     "prov:atLocation \"%s\" ; prov:value \"%s\" ] ;"
+                     % (r["fact_id"], esc(r["source_ref"]), esc(r["source_checksum"])),
+                     "    prov:generatedAtTime \"%s\"^^xsd:dateTime ." % r["created_at"]]
             anchor = []
             for key in ("repo", "ref", "path", "symbol", "resolution_status"):
                 if r[key]:
@@ -6270,15 +6347,11 @@ def export_rdf(args):
             if r["selected_text_hash"]:
                 anchor.append("mem:selectedTextHash \"%s\"" % esc(r["selected_text_hash"]))
             if anchor:
-                add("mem:evidence-%s a prov:Entity ; %s ." %
-                    (r["id"], " ; ".join(anchor)))
-        # cap and cut at a triple boundary (last line ends with '.')
-        if len(out) > limit * 6:
-            out = out[:limit * 6]
-        while out and not out[-1].rstrip().endswith("."):
-            out.pop()
-        return {"format": "text/turtle", "triples": len(out), "truncated": len(out) >= limit * 6,
-                "rdf": "\n".join(out)}
+                lines.append("mem:evidence-%s a prov:Entity ; %s ." %
+                             (r["id"], " ; ".join(anchor)))
+            add_record(lines)
+        return {"format": "text/turtle", "triples": len(out), "records": records,
+                "truncated": truncated, "rdf": "\n".join(out)}
     finally:
         con.close()
 
@@ -6861,11 +6934,11 @@ TOOLS = {
     # guess the name) but is intentionally NOT advertised in the schema —
     # aliases would add tool-choice noise for every client.
     "remember_fact": {
-        "description": "Store a durable fact (upsert, dedup by sha256 of text). admission='strict' requires bounded evidence text and stores only its hash/metadata.",
+        "description": "Store a durable fact (upsert, dedup by sha256 of text). Fact text is capped at MEMORY_MCP_FACT_MAX_TEXT_CHARS (default 16000). admission='strict' requires bounded evidence text and stores only its hash/metadata.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "Fact text"},
+                "text": {"type": "string", "maxLength": 16000, "description": "Fact text; maxLength follows MEMORY_MCP_FACT_MAX_TEXT_CHARS (default 16000)"},
                 "source": {"type": "string", "description": "Origin: session/issue/run"},
                 "project": {"type": "string", "description": "Project scope"},
                 "domain": {"type": "string", "description": "Legacy free tag; used as category when `category` is absent"},
@@ -6891,7 +6964,7 @@ TOOLS = {
                         "oneOf": [
                             {"type": "string"},
                             {"type": "object", "properties": {
-                                "text": {"type": "string"},
+                                "text": {"type": "string", "maxLength": 16000, "description": "Fact text; maxLength follows MEMORY_MCP_FACT_MAX_TEXT_CHARS (default 16000)"},
                                 "source": {"type": "string"},
                                 "project": {"type": "string"},
                                 "domain": {"type": "string"},
@@ -6906,7 +6979,7 @@ TOOLS = {
                         ],
                     },
                 },
-                "text": {"type": "string", "description": "Single-item alias for facts"},
+                "text": {"type": "string", "maxLength": 16000, "description": "Single-item alias for facts; maxLength follows MEMORY_MCP_FACT_MAX_TEXT_CHARS (default 16000)"},
                 "source": {"type": "string"},
                 "project": {"type": "string"},
                 "domain": {"type": "string"},
@@ -7322,7 +7395,7 @@ TOOLS = {
         },
     },
     "search_facts": {
-        "description": "Advisory full-text search over stored facts. It cannot authorize safety-critical operations. With semantic=true and MEMORY_MCP_EMBEDDINGS=1, merges lexical and embedding rankings (RRF) using the same eligibility filters.",
+        "description": "Advisory full-text search over stored facts. Default fact text output is capped at MEMORY_MCP_FACT_MAX_TEXT_CHARS; legacy rows may include text_truncated and text_length. It cannot authorize safety-critical operations. With semantic=true and MEMORY_MCP_EMBEDDINGS=1, merges lexical and embedding rankings (RRF) using the same eligibility filters.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -7516,11 +7589,11 @@ TOOLS = {
         },
     },
     "export_rdf": {
-        "description": "W3C PROV-flavoured Turtle export (facts, entities/relations, decisions, evidence, supersession edges).",
+        "description": "W3C PROV-flavoured Turtle export (facts, entities/relations, decisions, evidence, supersession edges). limit bounds complete source records and never cuts a record in the middle.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "limit": {"type": "integer", "default": 5000},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 5000, "description": "Maximum complete source records; prefixes are not counted"},
                 "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
             },
         },
@@ -7640,7 +7713,7 @@ TOOLS = {
                 "scenario": {"type": "string"},
                 "reasoning": {"type": "string"},
                 "outcome": {"type": "string"},
-                "confidence": {"type": "number"},
+                "confidence": {"type": "number", "description": "Optional finite number; NaN, infinity, and non-numeric values are rejected"},
                 "decision_maker": {"type": "string"},
                 "issue_ref": {"type": "string"},
                 "path": {"type": "string", "maxLength": 2048, "description": "Optional code path anchor (queryable via query_anchored)"},
