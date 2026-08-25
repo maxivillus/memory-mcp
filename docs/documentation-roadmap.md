@@ -1,10 +1,10 @@
 # Documentation refresh roadmap
 
 - Mode: comprehensive-refresh
-- Baseline source: merged implementation commit `a762656`
+- Baseline source: merged implementation commit `0b9efb1`
 - Audience: agents and developers using the local `memory-mcp` MCP server
-- First successful action: preview candidate facts with `absorb`, then read or
-  commit only the bounded result required by the task
+- First successful action: preview candidate facts or a local document, then
+  read or commit only the bounded result required by the task
 
 ## Scope
 
@@ -15,8 +15,8 @@ Included surfaces:
 - `skills/memory-mcp/SKILL.md` agent-facing usage rules;
 - `tests/test_memory_mcp.py` test-run instruction in the module docstring;
 - `docs/ingestion-and-provenance.md` operational contract; and
-- `docs/decisions/ADR-0002-local-ingestion-and-code-provenance.md` decision
-  record.
+- `docs/decisions/ADR-0002-local-ingestion-and-code-provenance.md` and the
+  v0.22 architecture decision record.
 
 Excluded surfaces:
 
@@ -30,8 +30,9 @@ Excluded surfaces:
 ## Audit findings and planned phases
 
 1. Audit code, tests, README, deployment notes, and the project skill against
-   the v0.16 implementation. The README covered the new code, but the skill
-   was stale and its contract link pointed to the lifecycle document.
+   the v0.16–v0.22 implementation. The v0.22 pass adds bounded retrieval
+   profiles, a preview-first local document adapter, aggregate usage feedback,
+   and canonical entity lookup keys.
 2. Add the missing operational contract, synchronize the skill and landing
    page, and record the local-only architecture boundary.
 3. Verify paths, links, examples, skill structure, Python syntax, and the
@@ -40,13 +41,16 @@ Excluded surfaces:
 4. Document the v0.17 focused retrieval contract, including the advisory-only
    safety boundary, public `purpose` schema, noise-only behavior, and the
    deployment smoke check.
+5. Document the v0.22 local-only boundaries: explicit-root document reads,
+   immutable context chunks, profile caps, fixed feedback signals, bounded
+   retention, and additive entity normalization.
 
 ## Verification record
 
 The refresh passed internal Markdown path checks, project skill structure
 checks, `git diff --check`, and the local Python checks:
 
-- `MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -q` — 121 tests;
+- `MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -q` — 149 tests;
 - `python3 -m unittest -q test_memory_mcp` — 78 tests; and
 - `python3 -m py_compile memory_mcp.py extract.py verify.py recall.py embeddings.py`.
 - Public stdio JSON-RPC smoke — `tools/list`, focused `compose_recall`,
