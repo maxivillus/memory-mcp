@@ -1170,6 +1170,192 @@ class PairedMeasurementTest(unittest.TestCase):
                                                   input_tokens=1))["error"])
 
 
+class IssueShapedPilotTest(unittest.TestCase):
+    """Synthetic end-to-end pilot for the issue-shaped integration contract."""
+
+    def setUp(self):
+        self.old_db = mcp.DB_PATH
+        self.old_selected = mcp._SELECTED_DB[0]
+        self.old_context_map = os.environ.get("MEMORY_MCP_CONTEXT_MAP")
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="mcp-pilot-")
+        self.db = os.path.join(self.tmpdir.name, "facts.db")
+        self.repo = os.path.join(self.tmpdir.name, "repo")
+        os.makedirs(os.path.join(self.repo, "src"))
+        self.path = "src/worker.py"
+        self.source = (
+            "# retry budget returns min attempts 3\n"
+            "def retry_budget(attempts):\n"
+            "    return min(attempts, 3)\n"
+        )
+        with open(os.path.join(self.repo, self.path), "w", encoding="utf-8") as handle:
+            handle.write(self.source)
+        mcp.DB_PATH = self.db
+        mcp._SELECTED_DB[0] = None
+        os.environ["MEMORY_MCP_CONTEXT_MAP"] = "1"
+
+    def tearDown(self):
+        mcp.DB_PATH = self.old_db
+        mcp._SELECTED_DB[0] = self.old_selected
+        if self.old_context_map is None:
+            os.environ.pop("MEMORY_MCP_CONTEXT_MAP", None)
+        else:
+            os.environ["MEMORY_MCP_CONTEXT_MAP"] = self.old_context_map
+        self.tmpdir.cleanup()
+
+    @staticmethod
+    def _sha256(value):
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def _ok(self, result):
+        self.assertNotIn("error", result, result)
+        return result
+
+    def test_synthetic_issue_run_connects_evidence_context_handoff_and_measurement(self):
+        workspace = "pilot-project"
+        issue_ref = "NTL-719-synthetic"
+        repo = "pilot-repo"
+        ref = "pilot-ref-001"
+        run_id = "pilot-run-001"
+
+        started = self._ok(mcp.run_begin({
+            "run_id": run_id, "issue_ref": issue_ref, "workspace": workspace,
+            "session_id": "pilot-session", "cwd": "repo", "source": "synthetic-pilot",
+        }))
+        self.assertEqual(started["run"]["state"], "open")
+
+        fact = self._ok(mcp.remember_fact({
+            "text": "retry budget returns min attempts 3",
+            "source": "%s@%s:%s" % (repo, ref, self.path),
+            "workspace": workspace,
+            "admission": "strict",
+            "evidence": {
+                "source_ref": "%s@%s:%s" % (repo, ref, self.path),
+                "repo": repo,
+                "ref": ref,
+                "path": self.path,
+                "symbol": "retry_budget",
+                "start_line": 1,
+                "end_line": 3,
+                "selected_text": self.source,
+            },
+        }))
+        self.assertEqual(fact["admission"]["status"], "accepted")
+        self.assertEqual(fact["admission"]["evidence_attached"], 1)
+
+        decision = self._ok(mcp.record_decision({
+            "scenario": "synthetic retry budget review",
+            "reasoning": "the current repository exposes a bounded retry helper",
+            "outcome": "keep the repository implementation as the code source of truth",
+            "decision_maker": "pilot-reviewer",
+            "issue_ref": issue_ref,
+            "path": self.path,
+            "symbol": "retry_budget",
+            "workspace": workspace,
+        }))
+        self.assertTrue(decision["id"])
+
+        event = self._ok(mcp.capture_event({
+            "workspace": workspace,
+            "idempotency_key": "pilot-event-1",
+            "event_kind": "pilot_checkpoint",
+            "session_id": "pilot-session",
+            "source": issue_ref,
+            "path": self.path,
+            "payload": {"stage": "evidence-attached", "fact_id": fact["id"]},
+        }))
+        self.assertEqual(event["event"]["event_kind"], "pilot-checkpoint")
+
+        context = self._ok(mcp.put_context({
+            "name": "pilot-review-slice",
+            "content": "Synthetic review context: inspect retry_budget in src/worker.py.",
+            "workspace": workspace,
+            "schema": {"kind": "issue-shaped-pilot", "synthetic": True},
+            "source": issue_ref,
+        }))
+        context_ref = context["context"]["ref"]
+        read_context = self._ok(mcp.read_context({
+            "ref": context_ref, "workspace": workspace, "max_chars": 200,
+        }))
+        self.assertIn("retry_budget", read_context["context"]["content"])
+
+        handoff_content = "Synthetic handoff: review the bounded retry helper."
+        handoff = self._ok(mcp.handoff_begin({
+            "workspace": workspace,
+            "owner": "pilot-agent",
+            "session_id": "pilot-session",
+            "cwd": "repo",
+            "source": issue_ref,
+            "content": handoff_content,
+            "checksum": self._sha256(handoff_content),
+            "ttl_seconds": 60,
+            "idempotency_key": "pilot-handoff-1",
+        }))
+        accepted = self._ok(mcp.handoff_accept({
+            "handoff_ref": handoff["handoff"]["ref"],
+            "actor": "pilot-agent",
+            "workspace": workspace,
+            "cwd": "repo",
+            "max_chars": 200,
+        }))
+        self.assertEqual(accepted["context"]["content"], handoff_content)
+
+        ended = self._ok(mcp.run_end({
+            "run_id": run_id, "workspace": workspace,
+            "base_sha": "a" * 40, "head_sha": "b" * 40,
+            "files_changed": [self.path], "diff": "synthetic diff",
+        }))
+        self.assertTrue(ended["closed"])
+
+        mapped = self._ok(mcp.context_map({
+            "repo": repo,
+            "ref": ref,
+            "view": "impact",
+            "repo_root": self.repo,
+            "workspace": workspace,
+            "anchors": [{
+                "path": self.path,
+                "symbol": "retry_budget",
+                "content_checksum": self._sha256(self.source),
+                "relation": "dependent",
+            }],
+            "impact_paths": [self.path],
+        }))
+        self.assertEqual(mapped["source_of_truth"],
+                         "current repository and live runtime state")
+        self.assertEqual(mapped["memory_policy"], "advisory_only")
+        self.assertFalse(mapped["safety_critical_allowed"])
+        self.assertEqual(mapped["manifest"][0]["anchor_verdict"], "STRONG")
+        self.assertEqual(mapped["manifest"][0]["checksum_verdict"], "MATCH")
+        self.assertEqual(mapped["facts"][0]["id"], fact["id"])
+        self.assertEqual(mapped["decisions"][0]["id"], decision["id"])
+        self.assertEqual(mapped["impact"]["runs"][0]["matched_paths"], [self.path])
+
+        summary = self._ok(mcp.prepare_summary({
+            "run_id": run_id, "workspace": workspace,
+        }))
+        self.assertIn(issue_ref, summary["summary"])
+        self.assertEqual(len(summary["decisions"]), 1)
+        self.assertEqual(len(summary["events"]), 1)
+
+        for variant, wall_time in (("baseline", 250.0), ("memory", 210.0)):
+            self._ok(mcp.record_measurement({
+                "measurement_id": "pilot-slice",
+                "sample_key": "case-1",
+                "variant": variant,
+                "workspace": workspace,
+                "run_id": run_id,
+                "issue_ref": issue_ref,
+                "wall_time_ms": wall_time,
+                "quality_score": 1.0,
+                "safety_regression": 0,
+            }))
+        measurement = self._ok(mcp.query_measurement({
+            "measurement_id": "pilot-slice", "workspace": workspace,
+        }))
+        self.assertEqual(measurement["paired_samples"], 1)
+        self.assertEqual(measurement["status"], "not_claimed")
+
+
 class AnchorAndRuntimePolicyTest(unittest.TestCase):
     """Query-time anchors, first-input orientation, and runtime guardrails."""
 

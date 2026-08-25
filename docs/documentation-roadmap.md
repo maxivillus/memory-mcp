@@ -42,15 +42,19 @@ Excluded surfaces:
    safety boundary, public `purpose` schema, noise-only behavior, and the
    deployment smoke check.
 5. Document the v0.22 local-only boundaries: explicit-root document reads,
-   immutable context chunks, profile caps, fixed feedback signals, bounded
-   retention, and additive entity normalization.
+  immutable context chunks, profile caps, fixed feedback signals, bounded
+  retention, and additive entity normalization.
+6. Document and test the issue-shaped pilot composition: strict code evidence,
+   bounded context, typed handoff, read-only context mapping, run summary, and
+   aggregate paired measurement without workflow authority. The contract is
+   recorded in ADR-0007 and exercised with synthetic data.
 
 ## Verification record
 
 The refresh passed internal Markdown path checks, project skill structure
 checks, `git diff --check`, and the local Python checks:
 
-- `MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -q` — 149 tests;
+- `MEMORY_MIGRATE_SRC=. python3 -m unittest discover -s tests -q` — 157 tests;
 - `python3 -m unittest -q test_memory_mcp` — 78 tests; and
 - `python3 -m py_compile memory_mcp.py extract.py verify.py recall.py embeddings.py`.
 - Public stdio JSON-RPC smoke — `tools/list`, focused `compose_recall`,
@@ -59,6 +63,9 @@ checks, `git diff --check`, and the local Python checks:
   --output json` — exit 0; one expected warning notes that the project-local
   package has no global `registry-manifest.json`.
 - JSON examples in `docs/ingestion-and-provenance.md` parse successfully.
+- `IssueShapedPilotTest` — one temporary-repository, temporary-database
+  vertical slice covering evidence, context, handoff, anchor mapping, run
+  summary, and `not_claimed` paired measurement state.
 
 No `.doc-state.json` manifest is created because documentation-health telemetry
 was not requested; this roadmap is the reviewable scope record for this pass.

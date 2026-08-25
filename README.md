@@ -71,6 +71,16 @@ fail-closed. Memory never authorizes registry writes, route selection, lock
 validity, or hash acceptance. Those decisions must use current Multica state
 and local lock/hash checks.
 
+### Issue-shaped pilot
+
+[`docs/pilot-workflow.md`](docs/pilot-workflow.md) describes the supported
+synthetic pilot composition: issue-bound run, strict code evidence, bounded
+context, typed handoff, read-only anchor/context lookup, run summary, and
+paired baseline/memory measurements. It composes existing tools and does not
+change workflow state or add a separate code graph. The default measurement
+result remains `status: "not_claimed"` until ten complete pairs are available
+for human/PM review.
+
 `attach_evidence` accepts optional code-local fields (`repo`, `ref`, `path`,
 `symbol`, line/column range, `selected_text` or its SHA-256, and
 `resolution_status`). `get_provenance` and `backup_workspace` retain these
