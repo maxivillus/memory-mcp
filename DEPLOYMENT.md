@@ -118,6 +118,13 @@ profiles only select bounded defaults; `balanced` remains the default and all
 retrieval stays advisory. A profile cannot authorize writes, routes, locks,
 hashes, or safety-critical operations.
 
+For v0.23 admission and retrieval handling, clients may pass
+`admission: "strict"` to `remember_fact` or `absorb`. Strict candidates need
+bounded `evidence[].selected_text`; the snippet is checked transiently and
+only its hash/metadata is stored. Rejected candidates are not written. Empty
+retrieval responses keep `result_status: "empty"` and add typed
+`retrieval_outcome: "abstained"`, `abstention_reason`, and `remedy` fields.
+
 For a local document, first preview it with `commit:false` (or omit `commit`):
 
 ```json
