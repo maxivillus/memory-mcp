@@ -25,6 +25,9 @@ canonical local data plane.
 2. Use deterministic, offset-addressable `chunk_fact` pages and optional
    chunks on `search_facts`, with independent item, page, and aggregate limits.
    This preserves existing ranking while preventing an unbounded fact response.
+   Direct fact input is capped at 16,000 characters by default, and normal
+   search also clips legacy oversized rows with an explicit truncation marker.
+   Complete text remains available through the bounded page/provenance paths.
 3. Extend evidence additively with repository, immutable ref, path, symbol,
    line/column range, selected-text hash, and resolution status. Store the
    selected-text hash instead of the raw snippet.

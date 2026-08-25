@@ -11,7 +11,9 @@ and injection are client-side by default; optional server-side modules
 ## Tools
 
 - `remember_fact {text, source?, project?, domain?, category?, trust?, strong?, admission?, evidence?}` —
-  upsert (dedup by sha256 of text). Category auto-assigned at write time
+  upsert (dedup by sha256 of text). Text is capped at
+  `MEMORY_MCP_FACT_MAX_TEXT_CHARS` (default 16000 characters); oversized input is
+  rejected before it reaches SQLite. Category auto-assigned at write time
   (explicit `category` > legacy `domain` > keyword rules > uncategorized).
   `admission: "strict"` requires bounded evidence text and stores only its
   hash/metadata; failed admission returns a typed rejection without writing.
@@ -28,6 +30,9 @@ and injection are client-side by default; optional server-side modules
   search when `MEMORY_MCP_EMBEDDINGS=1`; its eligibility filters match
   `search_facts`, and it cannot authorize safety-critical operations.
 - `chunk_fact {id | fact_id | sha256, workspace?, chunk_chars?, chunk_overlap?, start_chunk?, max_chunks?}` — read one active fact through a bounded page API
+- `export_rdf {limit?, workspace?}` — export complete Turtle records; `limit`
+  counts source records rather than output lines and `truncated` reports whether
+  more records exist.
 - `list_facts {project?, domain?, category?, limit?}` — recent non-archived facts
 - `summarize_index {project?, domain?, category?, trust_min?, strong_only?, limit?, max_chars?}` —
   compact one-line-per-fact index (`#id trust! [category] [domain] text`), freshest first,
@@ -313,6 +318,10 @@ extracted candidate memories:
   character offsets, optional overlap, pagination, and a 64 KiB aggregate
   chunk budget. This keeps retrieval usable for long facts without changing
   BM25 or semantic ranking.
+- Normal `search_facts` and `search_semantic` hits cap legacy fact text at the
+  same 16000-character limit. A clipped legacy row carries
+  `text_truncated: true` and its original `text_length`; use `chunk_fact` or
+  `get_provenance` when a complete fact is required.
 - Evidence anchors are additive and migration-safe. A code-local record can
   point to a repository, immutable ref, path, symbol, line/column range, and
   selected-text hash, with `resolved`, `stale`, or `unresolved` status.
@@ -610,6 +619,9 @@ v0.22 additions (additive — existing stores migrate in place):
   docker runtimes → `/opt/memory-shared/facts.db`.
 - `MEMORY_MCP_CONTEXT_MAX_BYTES` — maximum UTF-8 payload size per context
   (default 16 MiB).
+- `MEMORY_MCP_FACT_MAX_TEXT_CHARS` — maximum fact text accepted by
+  `remember_fact` and returned by normal fact search (default 16000). The
+  legacy `MEMORY_MCP_ABSORB_MAX_TEXT_CHARS` cap cannot exceed this value.
 - `MEMORY_MCP_CONTEXT_READ_CHARS` — default `read_context` slice size
   (default 4000).
 - `MEMORY_MCP_CONTEXT_MAX_READ_CHARS` — hard maximum `read_context` slice
