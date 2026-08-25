@@ -94,6 +94,91 @@ class MemoryMCPTest(unittest.TestCase):
         })
         self.assertEqual(over_limit["code"], "profile_limit_exceeded")
 
+    def test_strict_admission_requires_grounded_evidence_without_storing_text(self):
+        accepted = mcp.remember_fact({
+            "text": "the worker stores retry counters in SQLite",
+            "source": "run/strict-admission",
+            "admission": "strict",
+            "evidence": {
+                "source_ref": "run/strict-admission#evidence-1",
+                "selected_text": "The worker stores retry counters in SQLite for recovery.",
+                "path": "src/worker.py",
+                "start_line": 10,
+                "end_line": 12,
+            },
+            "workspace": "strict-admission",
+        })
+        self.assertNotIn("error", accepted, accepted)
+        self.assertEqual(accepted["admission"]["status"], "accepted")
+        self.assertEqual(accepted["admission"]["evidence_attached"], 1)
+        provenance = mcp.get_provenance({
+            "fact_id": accepted["id"], "workspace": "strict-admission",
+        })
+        self.assertNotIn("error", provenance, provenance)
+        self.assertNotIn("selected_text", provenance["evidence"][0])
+        self.assertEqual(len(provenance["evidence"][0]["selected_text_hash"]), 64)
+
+        rejected = mcp.remember_fact({
+            "text": "the worker stores retry counters in Redis",
+            "source": "run/strict-admission",
+            "admission": "strict",
+            "evidence": {
+                "source_ref": "run/strict-admission#evidence-2",
+                "selected_text": "The worker renders a status page.",
+            },
+            "workspace": "strict-admission",
+        })
+        self.assertEqual(rejected["result_status"], "rejected")
+        self.assertEqual(rejected["code"], "evidence_not_grounded")
+        self.assertEqual(
+            mcp.search_facts({
+                "query": "retry counters Redis",
+                "workspace": "strict-admission",
+            })["count"], 0)
+
+    def test_absorb_strict_admission_is_preview_first_and_typed(self):
+        item = {
+            "text": "the scheduler stores a bounded retry counter",
+            "source": "run/strict-batch",
+            "evidence": {
+                "source_ref": "run/strict-batch#evidence-1",
+                "selected_text": "The scheduler stores a bounded retry counter in SQLite.",
+            },
+        }
+        preview = mcp.absorb({
+            "facts": [item], "workspace": "strict-batch", "admission": "strict",
+        })
+        self.assertEqual(preview["result_status"], "preview")
+        self.assertEqual(preview["items"][0]["admission"]["status"], "accepted")
+        self.assertEqual(
+            mcp.search_facts({
+                "query": "scheduler bounded retry counter",
+                "workspace": "strict-batch",
+            })["count"], 0)
+
+        committed = mcp.absorb({
+            "facts": [item], "workspace": "strict-batch", "admission": "strict",
+            "commit": True,
+        })
+        self.assertEqual(committed["result_status"], "committed")
+        self.assertEqual(committed["created"], 1)
+        self.assertEqual(committed["evidence_attached"], 1)
+
+    def test_empty_search_reports_typed_abstention(self):
+        empty = mcp.search_facts({
+            "query": "unseen bounded retrieval marker", "workspace": "abstain-ws",
+        })
+        self.assertEqual(empty["result_status"], "empty")
+        self.assertEqual(empty["retrieval_outcome"], "abstained")
+        self.assertEqual(empty["abstention_reason"], "no_matching_facts")
+        self.assertEqual(empty["remedy"], "broaden_query_or_absorb_evidence")
+
+        no_terms = mcp.search_facts({
+            "query": "the and", "workspace": "abstain-ws",
+        })
+        self.assertEqual(no_terms["retrieval_outcome"], "abstained")
+        self.assertEqual(no_terms["abstention_reason"], "no_searchable_terms")
+
     def test_feedback_is_idempotent_and_aggregate_only(self):
         first = mcp.record_feedback({
             "feedback_id": "feedback-profile-1",

@@ -10,8 +10,8 @@ description: >-
   paired measurements — via the
   memory-mcp MCP tools (shared SQLite+FTS5 store).
 metadata:
-  author: reasonix
-  version: "1.7"
+  author: local-maintainers
+  version: "1.8"
 ---
 
 # Shared Agent Memory (memory-mcp)
@@ -51,12 +51,19 @@ session is visible to every later session.
   search actions and return a non-blocking warning after the threshold (three
   by default); `action: "memory"` resets the counter.
 
-- `remember_fact {text, source?, project?, domain?, category?, trust?, strong?}` —
+- `remember_fact {text, source?, project?, domain?, category?, trust?, strong?, admission?, evidence?}` —
   store a durable fact (upsert, dedup by sha256 within a workspace). Use `strong=true` for
   user-confirmed facts, `trust=high` for verified facts, default `medium`.
   Category is auto-assigned at write time: explicit `category` arg > legacy
   `domain` > keyword rules; unmatched facts stay uncategorized until
   `categorize_pending` (LLM batch) refines them.
+- `admission: "strict"` is an opt-in evidence-shape check for `remember_fact`
+  and `absorb`. It requires an evidence object with a bounded `selected_text`
+  snippet whose content terms occur in the claim's order. The snippet is used
+  transiently, then discarded; only the evidence hash and bounded metadata are
+  stored. A failed check returns `result_status: "rejected"` and a stable
+  reason code without creating a fact. Strict admission does not make a fact
+  authoritative, raise trust, set `strong`, or bypass human confirmation.
 - **Library flow (v0.10): never read memory as one dump.** Tier 1 —
   `list_categories {query?}`: the card catalog (topics with fact counts).
   Tier 2 — `search_index {query, category?, max_chars?}`: the shelf — short
@@ -93,13 +100,26 @@ session is visible to every later session.
 - `orientation` is the smallest context; `implementation`, `review`, and
   `incident` enable bounded graph expansion; `balanced` keeps the broad legacy
   limit. Successful retrieval responses include `profile` and
-  `result_status: "ok" | "empty"`.
+  `result_status: "ok" | "empty"`. Empty results also include
+  `retrieval_outcome: "abstained"`, an `abstention_reason`, and a bounded
+  `remedy`; absence is not treated as proof that a fact does not exist.
 - The `purpose: "safety_critical"` fail-closed boundary is unchanged. A
   profile never authorizes a route, write, lock, hash, gate, or acceptance.
 
+## Typed retrieval abstention
+
+- Treat `retrieval_outcome: "matched"` as a candidate-set signal, not a truth
+  verdict. Treat `retrieval_outcome: "abstained"` as an explicit request to
+  stop claiming absence and follow the returned remedy.
+- `no_matching_facts` recommends broadening the query or adding reviewed
+  evidence. `no_searchable_terms` recommends a more specific query. Decision
+  lookup uses the analogous decision-specific reason code.
+- The fields are additive and keep the legacy `result_status` values for
+  clients that only understand `ok` and `empty`.
+
 ## Safe ingestion — absorb
 
-- Use `absorb {facts, workspace?, dry_run?, commit?, verify?}` when a client
+- Use `absorb {facts, workspace?, dry_run?, commit?, verify?, admission?}` when a client
   already has candidate fact text and needs a bounded write boundary.
 - Preview is the default. Each candidate is classified as `new`, `duplicate`,
   or `related`; exact SHA-256 duplicates are no-ops, lexical near-duplicates
@@ -114,6 +134,12 @@ session is visible to every later session.
 - A batch contains at most 50 candidates and each candidate is capped at
   16,000 characters by default. Keep `workspace` exact and never put secrets
   in text, source references, or opaque metadata.
+- With `admission: "strict"`, each candidate must carry evidence text that
+  deterministically contains the claim's ordered content terms. Candidates
+  that fail are classified as `rejected`/`reject`, are never written, and
+  include `admission.code` plus a remediation hint. Accepted strict candidates
+  attach their evidence in the same fact transaction; raw evidence text is
+  never returned or persisted.
 
 Recommended flow: search the workspace, call `absorb` without `commit`, inspect
 `items` and candidate ids, then call the same batch with `commit:true` only for
@@ -357,8 +383,10 @@ flag value is off. Turn the flag off to return to the previous response path.
   `path`, optional `symbol`, line/column range, and `resolution_status`.
   `resolution_status` is `resolved`, `stale`, or `unresolved`; an anchor with
   no explicit status defaults to `unresolved`.
-- `selected_text` is accepted only to calculate a SHA-256 anchor. The raw
-  snippet is not stored; use `selected_text_hash` for later comparison.
+- `selected_text` is accepted only to calculate a SHA-256 anchor. In strict
+  admission it is also checked transiently against the claim's ordered content
+  terms. The raw snippet is never stored or returned; use `selected_text_hash`
+  for later comparison.
 - The anchor fields are additive and migration-safe. Keep `source_ref`
   stable, and treat stale/unresolved anchors as evidence requiring refresh,
   not as proof that the current code still matches.

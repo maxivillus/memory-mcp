@@ -1,6 +1,6 @@
 # Ingestion, bounded retrieval, and code-local provenance
 
-This document is the operational contract for the v0.16, v0.17, v0.19, v0.20, and v0.22 additions to the
+This document is the operational contract for the v0.16, v0.17, v0.19, v0.20, v0.22, and v0.23 additions to the
 local `memory-mcp` server. The canonical behavior is implemented in
 `memory_mcp.py` and covered by `tests/test_memory_mcp.py`; this document keeps
 the client-facing flow concise.
@@ -23,6 +23,9 @@ and SQLite store:
   context chunks; and
 - `record_feedback` / `query_feedback` retain aggregate usage signals without
   storing raw queries or free-text notes.
+- `admission: "strict"` validates candidate claims against bounded evidence
+  text before a fact write, and typed retrieval outcomes distinguish an empty
+  result from a claim that no fact exists.
 
 No UI, cloud synchronization service, separate code graph, or other external
 product is required or introduced by these operations. Existing optional
@@ -51,9 +54,17 @@ Omitting `profile` preserves the existing `balanced` behavior. Explicit
 `limit` values above the selected maximum are rejected with
 `code: "profile_limit_exceeded"`; invalid names are rejected with
 `code: "invalid_retrieval_profile"`. Successful retrieval responses include
-`profile` and `result_status: "ok" | "empty"`. The advisory-only safety
+`profile` and `result_status: "ok" | "empty"`. Empty results also include
+`retrieval_outcome: "abstained"`, `abstention_reason`, and a bounded `remedy`.
+The advisory-only safety
 boundary remains unchanged: a profile never authorizes a write, route, lock,
 hash, or safety-critical action.
+
+`retrieval_outcome: "matched"` means only that candidates were returned. An
+`abstained` response means the server declines to infer absence. Use
+`no_matching_facts` with `broaden_query_or_absorb_evidence`, or
+`no_searchable_terms` with `provide_specific_query_terms`, as the next-step
+hint. Decision lookup uses the corresponding decision-specific codes.
 
 ## Local document adapter
 
@@ -176,6 +187,21 @@ objects per candidate. A candidate needs either `source_ref` or at least one
 of `repo`, `ref`, or `path` to form one; the source reference and anchor fields
 are bounded by the server's evidence field limit.
 
+### Strict admission
+
+Pass `admission: "strict"` at the batch level or on an individual fact when a
+candidate must carry a deterministic evidence check. Each strict candidate
+needs at least one evidence object with `selected_text`; the snippet must
+contain the claim's non-stopword terms in their original order. The check is
+bounded and transient. The server stores only the resulting selected-text
+hash and structured evidence metadata, never the raw snippet.
+
+An accepted candidate reports `admission.status: "accepted"`. A failed
+candidate is classified as `rejected` with `action: "reject"`, a stable
+`admission.code`, and a remediation hint. It is never written, including when
+the request uses `commit:true`. Strict admission is an evidence-shape guard;
+it does not set trust, `strong`, confirmation, or workflow authority.
+
 Recommended sequence:
 
 1. Search the exact workspace for existing facts.
@@ -272,11 +298,12 @@ fields:
 }
 ```
 
-`selected_text` is used only to compute a SHA-256 value. The raw snippet is
-not stored; `get_provenance` returns `selected_text_hash` instead. Allowed
-statuses are `resolved`, `stale`, and `unresolved`; an anchor without an
-explicit status defaults to `unresolved`. A stale or unresolved anchor is a
-signal to refresh evidence, not proof that the current source still matches.
+`selected_text` is used transiently to compute a SHA-256 value and, in strict
+admission, to check ordered claim terms. The raw snippet is never stored;
+`get_provenance` returns `selected_text_hash` instead. Allowed statuses are
+`resolved`, `stale`, and `unresolved`; an anchor without an explicit status
+defaults to `unresolved`. A stale or unresolved anchor is a signal to refresh
+evidence, not proof that the current source still matches.
 
 The schema migration is additive. Existing evidence remains readable, and
 existing stores do not need a destructive migration or a new dependency.

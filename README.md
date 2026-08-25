@@ -1,24 +1,26 @@
 # memory-mcp
 
 Shared fact-memory MCP server (stdio, JSON-RPC 2.0, newline-delimited) for
-reasonix / jcode / codex runtimes. SQLite + FTS5 storage; one fact store
-shared across the host and docker runtimes via bind-mount.
+local runtimes. SQLite + FTS5 storage; one fact store can be shared across
+processes through an explicitly configured database path.
 
-Replaces the per-runtime memory storage with a single searchable store.
-Extraction/gating/injection are client-side by default (reasonix memory
-patches); optional server-side modules (extract/recall/verify) move the same
-pipeline into the server for runtimes that have no client patches.
+Provides one searchable store for configured processes. Extraction, gating,
+and injection are client-side by default; optional server-side modules
+(`extract`, `recall`, and `verify`) can be enabled explicitly.
 
 ## Tools
 
-- `remember_fact {text, source?, project?, domain?, category?, trust?, strong?}` —
+- `remember_fact {text, source?, project?, domain?, category?, trust?, strong?, admission?, evidence?}` —
   upsert (dedup by sha256 of text). Category auto-assigned at write time
   (explicit `category` > legacy `domain` > keyword rules > uncategorized).
+  `admission: "strict"` requires bounded evidence text and stores only its
+  hash/metadata; failed admission returns a typed rejection without writing.
   `add_fact` is an alias for the same operation.
-- `absorb {facts, workspace?, dry_run?, commit?, verify?}` — bounded batch
+- `absorb {facts, workspace?, dry_run?, commit?, verify?, admission?}` — bounded batch
   ingestion with `new` / `duplicate` / `related` classification. Preview is
   the default; `commit:true` only writes `new` items and leaves related,
-  update, and contradiction candidates for review.
+  update, and contradiction candidates for review. Strict candidates require
+  `evidence[].selected_text`; raw evidence text is never stored or returned.
 - `search_facts {query, limit?, profile?, trust_min?, strong_only?, project?, domain?, category?, valid_at?, workspace?, chunk_chars?, purpose?}` —
   advisory FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors.
   `chunk_chars?` optionally adds bounded, offset-addressable chunks to hits.
@@ -76,7 +78,9 @@ permissions: `balanced` (default), `orientation`, `implementation`, `review`,
 and `incident`. They only choose a default limit, optional graph expansion, and
 for `compose_recall` a character budget; explicit limits are still capped by
 the selected profile. Results add `profile` and `result_status` (`ok` or
-`empty`) while keeping retrieval advisory-only.
+`empty`) while keeping retrieval advisory-only. Empty results also expose a
+typed `retrieval_outcome: "abstained"`, reason code, and bounded remedy;
+absence is never treated as proof.
 
 ### v0.6 — database & workspace management (2026-08-17)
 
@@ -472,6 +476,30 @@ The operational contract and threat notes are in
 [`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md), and
 the architecture boundary is recorded in
 [`docs/decisions/ADR-0005-bounded-local-retrieval-and-feedback.md`](docs/decisions/ADR-0005-bounded-local-retrieval-and-feedback.md).
+
+### v0.23 — strict evidence admission and typed abstention (2026-08-25)
+
+This release adds two opt-in, dependency-free safety seams while preserving
+the advisory retrieval boundary:
+
+- **Strict evidence admission**: `remember_fact` and `absorb` accept
+  `admission: "strict"`. A candidate must provide bounded `selected_text`
+  whose content terms occur in the claim's order, plus a source reference or
+  anchor. The snippet is consumed only for the check; the store keeps its
+  SHA-256 and structured evidence metadata, never the raw snippet. Rejected
+  candidates return a stable code/remedy and do not create a fact. Strict
+  admission does not raise trust, set `strong`, or establish authority.
+- **Typed retrieval abstention**: empty `search_facts`, semantic search,
+  precedent lookup, and optional recall responses expose
+  `retrieval_outcome: "abstained"`, a reason code, and a bounded remedy while
+  retaining legacy `result_status: "empty"`. Clients must not turn an empty
+  result into an absence claim.
+- The public MCP server reports `serverInfo.version = 0.23.0`.
+
+The operational contract is documented in
+[`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md), and
+the decision boundary is recorded in
+[`docs/decisions/ADR-0006-strict-admission-and-typed-abstention.md`](docs/decisions/ADR-0006-strict-admission-and-typed-abstention.md).
 
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 

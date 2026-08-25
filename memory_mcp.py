@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""memory-mcp — shared fact memory for reasonix/jcode/codex runtimes (v0.22, 2026-08-25).
+"""memory-mcp — shared fact memory for local runtimes (v0.23, 2026-08-25).
 
 Stdio MCP server (JSON-RPC 2.0, newline-delimited), SQLite + FTS5 storage.
-Replaces the storage layer of the reasonix memory patches with a shared,
-searchable fact store; extraction/gating/injection stay client-side.
+Provides a shared, searchable fact store; optional extraction, recall, and
+verification remain client-controlled or explicitly enabled.
 
 Schema: text, sha256 (workspace-scoped dedup), source, project, domain, trust
 (high|medium|low), strong (bool), created_at, updated_at, archived (soft delete).
 
 Tools:
-  remember_fact {text, source?, project?, domain?, trust?, strong?}
+  remember_fact {text, source?, project?, domain?, trust?, strong?, admission?, evidence?}
   search_facts  {query, limit?, trust_min?, strong_only?, project?, domain?}
   list_facts    {project?, domain?, limit?}
   summarize_index {project?, domain?, trust_min?, strong_only?, limit?, max_chars?}
@@ -47,6 +47,7 @@ Tools:
   auto_orient {turn_text, session_id?, workspace?}
   search_guard {session_id, action, threshold?, workspace?}
   -- v0.22 bounded profiles, local documents, feedback, entity normalization --
+  -- v0.23 strict evidence admission and typed retrieval abstention --
   ingest_document {root, path, workspace, name?, chunk_chars?, max_bytes?, ttl_seconds?, commit?}
   record_feedback {feedback_id, site, item_type, item_ref, signal, workspace, query_hash?}
   query_feedback {workspace, site?, limit?}
@@ -63,7 +64,7 @@ Tools:
   get_provenance {fact_id | sha256}
   attach_evidence {fact_id, source_ref, source_checksum?, fetched_at?, repo?, ref?, path?, symbol?, line range?}
   chunk_fact {id | sha256, workspace?, chunk_chars?, start_chunk?, max_chunks?, chunk_overlap?}
-  absorb {facts, workspace?, dry_run?, commit?, verify?}
+  absorb {facts, workspace?, dry_run?, commit?, verify?, admission?}
   detect_conflicts {text}
 """
 import base64
@@ -129,6 +130,7 @@ _ABSORB_MAX_TEXT_CHARS = _env_int("MEMORY_MCP_ABSORB_MAX_TEXT_CHARS", 16000, 1)
 _EVIDENCE_MAX_FIELD_CHARS = _env_int("MEMORY_MCP_EVIDENCE_MAX_FIELD_CHARS", 2048, 1)
 _ADMISSION_TRACE_MAX_REFS = _env_int(
     "MEMORY_MCP_ADMISSION_TRACE_MAX_REFS", 20, 1)
+_ADMISSION_MODES = ("advisory", "strict")
 
 # v0.13 lifecycle capture and typed handoffs. These limits keep the local
 # event spool useful between short runtime sessions without turning it into an
@@ -4149,6 +4151,18 @@ def _profile_result(result, profile):
     return result
 
 
+def _retrieval_metadata(count, no_match_code="no_matching_facts",
+                        remedy="broaden_query_or_absorb_evidence"):
+    """Return a bounded, typed outcome without treating absence as proof."""
+    if int(count or 0) > 0:
+        return {"retrieval_outcome": "matched"}
+    return {
+        "retrieval_outcome": "abstained",
+        "abstention_reason": no_match_code,
+        "remedy": remedy,
+    }
+
+
 def ingest_turn(args):
     m = _mod("extract", "MEMORY_MCP_EXTRACT")
     if m is None:
@@ -4400,19 +4414,62 @@ def _categorize_fact(con, args, text, workspace):
     return _resolve_category(con, cat, workspace)
 
 
+def _normalize_admission(value):
+    """Normalize the optional evidence-admission mode."""
+    if value is None:
+        return "advisory", None
+    if not isinstance(value, str):
+        return None, {"error": "admission must be a string",
+                      "code": "invalid_admission_mode"}
+    mode = value.strip().lower()
+    if mode not in _ADMISSION_MODES:
+        return None, {"error": "admission must be advisory or strict",
+                      "code": "invalid_admission_mode"}
+    return mode, None
+
+
 def remember_fact(args):
     text = (args.get("text") or "").strip()
     if not text:
         return {"error": "text is required"}
+    source = args.get("source") or ""
+    if not isinstance(source, str):
+        return {"error": "source must be a string"}
+    source = source.strip()
     trust = args.get("trust", "medium")
     if trust not in VALID_TRUST:
         return {"error": f"trust must be one of {VALID_TRUST}"}
+    admission, admission_error = _normalize_admission(args.get("admission"))
+    if admission_error:
+        return admission_error
+    if "evidence" in args and admission != "strict":
+        return {"error": "evidence requires admission='strict'",
+                "code": "admission_mode_required"}
+    evidence = []
+    admission_result = None
+    if admission == "strict":
+        evidence, evidence_error = _absorb_evidence_items(
+            {"evidence": args.get("evidence")},
+            fallback_source="")
+        if evidence_error and source and "requires source_ref" in evidence_error["error"]:
+            evidence, evidence_error = _absorb_evidence_items(
+                {"evidence": args.get("evidence")},
+                fallback_source=source)
+        if evidence_error:
+            return {"error": evidence_error["error"],
+                    "code": "invalid_evidence"}
+        admission_result = _strict_admission_verdict(text, evidence)
+        if admission_result["status"] != "accepted":
+            return {"result_status": "rejected",
+                    "code": admission_result["code"],
+                    "admission": admission_result,
+                    "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
     importance = _importance(args)
     workspace = _workspace(args)
     sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     ts = now()
     warning = ""
-    if not (args.get("source") or "").strip():
+    if not source:
         warning = "no source provided; add source=repo@commit/issue/run for provenance"
     if not workspace:
         warning = (warning + "; " if warning else "") + \
@@ -4445,11 +4502,26 @@ def remember_fact(args):
                     (args.get("category") or "").strip() or (args.get("domain") or "").strip()):
                 sets.append("category_id=?")
                 params.append(cat_id)
-            con.execute("UPDATE facts SET %s WHERE id=?" % ", ".join(sets),
-                        params + [row["id"]])
-            con.commit()
+            try:
+                con.execute("UPDATE facts SET %s WHERE id=?" % ", ".join(sets),
+                            params + [row["id"]])
+                evidence_attached = 0
+                if admission == "strict":
+                    evidence_attached = _insert_evidence_rows(con, row["id"], evidence)
+                con.commit()
+            except (sqlite3.Error, ValueError):
+                if admission == "strict":
+                    con.rollback()
+                    return {"result_status": "rejected",
+                            "code": "admission_commit_failed",
+                            "admission": dict(admission_result),
+                            "sha256": sha}
+                raise
             out = {"id": row["id"], "sha256": sha, "dedup": True,
                    "created_at": row["created_at"], "updated_at": ts}
+            if admission == "strict":
+                out["admission"] = dict(admission_result)
+                out["admission"]["evidence_attached"] = evidence_attached
             if warning:
                 out["warning"] = warning
             return out
@@ -4459,13 +4531,28 @@ def remember_fact(args):
             (sha, text, args.get("source", ""), args.get("project", ""),
              args.get("domain", ""), trust, 1 if args.get("strong") else 0,
              importance, workspace, ts, ts, cat_id))
-        con.commit()
+        try:
+            evidence_attached = 0
+            if admission == "strict":
+                evidence_attached = _insert_evidence_rows(con, cur.lastrowid, evidence)
+            con.commit()
+        except (sqlite3.Error, ValueError):
+            if admission == "strict":
+                con.rollback()
+                return {"result_status": "rejected",
+                        "code": "admission_commit_failed",
+                        "admission": dict(admission_result),
+                        "sha256": sha}
+            raise
         fid = cur.lastrowid
         emb = _emb()
         if emb is not None:
             emb.embed_fact(con, fid, text)  # best-effort, never raises
         out = {"id": fid, "sha256": sha, "dedup": False,
                "created_at": ts, "updated_at": ts}
+        if admission == "strict":
+            out["admission"] = dict(admission_result)
+            out["admission"]["evidence_attached"] = evidence_attached
         if warning:
             out["warning"] = warning
         return out
@@ -4535,6 +4622,16 @@ def _absorb_evidence_items(item, fallback_source=""):
         if len(source_ref) > _EVIDENCE_MAX_FIELD_CHARS:
             return None, {"error": "evidence[%d].source_ref is too long" % index}
         normalized["source_ref"] = source_ref
+        for name in ("source_checksum", "fetched_at"):
+            value = normalized.get(name, "") or ""
+            if not isinstance(value, str):
+                return None, {"error": "evidence[%d].%s must be a string" %
+                               (index, name)}
+            value = value.strip()
+            if len(value) > _EVIDENCE_MAX_FIELD_CHARS:
+                return None, {"error": "evidence[%d].%s is too long" %
+                               (index, name)}
+            normalized[name] = value
         _, anchor_err = _evidence_anchor_fields(normalized)
         if anchor_err:
             return None, {"error": "evidence[%d]: %s" %
@@ -4543,6 +4640,63 @@ def _absorb_evidence_items(item, fallback_source=""):
     if fallback_source and not any(e["source_ref"] == fallback_source for e in evidence):
         evidence.insert(0, {"source_ref": fallback_source})
     return evidence, None
+
+
+def _strict_admission_verdict(text, evidence):
+    """Check that bounded evidence text carries the claim's ordered terms.
+
+    This is an evidence-shape guard, not a truth or authority decision. The
+    supplied snippet is used transiently and is never returned or persisted.
+    """
+    if not evidence:
+        return {
+            "status": "rejected",
+            "code": "evidence_required",
+            "remedy": "attach_evidence_with_selected_text",
+        }
+    claim_terms = fts_terms(text)
+    if not claim_terms:
+        return {
+            "status": "rejected",
+            "code": "claim_has_no_searchable_terms",
+            "remedy": "rewrite_claim_with_specific_content_terms",
+        }
+    has_text = False
+    for index, item in enumerate(evidence):
+        selected_text = item.get("selected_text")
+        if not isinstance(selected_text, str) or not selected_text.strip():
+            continue
+        has_text = True
+        evidence_terms = fts_terms(selected_text)
+        if not evidence_terms:
+            continue
+        cursor = 0
+        ordered = True
+        for term in claim_terms:
+            try:
+                cursor = evidence_terms.index(term, cursor) + 1
+            except ValueError:
+                ordered = False
+                break
+        if ordered:
+            return {
+                "status": "accepted",
+                "code": "evidence_grounded",
+                "grounding": "ordered_content_terms",
+                "evidence_index": index,
+                "matched_terms": len(claim_terms),
+            }
+    if not has_text:
+        return {
+            "status": "rejected",
+            "code": "evidence_text_required",
+            "remedy": "add_selected_text_to_an_evidence_object",
+        }
+    return {
+        "status": "rejected",
+        "code": "evidence_not_grounded",
+        "remedy": "provide_selected_text_containing_claim_terms_in_order",
+    }
 
 
 def _admission_reason_code(exact, candidates, verify_requested, verdict,
@@ -4603,9 +4757,14 @@ def absorb(args):
         return {"error": "verification is disabled (set MEMORY_MCP_VERIFY=1)"}
 
     workspace = _workspace(args)
+    default_admission, admission_error = _normalize_admission(args.get("admission"))
+    if admission_error:
+        return admission_error
     defaults = {key: args[key] for key in (
-        "source", "project", "domain", "category", "trust", "strong", "importance")
+        "source", "project", "domain", "category", "trust", "strong", "importance",
+        "admission")
         if key in args}
+    defaults.setdefault("admission", default_admission)
     normalized = []
     for index, raw in enumerate(raw_facts):
         if isinstance(raw, str):
@@ -4631,7 +4790,8 @@ def absorb(args):
                     (index, _ABSORB_MAX_TEXT_CHARS)}
         fact_args = dict(defaults)
         fact_args.update({key: item[key] for key in (
-            "source", "project", "domain", "category", "trust", "strong", "importance")
+            "source", "project", "domain", "category", "trust", "strong", "importance",
+            "admission")
             if key in item})
         fact_args["text"] = text
         for name in ("source", "project", "domain", "category"):
@@ -4645,10 +4805,26 @@ def absorb(args):
         fallback_source = fact_args.get("source") or ""
         if not isinstance(fallback_source, str):
             return {"error": "facts[%d].source must be a string" % index}
-        evidence, evidence_err = _absorb_evidence_items(item, fallback_source=fallback_source.strip())
+        admission, admission_error = _normalize_admission(fact_args.get("admission"))
+        if admission_error:
+            return {"error": "facts[%d]: %s" % (index, admission_error["error"]),
+                    "code": admission_error["code"]}
+        fact_args["admission"] = admission
+        evidence, evidence_err = _absorb_evidence_items(
+            item, fallback_source="" if admission == "strict" else fallback_source.strip())
+        if evidence_err and admission == "strict" and fallback_source.strip() and \
+                "requires source_ref" in evidence_err["error"]:
+            evidence, evidence_err = _absorb_evidence_items(
+                item, fallback_source=fallback_source.strip())
         if evidence_err:
             return {"error": "facts[%d]: %s" % (index, evidence_err["error"])}
-        normalized.append({"args": fact_args, "text": text, "evidence": evidence})
+        admission_result = None
+        if admission == "strict":
+            admission_result = _strict_admission_verdict(text, evidence)
+            fact_args["evidence"] = evidence
+        normalized.append({"args": fact_args, "text": text, "evidence": evidence,
+                           "admission": admission,
+                           "admission_result": admission_result})
 
     con = get_db()
     planned = []
@@ -4659,6 +4835,19 @@ def absorb(args):
         for index, item in enumerate(normalized):
             text = item["text"]
             sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if item["admission_result"] and item["admission_result"]["status"] != "accepted":
+                out = {
+                    "index": index,
+                    "sha256": sha,
+                    "text_preview": text[:300],
+                    "classification": "rejected",
+                    "action": "reject",
+                    "candidate_ids": [],
+                    "evidence_count": len(item["evidence"]),
+                    "admission": item["admission_result"],
+                }
+                planned.append({"out": out, "item": item, "existing_id": None})
+                continue
             exact = con.execute(
                 "SELECT id, archived, invalid_at, lifecycle FROM facts WHERE sha256=?" +
                 _ws_check("facts", workspace),
@@ -4699,6 +4888,8 @@ def absorb(args):
                 "candidate_ids": [row["id"] for row in candidates],
                 "evidence_count": len(item["evidence"]),
             }
+            if item["admission_result"]:
+                out["admission"] = dict(item["admission_result"])
             if exact:
                 out["existing_id"] = exact["id"]
             if candidates:
@@ -4742,10 +4933,17 @@ def absorb(args):
         "deduped": 0,
         "pending_review": sum(1 for entry in planned
                                if entry["out"]["action"] == "review"),
+        "rejected": sum(1 for entry in planned
+                         if entry["out"]["action"] == "reject"),
+        "admission": "strict" if any(item["admission"] == "strict"
+                                      for item in normalized) else "advisory",
         "evidence_attached": 0,
         "items": [entry["out"] for entry in planned],
     }
     if not commit:
+        result["result_status"] = (
+            "rejected" if result["rejected"] == result["count"] else
+            ("partial" if result["rejected"] else "preview"))
         return result
 
     evidence_errors = []
@@ -4753,8 +4951,17 @@ def absorb(args):
         out = entry["out"]
         item = entry["item"]
         fid = entry["existing_id"]
+        if out["classification"] == "rejected":
+            continue
         if out["classification"] == "new":
             stored = remember_fact(item["args"])
+            if item["admission"] == "strict" and stored.get("result_status") == "rejected":
+                out["classification"] = "rejected"
+                out["action"] = "reject"
+                out["code"] = stored.get("code", "admission_commit_failed")
+                out["admission"] = stored.get("admission", out.get("admission", {}))
+                result["rejected"] += 1
+                continue
             if "error" in stored:
                 out["error"] = stored["error"]
                 continue
@@ -4766,11 +4973,20 @@ def absorb(args):
                 result["deduped"] += 1
             else:
                 result["created"] += 1
+            if item["admission"] == "strict" and stored.get("admission"):
+                out["admission"] = stored["admission"]
+                result["evidence_attached"] += stored["admission"].get(
+                    "evidence_attached", 0)
         elif out["classification"] == "duplicate":
             result["deduped"] += 1
         else:
             continue
-        for evidence in item["evidence"]:
+        # Strict new facts attach evidence in the same transaction as the fact.
+        # Duplicates still use the normal idempotent evidence-link path.
+        evidence_items = [] if (
+            item["admission"] == "strict" and out["classification"] == "new"
+        ) else item["evidence"]
+        for evidence in evidence_items:
             attach_args = dict(evidence)
             attach_args["fact_id"] = fid
             if workspace:
@@ -4782,6 +4998,9 @@ def absorb(args):
             elif not attached.get("dedup"):
                 result["evidence_attached"] += 1
     result["committed"] = True
+    result["result_status"] = (
+        "rejected" if result["rejected"] == result["count"] else
+        ("partial" if result["rejected"] else "committed"))
     if evidence_errors:
         result["evidence_errors"] = evidence_errors
     return result
@@ -4831,6 +5050,16 @@ def search_facts(args):
     filters, err = _fact_search_filters(args, ws)
     if err:
         return err
+    if not fts_terms(query):
+        result = {"count": 0, "facts": [],
+                  "memory_policy": "advisory_only",
+                  "safety_critical_allowed": False,
+                  "profile": profile,
+                  "result_status": "empty"}
+        result.update(_retrieval_metadata(
+            0, "no_searchable_terms", "provide_specific_query_terms"))
+        _record_access(ws, "search_facts", query, 0, time.monotonic() - t0)
+        return result
     sql = ("SELECT f.id, f.text, f.source, f.project, f.domain, f.trust, f.strong, "
            "f.importance, f.confirmed, f.invalid_at, f.created_at, "
            "c.name AS category, bm25(facts_fts) AS rank "
@@ -4905,6 +5134,7 @@ def search_facts(args):
                   "safety_critical_allowed": False,
                   "profile": profile,
                   "result_status": "ok" if rows else "empty"}
+        result.update(_retrieval_metadata(len(rows)))
         if args.get("graph"):
             result["graph"] = len(graph)
         _record_access(ws, "search_facts", query, len(rows), time.monotonic() - t0)
@@ -4955,6 +5185,7 @@ def search_semantic(args):
             res["safety_critical_allowed"] = False
             res["profile"] = profile
             res["result_status"] = "ok" if rows else "empty"
+            res.update(_retrieval_metadata(len(rows)))
         _record_access(ws, "search_semantic", query, len(rows), time.monotonic() - t0)
         return res
     finally:
@@ -5481,8 +5712,11 @@ def find_precedents(args):
     t0 = time.monotonic()
     terms = fts_terms(scenario)
     if not terms:
-        return {"error": "scenario has no searchable terms", "count": 0, "precedents": [],
-                "profile": profile, "result_status": "empty"}
+        result = {"error": "scenario has no searchable terms", "count": 0,
+                  "precedents": [], "profile": profile, "result_status": "empty"}
+        result.update(_retrieval_metadata(
+            0, "no_searchable_terms", "provide_specific_scenario_terms"))
+        return result
     limit, err = _bounded_int_arg(args, "limit", 10, 1, 50)
     if err:
         return err
@@ -5535,12 +5769,15 @@ def find_precedents(args):
                     pass
         _record_access(ws, "find_precedents", scenario, len(rows),
                        time.monotonic() - t0)
-        return {"count": len(rows), "precedents": rows,
-                "semantic": bool(args.get("semantic")),
-                "memory_policy": "advisory_only",
-                "safety_critical_allowed": False,
-                "profile": profile,
-                "result_status": "ok" if rows else "empty"}
+        result = {"count": len(rows), "precedents": rows,
+                  "semantic": bool(args.get("semantic")),
+                  "memory_policy": "advisory_only",
+                  "safety_critical_allowed": False,
+                  "profile": profile,
+                  "result_status": "ok" if rows else "empty"}
+        result.update(_retrieval_metadata(len(rows), "no_matching_decisions",
+                                          "broaden_scenario_or_record_decision"))
+        return result
     except sqlite3.OperationalError as e:
         return {"error": f"query failed: {e}", "count": 0, "precedents": []}
     finally:
@@ -5670,6 +5907,28 @@ def get_provenance(args):
         return {"fact": dict(fact), "evidence": evidence}
     finally:
         con.close()
+
+
+def _insert_evidence_rows(con, fact_id, evidence):
+    """Insert normalized evidence rows inside the caller's transaction."""
+    attached = 0
+    for item in evidence:
+        anchor, err = _evidence_anchor_fields(item)
+        if err:
+            raise ValueError(err["error"])
+        cur = con.execute(
+            "INSERT OR IGNORE INTO evidence (fact_id, source_ref, source_checksum, fetched_at, "
+            "repo, ref, path, symbol, start_line, start_col, end_line, end_col, "
+            "selected_text_hash, resolution_status, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (fact_id, item["source_ref"], item.get("source_checksum", ""),
+             item.get("fetched_at", ""), anchor["repo"], anchor["ref"],
+             anchor["path"], anchor["symbol"], anchor["start_line"],
+             anchor["start_col"], anchor["end_line"], anchor["end_col"],
+             anchor["selected_text_hash"], anchor["resolution_status"], now()))
+        if cur.rowcount:
+            attached += 1
+    return attached
 
 
 def attach_evidence(args):
@@ -6602,7 +6861,7 @@ TOOLS = {
     # guess the name) but is intentionally NOT advertised in the schema —
     # aliases would add tool-choice noise for every client.
     "remember_fact": {
-        "description": "Store a durable fact (upsert, dedup by sha256 of text).",
+        "description": "Store a durable fact (upsert, dedup by sha256 of text). admission='strict' requires bounded evidence text and stores only its hash/metadata.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -6614,6 +6873,8 @@ TOOLS = {
                 "trust": {"type": "string", "enum": list(VALID_TRUST), "default": "medium"},
                 "strong": {"type": "boolean", "default": False},
                 "importance": {"type": "number", "default": 0.5, "description": "0..1 value of the fact for retention"},
+                "admission": {"type": "string", "enum": list(_ADMISSION_MODES), "default": "advisory", "description": "strict requires evidence text to carry the claim's ordered content terms; it is not a truth or authority signal"},
+                "evidence": {"type": ["object", "array"], "description": "Evidence metadata; strict mode requires selected_text, which is hashed and never stored"},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
             },
             "required": ["text"],
@@ -6638,8 +6899,9 @@ TOOLS = {
                                 "trust": {"type": "string", "enum": list(VALID_TRUST)},
                                 "strong": {"type": "boolean"},
                                 "importance": {"type": "number"},
+                                "admission": {"type": "string", "enum": list(_ADMISSION_MODES)},
                                 "workspace": {"type": "string"},
-                                "evidence": {"type": ["object", "array"]},
+                                "evidence": {"type": ["object", "array"], "description": "Strict mode requires selected_text; raw text is never stored"},
                             }, "required": ["text"]},
                         ],
                     },
@@ -6652,6 +6914,7 @@ TOOLS = {
                 "trust": {"type": "string", "enum": list(VALID_TRUST)},
                 "strong": {"type": "boolean"},
                 "importance": {"type": "number"},
+                "admission": {"type": "string", "enum": list(_ADMISSION_MODES), "default": "advisory"},
                 "workspace": {"type": "string", "description": "Project scope id; the whole batch stays in one scope"},
                 "dry_run": {"type": "boolean", "default": True},
                 "commit": {"type": "boolean", "default": False, "description": "Explicitly apply only items classified as new"},
@@ -7747,7 +8010,7 @@ def main():
                 "result": {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "memory-mcp", "version": "0.22.0"},
+                    "serverInfo": {"name": "memory-mcp", "version": "0.23.0"},
                 },
             }
         elif method == "tools/list":

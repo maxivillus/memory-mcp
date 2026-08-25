@@ -123,7 +123,14 @@ def compose_recall(args):
     ws = (args.get("workspace") or "").strip()
     terms = fts_terms(turn_text)
     if not terms:
-        return {"error": "no searchable terms", "count": 0, "block": ""}
+        return {
+            "error": "no searchable terms",
+            "count": 0,
+            "block": "",
+            "retrieval_outcome": "abstained",
+            "abstention_reason": "no_searchable_terms",
+            "remedy": "provide_specific_turn_terms",
+        }
     # OR-joined like find_precedents: recall is about similarity, so a fact
     # sharing any distinctive term is a candidate; RRF ranks the overlap.
     query = " OR ".join(terms)
@@ -202,13 +209,22 @@ def compose_recall(args):
             used += len(entry)
     out.append(_CLOSE)
     block = "".join(out)
-    return {"count": len(hits), "authoritative": len(authoritative),
+    result = {"count": len(hits), "authoritative": len(authoritative),
             "background": len(background), "graph": len(graph),
             "session_expanded": len(session_expanded),
             "chars": len(block), "block": block,
             "query_mode": query_mode,
             "memory_policy": "advisory_only",
             "safety_critical_allowed": False}
+    if hits:
+        result["retrieval_outcome"] = "matched"
+    else:
+        result.update({
+            "retrieval_outcome": "abstained",
+            "abstention_reason": "no_matching_facts",
+            "remedy": "broaden_turn_or_absorb_evidence",
+        })
+    return result
 
 
 def _entry(f):
