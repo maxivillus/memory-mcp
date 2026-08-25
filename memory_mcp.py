@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""memory-mcp — shared fact memory for reasonix/jcode/codex runtimes (Phase 1, 2026-08-15).
+"""memory-mcp — shared fact memory for reasonix/jcode/codex runtimes (v0.22, 2026-08-25).
 
 Stdio MCP server (JSON-RPC 2.0, newline-delimited), SQLite + FTS5 storage.
 Replaces the storage layer of the reasonix memory patches with a shared,
@@ -46,6 +46,11 @@ Tools:
   -- v0.21 opt-in bounded repository context and admission explainability --
   auto_orient {turn_text, session_id?, workspace?}
   search_guard {session_id, action, threshold?, workspace?}
+  -- v0.22 bounded profiles, local documents, feedback, entity normalization --
+  ingest_document {root, path, workspace, name?, chunk_chars?, max_bytes?, ttl_seconds?, commit?}
+  record_feedback {feedback_id, site, item_type, item_ref, signal, workspace, query_hash?}
+  query_feedback {workspace, site?, limit?}
+  search_facts/search_semantic/compose_recall/find_precedents {profile?}
   -- v0.3 graph/decisions/provenance --
   remember_entity {name, type?, aliases?}
   remember_relation {subject, predicate, object, source_fact_id?}
@@ -63,6 +68,7 @@ Tools:
 """
 import base64
 import fnmatch, hashlib, json, math, os, re, signal, sqlite3, sys, tempfile, threading, time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 def default_db_path():
@@ -168,6 +174,50 @@ _CONTEXT_MAP_MAX_RESULTS = _env_int("MEMORY_MCP_CONTEXT_MAP_MAX_RESULTS", 100, 1
 _CONTEXT_MAP_VIEWS = ("orientation", "api", "callers", "dependents", "impact")
 _CONTEXT_MAP_RELATIONS = ("node", "caller", "callee", "dependent")
 
+# v0.22 role-aware retrieval is an opt-in response-shaping layer. Profiles
+# only set bounded defaults; they never change memory's advisory authority.
+_RETRIEVAL_PROFILES = {
+    "balanced": {"default_limit": 20, "max_limit": 100, "default_graph": False,
+                 "default_chars": 0},
+    "orientation": {"default_limit": 6, "max_limit": 6, "default_graph": False,
+                     "default_chars": 1400},
+    "implementation": {"default_limit": 12, "max_limit": 20, "default_graph": True,
+                        "default_chars": 2200},
+    "review": {"default_limit": 16, "max_limit": 30, "default_graph": True,
+                "default_chars": 3000},
+    "incident": {"default_limit": 16, "max_limit": 30, "default_graph": True,
+                  "default_chars": 2200},
+}
+_DEFAULT_RETRIEVAL_PROFILE = "balanced"
+
+# v0.22 local document adapter. It reads only an explicit relative path under
+# an explicit caller-supplied root, and writes immutable context chunks only
+# after commit:true.
+_DOCUMENT_DEFAULT_MAX_BYTES = _env_int(
+    "MEMORY_MCP_DOCUMENT_MAX_BYTES", 4 * 1024 * 1024, 1)
+_DOCUMENT_MAX_BYTES = _env_int(
+    "MEMORY_MCP_DOCUMENT_MAX_ALLOWED_BYTES", 16 * 1024 * 1024, 1)
+_DOCUMENT_DEFAULT_CHUNK_CHARS = _env_int(
+    "MEMORY_MCP_DOCUMENT_CHUNK_CHARS", 4000, 256)
+_DOCUMENT_MAX_CHUNKS = _env_int("MEMORY_MCP_DOCUMENT_MAX_CHUNKS", 256, 1)
+_DOCUMENT_EXCLUDED_GLOBS = (
+    ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx",
+    "*.crt", "*.cer", "*.der", "id_rsa*", "credentials*", "secrets*",
+    "*.sqlite", "*.sqlite3", "*.db", "*.db-*", "*.bak", "*.zip", "*.gz",
+    "*.tar", "*.tgz", "*.7z", "*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif",
+    "*.ico", "*.pdf",
+)
+_DOCUMENT_EXCLUDED_DIR_NAMES = frozenset({
+    "credentials", "credential", "secrets", "secret", "certs", "certificates",
+    "keys", "private_keys", ".ssh",
+})
+
+# v0.22 aggregate usage feedback. No free-text note is accepted or stored.
+_FEEDBACK_MAX_FIELD_CHARS = _env_int("MEMORY_MCP_FEEDBACK_MAX_FIELD_CHARS", 256, 1)
+_FEEDBACK_MAX_EVENTS = _env_int("MEMORY_MCP_FEEDBACK_MAX_EVENTS", 5000, 1)
+_FEEDBACK_SIGNALS = ("helpful", "not_helpful", "stale", "irrelevant", "unsafe")
+_FEEDBACK_ITEM_TYPES = ("fact", "decision", "context", "precedent", "recall")
+
 # v0.20 aggregate-only paired measurement. The observation table deliberately
 # has no free-text or payload column; every accepted value is a bounded number
 # or an opaque, length-limited reference.
@@ -241,6 +291,7 @@ _ENTITIES_TABLE_DDL = """
 CREATE TABLE entities_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
+  canonical_name TEXT NOT NULL DEFAULT '',
   type TEXT NOT NULL DEFAULT '',
   aliases TEXT NOT NULL DEFAULT '',
   workspace_id TEXT NOT NULL DEFAULT '',
@@ -343,6 +394,7 @@ END;
 CREATE TABLE IF NOT EXISTS entities (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
+  canonical_name TEXT NOT NULL DEFAULT '',
   type TEXT NOT NULL DEFAULT '',
   aliases TEXT NOT NULL DEFAULT '',
   workspace_id TEXT NOT NULL DEFAULT '',
@@ -557,6 +609,23 @@ CREATE TABLE IF NOT EXISTS memory_access_events (
 CREATE INDEX IF NOT EXISTS access_events_workspace_idx
   ON memory_access_events(workspace_id, created_at, id);
 
+-- v0.22: aggregate usage feedback. The item reference is opaque and the
+-- query is represented only by a SHA-256, never by source text.
+CREATE TABLE IF NOT EXISTS memory_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  feedback_id TEXT NOT NULL,
+  site TEXT NOT NULL,
+  item_type TEXT NOT NULL CHECK (item_type IN ('fact','decision','context','precedent','recall')),
+  item_ref TEXT NOT NULL,
+  signal TEXT NOT NULL CHECK (signal IN ('helpful','not_helpful','stale','irrelevant','unsafe')),
+  query_hash TEXT NOT NULL DEFAULT '',
+  workspace_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(workspace_id, feedback_id)
+);
+CREATE INDEX IF NOT EXISTS feedback_workspace_idx
+  ON memory_feedback(workspace_id, created_at, id);
+
 -- v0.20 (2026-08-24): aggregate-only paired measurement observations.
 -- No prompt, retrieved payload, comment, diff, or other free-text payload is
 -- accepted by the public handler or represented in this table.
@@ -691,6 +760,8 @@ def _open_db(path):
     _migrate_categories(con)
     _migrate_decisions_anchors(con)
     _migrate_measurements(con)
+    _migrate_entity_normalization(con)
+    _migrate_feedback(con)
     return con
 
 
@@ -738,6 +809,46 @@ def _migrate_measurements(con):
     con.execute(
         "CREATE INDEX IF NOT EXISTS measurement_workspace_idx "
         "ON measurement_observations(workspace_id, measurement_id, sample_key, id)")
+    con.commit()
+
+
+def _canonical_entity_name(value):
+    """Return a stable lookup key without changing the stored display name."""
+    if not isinstance(value, str):
+        return ""
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = " ".join(normalized.split())
+    return normalized.casefold()
+
+
+def _display_entity_name(value):
+    if not isinstance(value, str):
+        return ""
+    normalized = unicodedata.normalize("NFKC", value)
+    return " ".join(normalized.split())
+
+
+def _migrate_entity_normalization(con):
+    """Add the additive canonical lookup key used by entity resolution."""
+    existing = {r["name"] for r in con.execute("PRAGMA table_info(entities)")}
+    if "canonical_name" not in existing:
+        con.execute("ALTER TABLE entities ADD COLUMN canonical_name TEXT NOT NULL DEFAULT ''")
+    rows = con.execute("SELECT id, name, canonical_name FROM entities").fetchall()
+    for row in rows:
+        canonical = _canonical_entity_name(row["name"])
+        if row["canonical_name"] != canonical:
+            con.execute("UPDATE entities SET canonical_name=? WHERE id=?", [canonical, row["id"]])
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS entities_canonical_ws_idx "
+        "ON entities(canonical_name, workspace_id)")
+    con.commit()
+
+
+def _migrate_feedback(con):
+    """Keep the v0.22 feedback retention index present on old stores."""
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS feedback_workspace_idx "
+        "ON memory_feedback(workspace_id, created_at, id)")
     con.commit()
 
 
@@ -822,8 +933,8 @@ def _migrate_entities(con):
         "PRAGMA foreign_keys=OFF;\n"
         "BEGIN;\n"
         + _ENTITIES_TABLE_DDL + "\n"
-        "INSERT INTO entities_new (id, name, type, aliases, workspace_id, created_at, updated_at) "
-        "SELECT id, name, type, aliases, workspace_id, created_at, updated_at FROM entities;\n"
+        "INSERT INTO entities_new (id, name, canonical_name, type, aliases, workspace_id, created_at, updated_at) "
+        "SELECT id, name, '', type, aliases, workspace_id, created_at, updated_at FROM entities;\n"
         "DROP TABLE entities;\n"
         "ALTER TABLE entities_new RENAME TO entities;\n"
         "COMMIT;\n"
@@ -1863,6 +1974,146 @@ def _record_access(ws, site, query, result_count, latency_ms):
             con.close()
     except Exception:
         pass
+
+
+def _feedback_field(args, name, required=True):
+    value = args.get(name, "")
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        return None, {"error": "%s must be a string" % name}
+    value = value.strip()
+    if required and not value:
+        return None, {"error": "%s is required" % name}
+    if len(value) > _FEEDBACK_MAX_FIELD_CHARS:
+        return None, {"error": "%s is too long" % name}
+    return value, None
+
+
+def _feedback_metadata(row):
+    return {
+        "feedback_id": row["feedback_id"],
+        "site": row["site"],
+        "item_type": row["item_type"],
+        "item_ref": row["item_ref"],
+        "signal": row["signal"],
+        "query_hash": row["query_hash"],
+        "workspace": row["workspace_id"],
+        "created_at": row["created_at"],
+    }
+
+
+def record_feedback(args):
+    """Record one bounded, aggregate usage signal with retry-safe identity."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    feedback_id, err = _feedback_field(args, "feedback_id")
+    if err:
+        return err
+    site, err = _feedback_field(args, "site")
+    if err:
+        return err
+    item_ref, err = _feedback_field(args, "item_ref")
+    if err:
+        return err
+    item_type, err = _feedback_field(args, "item_type")
+    if err:
+        return err
+    if item_type not in _FEEDBACK_ITEM_TYPES:
+        return {"error": "item_type must be one of %s" % (_FEEDBACK_ITEM_TYPES,),
+                "code": "invalid_feedback_item_type"}
+    signal_name, err = _feedback_field(args, "signal")
+    if err:
+        return err
+    if signal_name not in _FEEDBACK_SIGNALS:
+        return {"error": "signal must be one of %s" % (_FEEDBACK_SIGNALS,),
+                "code": "invalid_feedback_signal"}
+    query_hash, err = _feedback_field(args, "query_hash", required=False)
+    if err:
+        return err
+    if query_hash and (len(query_hash) != 64 or
+                       any(ch not in "0123456789abcdefABCDEF" for ch in query_hash)):
+        return {"error": "query_hash must be a SHA-256 hex string",
+                "code": "invalid_feedback_query_hash"}
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        con.execute("BEGIN IMMEDIATE")
+        existing = con.execute(
+            "SELECT * FROM memory_feedback WHERE workspace_id=? AND feedback_id=?",
+            [workspace, feedback_id]).fetchone()
+        if existing:
+            same = all(existing[key] == value for key, value in (
+                ("site", site), ("item_type", item_type), ("item_ref", item_ref),
+                ("signal", signal_name), ("query_hash", query_hash)))
+            con.rollback()
+            if not same:
+                return {"error": "feedback_id already records different data",
+                        "code": "feedback_id_conflict"}
+            return {"accepted": True, "duplicate": True,
+                    "result_status": "duplicate",
+                    "feedback": _feedback_metadata(existing)}
+        created_at = now()
+        con.execute(
+            "INSERT INTO memory_feedback (feedback_id, site, item_type, item_ref, signal, "
+            "query_hash, workspace_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (feedback_id, site, item_type, item_ref, signal_name, query_hash,
+             workspace, created_at))
+        con.execute(
+            "DELETE FROM memory_feedback WHERE workspace_id=? AND id NOT IN "
+            "(SELECT id FROM memory_feedback WHERE workspace_id=? "
+            " ORDER BY created_at DESC, id DESC LIMIT ?)",
+            (workspace, workspace, _FEEDBACK_MAX_EVENTS))
+        con.commit()
+        row = con.execute(
+            "SELECT * FROM memory_feedback WHERE workspace_id=? AND feedback_id=?",
+            [workspace, feedback_id]).fetchone()
+        return {"accepted": True, "duplicate": False, "result_status": "recorded",
+                "feedback": _feedback_metadata(row)}
+    except sqlite3.DatabaseError as exc:
+        con.rollback()
+        return {"error": f"feedback write failed: {exc}"}
+    finally:
+        con.close()
+
+
+def query_feedback(args):
+    """Return bounded feedback metadata and signal counts for one workspace."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    limit, err = _context_limit(args.get("limit"), "limit", 100, 200)
+    if err:
+        return err
+    site, err = _feedback_field(args, "site", required=False)
+    if err:
+        return err
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        where = "workspace_id=?"
+        params = [workspace]
+        if site:
+            where += " AND site=?"
+            params.append(site)
+        rows = con.execute(
+            "SELECT * FROM memory_feedback WHERE " + where +
+            " ORDER BY created_at DESC, id DESC LIMIT ?", params + [limit]).fetchall()
+        signal_rows = con.execute(
+            "SELECT signal, COUNT(*) AS n FROM memory_feedback WHERE " + where +
+            " GROUP BY signal ORDER BY signal", params).fetchall()
+        signals = {signal_name: 0 for signal_name in _FEEDBACK_SIGNALS}
+        signals.update({row["signal"]: row["n"] for row in signal_rows})
+        return {"count": len(rows), "signals": signals,
+                "feedback": [_feedback_metadata(row) for row in rows],
+                "result_status": "ok" if rows else "empty"}
+    finally:
+        con.close()
 
 
 def _like_escape(value):
@@ -2974,6 +3225,173 @@ def context_map(args):
     return result
 
 
+def _document_file(root, relative_path):
+    """Resolve one UTF-8 document without allowing root or symlink escape."""
+    if not isinstance(root, str) or not root.strip():
+        return None, {"error": "root is required", "code": "document_root_required"}
+    if not isinstance(relative_path, str) or not relative_path.strip():
+        return None, {"error": "path is required", "code": "document_path_required"}
+    root = os.path.realpath(os.path.abspath(root.strip()))
+    if not os.path.isdir(root):
+        return None, {"error": "root is not a readable directory", "code": "document_root_invalid"}
+    relative_path = relative_path.strip().replace("\\", "/")
+    if os.path.isabs(relative_path):
+        return None, {"error": "path must be relative to root", "code": "path_outside_root"}
+    normalized = os.path.normpath(relative_path).replace(os.sep, "/")
+    if normalized in ("", ".") or normalized == ".." or normalized.startswith("../"):
+        return None, {"error": "path must stay inside root", "code": "path_outside_root"}
+    parts = normalized.split("/")
+    if any(part in _ANCHOR_EXCLUDED_DIRS or part.casefold() in _DOCUMENT_EXCLUDED_DIR_NAMES
+           for part in parts):
+        return None, {"error": "path is excluded from local document capture",
+                      "code": "document_path_excluded"}
+    basename = os.path.basename(normalized)
+    if any(fnmatch.fnmatch(basename, pattern) for pattern in _DOCUMENT_EXCLUDED_GLOBS):
+        return None, {"error": "path is excluded from local document capture",
+                      "code": "document_path_excluded"}
+    candidate = os.path.realpath(os.path.join(root, normalized))
+    try:
+        inside = os.path.commonpath([root, candidate]) == root
+    except ValueError:
+        inside = False
+    if not inside:
+        return None, {"error": "path must stay inside root", "code": "path_outside_root"}
+    if not os.path.isfile(candidate):
+        return None, {"error": "document file was not found", "code": "document_not_found"}
+    try:
+        size = os.path.getsize(candidate)
+        if size > _DOCUMENT_MAX_BYTES:
+            return None, {"error": "document exceeds the maximum supported size",
+                          "code": "document_too_large"}
+        with open(candidate, "rb") as handle:
+            raw = handle.read(_DOCUMENT_MAX_BYTES + 1)
+    except (OSError, ValueError):
+        return None, {"error": "document file could not be read", "code": "document_unreadable"}
+    if len(raw) > _DOCUMENT_MAX_BYTES:
+        return None, {"error": "document exceeds the maximum supported size",
+                      "code": "document_too_large"}
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, {"error": "document must be UTF-8 text", "code": "document_not_text"}
+    return {
+        "root": root,
+        "path": normalized,
+        "content": content,
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }, None
+
+
+def ingest_document(args):
+    """Preview or commit one local UTF-8 document as immutable context chunks."""
+    workspace, err = _context_scope(args)
+    if err:
+        return err
+    document, err = _document_file(args.get("root"), args.get("path"))
+    if err:
+        return err
+    chunk_chars, err = _context_limit(
+        args.get("chunk_chars"), "chunk_chars", _DOCUMENT_DEFAULT_CHUNK_CHARS,
+        _CONTEXT_MAX_READ_CHARS)
+    if err:
+        return err
+    if chunk_chars < 256:
+        return {"error": "chunk_chars must be at least 256", "code": "invalid_document_chunk_size"}
+    max_bytes, err = _context_limit(
+        args.get("max_bytes"), "max_bytes", _DOCUMENT_DEFAULT_MAX_BYTES,
+        _DOCUMENT_MAX_BYTES)
+    if err:
+        return err
+    if document["bytes"] > max_bytes:
+        return {"error": "document exceeds max_bytes", "code": "document_too_large",
+                "max_bytes": max_bytes}
+    chunks = _split_fact_text(document["content"], chunk_chars)
+    if not chunks:
+        return {"error": "document is empty", "code": "document_empty"}
+    if len(chunks) > _DOCUMENT_MAX_CHUNKS:
+        return {"error": "document has too many chunks", "code": "document_too_many_chunks",
+                "max_chunks": _DOCUMENT_MAX_CHUNKS}
+    expires_at = ""
+    if args.get("ttl_seconds") is not None:
+        expires_at, err = _context_expiry(args.get("ttl_seconds"), maximum=_HANDOFF_MAX_TTL)
+        if err:
+            return err
+    document_name = (args.get("name") or "document:" + document["path"]).strip()
+    if not document_name:
+        return {"error": "name must not be empty"}
+    if len(document_name) > 128:
+        return {"error": "name must be at most 128 characters"}
+    source_prefix = "local-document:%s@%s:chars=%d" % (
+        document["path"], document["sha256"], chunk_chars)
+    base = {
+        "path": document["path"],
+        "sha256": document["sha256"],
+        "bytes": document["bytes"],
+        "chunks": len(chunks),
+        "chunk_chars": chunk_chars,
+        "source": source_prefix,
+    }
+    if args.get("commit") is not True:
+        return {"committed": False, "duplicate": False, "document": base,
+                "chunks": len(chunks), "refs": [], "result_status": "preview"}
+
+    con = get_db()
+    try:
+        inactive = _ws_inactive_error(con, workspace)
+        if inactive:
+            return inactive
+        con.execute("BEGIN IMMEDIATE")
+        existing = con.execute(
+            "SELECT ref, name, content, schema_json, source, sha256, workspace_id, "
+            "created_at, expires_at, size_bytes FROM contexts "
+            "WHERE workspace_id=? AND source LIKE ? ORDER BY name",
+            [workspace, source_prefix + "#chunk=%"]).fetchall()
+        by_index = {}
+        for row in existing:
+            match = re.search(r"#chunk=(\d+)$", row["source"])
+            if match:
+                by_index[int(match.group(1))] = row
+        if len(by_index) == len(chunks) and all(index in by_index for index in range(len(chunks))):
+            con.rollback()
+            return {"committed": True, "duplicate": True, "document": base,
+                    "chunks": len(chunks),
+                    "refs": [by_index[index]["ref"] for index in range(len(chunks))],
+                    "result_status": "duplicate"}
+        refs = []
+        created_at = now()
+        for chunk in chunks:
+            source = source_prefix + "#chunk=%d" % chunk["index"]
+            existing_row = by_index.get(chunk["index"])
+            if existing_row and existing_row["sha256"] == hashlib.sha256(
+                    chunk["content"].encode("utf-8")).hexdigest():
+                refs.append(existing_row["ref"])
+                continue
+            schema = {
+                "kind": "local_document_chunk",
+                "version": 1,
+                "path": document["path"],
+                "document_sha256": document["sha256"],
+                "chunk_index": chunk["index"],
+                "chunk_count": len(chunks),
+            }
+            row = _insert_context_row(
+                con, name="%s#%04d" % (document_name, chunk["index"] + 1),
+                content=chunk["content"], workspace=workspace, schema=schema,
+                source=source,
+                checksum=hashlib.sha256(chunk["content"].encode("utf-8")).hexdigest(),
+                created_at=created_at, expires_at=expires_at)
+            refs.append(row["ref"])
+        con.commit()
+        return {"committed": True, "duplicate": False, "document": base,
+                "chunks": len(chunks), "refs": refs, "result_status": "ok"}
+    except sqlite3.DatabaseError as exc:
+        con.rollback()
+        return {"error": f"document write failed: {exc}"}
+    finally:
+        con.close()
+
+
 def put_context(args):
     """Store an immutable, named context artifact and optional parent refs."""
     workspace, err = _context_scope(args)
@@ -3685,6 +4103,52 @@ def _advisory_only_error(args, operation):
     return None
 
 
+def _profile_args(args, operation):
+    """Apply an explicit bounded retrieval profile without changing defaults."""
+    raw = args.get("profile", _DEFAULT_RETRIEVAL_PROFILE)
+    if not isinstance(raw, str) or not raw.strip():
+        return None, {"error": "profile must be a string", "code": "invalid_retrieval_profile"}
+    profile = raw.strip().lower()
+    config = _RETRIEVAL_PROFILES.get(profile)
+    if config is None:
+        return None, {"error": "profile must be one of %s" % (tuple(_RETRIEVAL_PROFILES),),
+                       "code": "invalid_retrieval_profile"}
+    normalized = dict(args)
+    normalized["profile"] = profile
+    if "limit" not in normalized:
+        normalized["limit"] = config["default_limit"]
+    else:
+        try:
+            requested = int(normalized["limit"])
+        except (TypeError, ValueError):
+            requested = None
+        if requested is not None and requested > config["max_limit"]:
+            return None, {
+                "error": "limit exceeds the %s profile maximum of %d" %
+                         (profile, config["max_limit"]),
+                "code": "profile_limit_exceeded",
+                "profile": profile,
+                "max_limit": config["max_limit"],
+            }
+    if operation in ("search_facts", "compose_recall") and "graph" not in normalized:
+        normalized["graph"] = config["default_graph"]
+    if operation == "compose_recall" and "chars" not in normalized:
+        if config.get("default_chars"):
+            normalized["chars"] = config["default_chars"]
+    return normalized, None
+
+
+def _profile_result(result, profile):
+    """Attach additive typed retrieval metadata to a successful result."""
+    if not isinstance(result, dict):
+        return result
+    result["profile"] = profile
+    if "result_status" not in result:
+        count = result.get("count", 0)
+        result["result_status"] = "ok" if int(count or 0) > 0 else "empty"
+    return result
+
+
 def ingest_turn(args):
     m = _mod("extract", "MEMORY_MCP_EXTRACT")
     if m is None:
@@ -3703,13 +4167,17 @@ def compose_recall(args):
     policy_error = _advisory_only_error(args, "compose_recall")
     if policy_error:
         return policy_error
+    profile_args, profile_error = _profile_args(args, "compose_recall")
+    if profile_error:
+        return profile_error
     m = _mod("recall", "MEMORY_MCP_RECALL")
     if m is None:
         return _disabled("MEMORY_MCP_RECALL")
     t0 = time.monotonic()
-    res = m.compose_recall(args)
+    res = m.compose_recall(profile_args)
     if isinstance(res, dict) and "error" not in res:
-        _record_access(_workspace(args), "compose_recall", args.get("turn_text", ""),
+        res = _profile_result(res, profile_args["profile"])
+        _record_access(_workspace(profile_args), "compose_recall", profile_args.get("turn_text", ""),
                        res.get("count", 0), time.monotonic() - t0)
     return res
 
@@ -4339,6 +4807,11 @@ def search_facts(args):
     policy_error = _advisory_only_error(args, "search_facts")
     if policy_error:
         return policy_error
+    profile_args, profile_error = _profile_args(args, "search_facts")
+    if profile_error:
+        return profile_error
+    args = profile_args
+    profile = args["profile"]
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query is required"}
@@ -4429,7 +4902,9 @@ def search_facts(args):
         _mark_hits(con, rows)
         result = {"count": len(rows), "facts": rows,
                   "memory_policy": "advisory_only",
-                  "safety_critical_allowed": False}
+                  "safety_critical_allowed": False,
+                  "profile": profile,
+                  "result_status": "ok" if rows else "empty"}
         if args.get("graph"):
             result["graph"] = len(graph)
         _record_access(ws, "search_facts", query, len(rows), time.monotonic() - t0)
@@ -4445,6 +4920,11 @@ def search_semantic(args):
     policy_error = _advisory_only_error(args, "search_semantic")
     if policy_error:
         return policy_error
+    profile_args, profile_error = _profile_args(args, "search_semantic")
+    if profile_error:
+        return profile_error
+    args = profile_args
+    profile = args["profile"]
     emb = _emb()
     if emb is None:
         return {"error": "semantic search is disabled (set MEMORY_MCP_EMBEDDINGS=1)"}
@@ -4473,6 +4953,8 @@ def search_semantic(args):
         if isinstance(res, dict):
             res["memory_policy"] = "advisory_only"
             res["safety_critical_allowed"] = False
+            res["profile"] = profile
+            res["result_status"] = "ok" if rows else "empty"
         _record_access(ws, "search_semantic", query, len(rows), time.monotonic() - t0)
         return res
     finally:
@@ -4787,24 +5269,29 @@ def categorize_pending(args):
 
 
 def _resolve_entity(con, name, etype="", aliases="", workspace=""):
-    """Get-or-create an entity by name; returns (id, created_flag). Scoped to
-    the workspace (or the shared pool)."""
+    """Get-or-create an entity by normalized name; returns (id, created_flag).
+    The display spelling is retained, while NFKC/casefold/whitespace
+    normalization makes aliases such as ``Widget  Service`` and
+    ``widget service`` resolve to one node."""
+    display_name = _display_entity_name(name)
+    canonical_name = _canonical_entity_name(display_name)
     ts = now()
-    row = con.execute("SELECT id FROM entities WHERE name=?" + _ws_check("entities", workspace),
-                      [name] + ([workspace] if workspace else [])).fetchone()
+    row = con.execute("SELECT id FROM entities WHERE canonical_name=?" +
+                      _ws_check("entities", workspace),
+                      [canonical_name] + ([workspace] if workspace else [])).fetchone()
     if row:
         con.execute("UPDATE entities SET updated_at=?, type=CASE WHEN ?<>'' THEN ? ELSE type END, "
-                    "aliases=CASE WHEN ?<>'' THEN ? ELSE aliases END WHERE id=?",
+                     "aliases=CASE WHEN ?<>'' THEN ? ELSE aliases END WHERE id=?",
                     (ts, etype, etype, aliases, aliases, row["id"]))
         return row["id"], False
-    cur = con.execute("INSERT INTO entities (name, type, aliases, workspace_id, created_at, updated_at) "
-                      "VALUES (?,?,?,?,?,?)",
-                      (name, etype, aliases, workspace, ts, ts))
+    cur = con.execute("INSERT INTO entities (name, canonical_name, type, aliases, workspace_id, created_at, updated_at) "
+                      "VALUES (?,?,?,?,?,?,?)",
+                      (display_name, canonical_name, etype, aliases, workspace, ts, ts))
     return cur.lastrowid, True
 
 
 def remember_entity(args):
-    name = (args.get("name") or "").strip()
+    name = _display_entity_name(args.get("name") or "")
     if not name:
         return {"error": "name is required"}
     con = get_db()
@@ -4824,9 +5311,9 @@ def remember_entity(args):
 
 
 def remember_relation(args):
-    subject = (args.get("subject") or "").strip()
+    subject = _display_entity_name(args.get("subject") or "")
     predicate = (args.get("predicate") or "").strip()
-    obj = (args.get("object") or "").strip()
+    obj = _display_entity_name(args.get("object") or "")
     if not subject or not predicate or not obj:
         return {"error": "subject, predicate and object are required"}
     con = get_db()
@@ -4874,8 +5361,9 @@ def search_graph(args):
         err = _ws_inactive_error(con, ws)
         if err:
             return err
-        root = con.execute("SELECT id, name, type FROM entities WHERE name=?" + _ws_check("entities", ws),
-                           [name] + ([ws] if ws else [])).fetchone()
+        root = con.execute("SELECT id, name, type FROM entities WHERE canonical_name=?" +
+                           _ws_check("entities", ws),
+                           [_canonical_entity_name(name)] + ([ws] if ws else [])).fetchone()
         if not root:
             return {"error": f"entity {name!r} not found", "nodes": [], "edges": []}
         nodes, edges, seen = {root["id"]: dict(root)}, [], {root["id"]}
@@ -4982,13 +5470,19 @@ def find_precedents(args):
     policy_error = _advisory_only_error(args, "find_precedents")
     if policy_error:
         return policy_error
+    profile_args, profile_error = _profile_args(args, "find_precedents")
+    if profile_error:
+        return profile_error
+    args = profile_args
+    profile = args["profile"]
     scenario = (args.get("scenario") or "").strip()
     if not scenario:
         return {"error": "scenario is required"}
     t0 = time.monotonic()
     terms = fts_terms(scenario)
     if not terms:
-        return {"error": "scenario has no searchable terms", "count": 0, "precedents": []}
+        return {"error": "scenario has no searchable terms", "count": 0, "precedents": [],
+                "profile": profile, "result_status": "empty"}
     limit, err = _bounded_int_arg(args, "limit", 10, 1, 50)
     if err:
         return err
@@ -5044,7 +5538,9 @@ def find_precedents(args):
         return {"count": len(rows), "precedents": rows,
                 "semantic": bool(args.get("semantic")),
                 "memory_policy": "advisory_only",
-                "safety_critical_allowed": False}
+                "safety_critical_allowed": False,
+                "profile": profile,
+                "result_status": "ok" if rows else "empty"}
     except sqlite3.OperationalError as e:
         return {"error": f"query failed: {e}", "count": 0, "precedents": []}
     finally:
@@ -5607,6 +6103,9 @@ def stats(_args=None):
             "measurements": con.execute(
                 "SELECT COUNT(*) FROM measurement_observations WHERE workspace_id=?",
                 [ws] if ws else ["__unscoped__"]).fetchone()[0],
+            "feedback": con.execute(
+                "SELECT COUNT(*) FROM memory_feedback WHERE workspace_id=?",
+                [ws] if ws else ["__unscoped__"]).fetchone()[0],
         }
         access = {"events": 0, "by_site": {}, "last_at": ""}
         try:
@@ -5859,7 +6358,8 @@ def list_workspaces(args):
              "(SELECT COUNT(*) FROM evidence e JOIN facts f ON f.id=e.fact_id WHERE f.workspace_id=w.id) AS evidence, "
              "(SELECT COUNT(*) FROM contexts c WHERE c.workspace_id=w.id) AS contexts, "
              "(SELECT COUNT(*) FROM lifecycle_events le WHERE le.workspace_id=w.id) AS lifecycle_events, "
-             "(SELECT COUNT(*) FROM handoffs h WHERE h.workspace_id=w.id) AS handoffs "
+             "(SELECT COUNT(*) FROM handoffs h WHERE h.workspace_id=w.id) AS handoffs, "
+             "(SELECT COUNT(*) FROM memory_feedback mf WHERE mf.workspace_id=w.id) AS feedback "
              "FROM workspaces w")
         params = []
         if status:
@@ -5905,6 +6405,8 @@ def _purge_workspace_rows(con, name):
     counts["context_lineage"] = cur.rowcount
     cur = con.execute("DELETE FROM contexts WHERE workspace_id=?", [name])
     counts["contexts"] = cur.rowcount
+    cur = con.execute("DELETE FROM memory_feedback WHERE workspace_id=?", [name])
+    counts["feedback"] = cur.rowcount
     return counts
 
 
@@ -6002,7 +6504,7 @@ def backup_workspace(args):
         for row in fact_embeddings:
             row["vec"] = base64.b64encode(bytes(row["vec"])).decode("ascii")
         entities = [dict(r) for r in con.execute(
-            "SELECT id, name, type, aliases, workspace_id, created_at, updated_at "
+            "SELECT id, name, canonical_name, type, aliases, workspace_id, created_at, updated_at "
             "FROM entities WHERE workspace_id=? ORDER BY id", [name])]
         relations = [dict(r) for r in con.execute(
             "SELECT id, subject_id, predicate, object_id, source_fact_id, workspace_id, created_at "
@@ -6038,6 +6540,10 @@ def backup_workspace(args):
             "shared, state, idempotency_key, created_at, expires_at, accepted_at, "
             "accepted_by, cancelled_at, cancelled_by FROM handoffs "
             "WHERE workspace_id=? ORDER BY id", [name])]
+        feedback = [dict(r) for r in con.execute(
+            "SELECT id, feedback_id, site, item_type, item_ref, signal, query_hash, "
+            "workspace_id, created_at FROM memory_feedback "
+            "WHERE workspace_id=? ORDER BY id", [name])]
         activity_days = [dict(r) for r in con.execute(
             "SELECT day FROM activity_days ORDER BY day")]
     finally:
@@ -6056,6 +6562,7 @@ def backup_workspace(args):
         "context_lineage": context_lineage,
         "lifecycle_events": lifecycle_events,
         "handoffs": handoffs,
+        "feedback": feedback,
         "workspaces": workspaces,
         "activity_days": activity_days,
     }
@@ -6183,6 +6690,23 @@ TOOLS = {
                 "workspace": {"type": "string", "description": "Required project/run access scope"},
             },
             "required": ["name", "content", "workspace"],
+        },
+    },
+    "ingest_document": {
+        "description": "Preview or commit one UTF-8 document from an explicit local root as bounded immutable workspace-scoped context chunks. The server never returns or stores the root path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string", "description": "Explicit local directory root; used only for this read"},
+                "path": {"type": "string", "description": "Repository-relative UTF-8 document path"},
+                "name": {"type": "string", "description": "Optional context name prefix"},
+                "chunk_chars": {"type": "integer", "minimum": 256, "maximum": 16000, "default": 4000},
+                "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16777216, "default": 4194304},
+                "ttl_seconds": {"type": "integer", "minimum": 0, "maximum": 604800},
+                "commit": {"type": "boolean", "default": False, "description": "Write chunks only when explicitly true"},
+                "workspace": {"type": "string", "description": "Required exact project/run access scope"},
+            },
+            "required": ["root", "path", "workspace"],
         },
     },
     "list_context": {
@@ -6552,6 +7076,7 @@ TOOLS = {
                 "chunk_chars": {"type": "integer", "minimum": 1, "maximum": 16000, "description": "Optionally add bounded chunks to each hit"},
                 "chunk_overlap": {"type": "integer", "minimum": 0, "maximum": 15999, "default": 0},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+                "profile": {"type": "string", "enum": list(_RETRIEVAL_PROFILES), "default": "balanced", "description": "Optional bounded role-aware retrieval profile"},
                 "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed; live state and lock/hash checks remain authoritative"},
             },
             "required": ["query"],
@@ -6570,6 +7095,7 @@ TOOLS = {
                 "project": {"type": "string"},
                 "domain": {"type": "string"},
                 "category": {"type": "string", "description": "Topic category filter (see list_categories)"},
+                "profile": {"type": "string", "enum": list(_RETRIEVAL_PROFILES), "default": "balanced", "description": "Optional bounded role-aware retrieval profile"},
                 "valid_at": {"type": "string", "description": "RFC3339: include facts that were still valid at that time (bi-temporal)"},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
                 "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed"},
@@ -6607,6 +7133,7 @@ TOOLS = {
                 "graph": {"type": "boolean", "default": False, "description": "Expand via the entity graph (third RRF source)"},
                 "session_expand": {"type": "integer", "default": 0, "description": "Pull up to N sibling facts from the top hits' sessions (background)"},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
+                "profile": {"type": "string", "enum": list(_RETRIEVAL_PROFILES), "default": "balanced", "description": "Optional bounded role-aware retrieval profile"},
                 "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed; memory never authorizes writes, locks, routes, or hashes"},
             },
             "required": ["turn_text"],
@@ -6887,6 +7414,7 @@ TOOLS = {
                 "category": {"type": "string"},
                 "limit": {"type": "integer", "default": 10},
                 "semantic": {"type": "boolean", "default": False},
+                "profile": {"type": "string", "enum": list(_RETRIEVAL_PROFILES), "default": "balanced", "description": "Optional bounded role-aware retrieval profile"},
                 "workspace": {"type": "string", "description": "Project scope id; scopes reads/writes to your project + shared pool"},
                 "purpose": {"type": "string", "enum": ["advisory", "safety_critical"], "default": "advisory", "description": "safety_critical is rejected fail-closed"},
             },
@@ -6961,10 +7489,30 @@ TOOLS = {
         },
     },
     "stats": {
-        "description": "Store statistics (facts, provenance, runs, aggregate measurement counts, access counts, and pull hit-rate telemetry).",
+        "description": "Store statistics (facts, provenance, runs, measurements, bounded feedback, access counts, and pull hit-rate telemetry).",
         "inputSchema": {"type": "object", "properties": {
             "workspace": {"type": "string", "description": "Project scope id; scopes the operation to your project + shared pool"},
         }},
+    },
+    "record_feedback": {
+        "description": "Record one retry-safe aggregate usage signal for a memory result. Accepts no free-text note or payload.",
+        "inputSchema": {"type": "object", "properties": {
+            "feedback_id": {"type": "string", "maxLength": 256},
+            "site": {"type": "string", "maxLength": 256},
+            "item_type": {"type": "string", "enum": list(_FEEDBACK_ITEM_TYPES)},
+            "item_ref": {"type": "string", "maxLength": 256},
+            "signal": {"type": "string", "enum": list(_FEEDBACK_SIGNALS)},
+            "query_hash": {"type": "string", "maxLength": 64, "description": "Optional SHA-256 of the query; raw query text is not accepted"},
+            "workspace": {"type": "string", "description": "Required exact project scope"},
+        }, "required": ["feedback_id", "site", "item_type", "item_ref", "signal", "workspace"]},
+    },
+    "query_feedback": {
+        "description": "Return bounded aggregate feedback counts and metadata for one exact workspace.",
+        "inputSchema": {"type": "object", "properties": {
+            "site": {"type": "string", "maxLength": 256},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
+            "workspace": {"type": "string", "description": "Required exact project scope"},
+        }, "required": ["workspace"]},
     },
     "export": {
         "description": "Export all facts (including archived) as JSON — for migration/backup.",
@@ -7075,6 +7623,7 @@ HANDLERS = {
     "absorb": absorb,
     "chunk_fact": chunk_fact,
     "put_context": put_context,
+    "ingest_document": ingest_document,
     "list_context": list_context,
     "resolve_context": resolve_context,
     "read_context": read_context,
@@ -7131,6 +7680,8 @@ HANDLERS = {
     "facts_for_session": facts_for_session,
     "list_sessions": list_sessions,
     "stats": stats,
+    "record_feedback": record_feedback,
+    "query_feedback": query_feedback,
     "export": export_facts,
     "create_database": create_database,
     "list_databases": list_databases,
@@ -7196,7 +7747,7 @@ def main():
                 "result": {
                     "protocolVersion": params.get("protocolVersion", "2024-11-05"),
                     "capabilities": {"tools": {"listChanged": False}},
-                    "serverInfo": {"name": "memory-mcp", "version": "0.21.0"},
+                    "serverInfo": {"name": "memory-mcp", "version": "0.22.0"},
                 },
             }
         elif method == "tools/list":

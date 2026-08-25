@@ -11,7 +11,9 @@ pattern applies to any runtime that can spawn a process.
 
 The v0.16 ingestion, bounded fact retrieval, and code-local provenance paths,
 plus the v0.17 focused advisory retrieval boundary, the v0.18 runs/telemetry,
-and the v0.19 live anchor checks and runtime policy helpers, run inside the existing local
+the v0.19 live anchor checks and runtime policy helpers, and the v0.22 bounded
+profiles, local document adapter, entity normalization, and feedback paths,
+run inside the existing local
 SQLite-backed server. They do not require a UI, cloud service, separate code
 graph, or another external product. The detailed request flow is in
 `docs/ingestion-and-provenance.md`; the optional runtime adapters below
@@ -109,6 +111,31 @@ or recall failures degrade to an empty advisory block. If the client exposes
 external grep/search actions, call `search_guard` with `action: "search"` and
 call it with `action: "memory"` after a memory lookup; the warning is advisory
 and never blocks a tool call.
+
+For v0.22 retrieval, clients may pass `profile: "orientation"`,
+`"implementation"`, `"review"`, or `"incident"` to the retrieval tools. The
+profiles only select bounded defaults; `balanced` remains the default and all
+retrieval stays advisory. A profile cannot authorize writes, routes, locks,
+hashes, or safety-critical operations.
+
+For a local document, first preview it with `commit:false` (or omit `commit`):
+
+```json
+{"root":"/opt/project","path":"docs/guide.md","workspace":"smoke","commit":false}
+```
+
+Then explicitly repeat with `commit:true` only after reviewing the returned
+path, byte count, document SHA-256, and chunk count. The adapter reads one
+UTF-8 relative file, rejects traversal and symlink escapes, excludes common
+secret/binary paths, stores chunks in the existing context table, and never
+stores the supplied root. Use a disposable workspace for smoke checks; do not
+point it at credentials, production databases, or private key material.
+
+Clients that display or consume retrieval results may send aggregate feedback
+with `record_feedback` and inspect it with `query_feedback`. Supply only an
+opaque item reference, a fixed signal, and optionally a SHA-256 query hash;
+raw queries, notes, and payloads are rejected. Feedback is bounded evidence,
+not an authorization or ranking signal.
 
 For the v0.13 seams, use a disposable workspace and send an event with a
 stable idempotency key, then accept a short handoff as the same owner:

@@ -68,6 +68,83 @@ class MemoryMCPTest(unittest.TestCase):
         strong = self.search("alpha core", strong_only=True)
         self.assertTrue(all(f["strong"] for f in strong))
 
+    def test_retrieval_profiles_are_bounded_and_typed(self):
+        for index in range(8):
+            self.remember("profile contract fact %d about bounded retrieval" % index)
+        result = mcp.search_facts({
+            "query": "profile contract fact bounded retrieval",
+            "profile": "orientation",
+        })
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["profile"], "orientation")
+        self.assertEqual(result["result_status"], "ok")
+        self.assertLessEqual(len(result["facts"]), 6)
+
+        empty = mcp.search_facts({
+            "query": "profile query with no matching fact",
+            "profile": "review",
+        })
+        self.assertNotIn("error", empty, empty)
+        self.assertEqual(empty["profile"], "review")
+        self.assertEqual(empty["result_status"], "empty")
+        invalid = mcp.search_facts({"query": "anything", "profile": "unknown"})
+        self.assertEqual(invalid["code"], "invalid_retrieval_profile")
+        over_limit = mcp.search_facts({
+            "query": "anything", "profile": "orientation", "limit": 7,
+        })
+        self.assertEqual(over_limit["code"], "profile_limit_exceeded")
+
+    def test_feedback_is_idempotent_and_aggregate_only(self):
+        first = mcp.record_feedback({
+            "feedback_id": "feedback-profile-1",
+            "site": "search_facts",
+            "item_type": "fact",
+            "item_ref": "fact:42",
+            "signal": "helpful",
+            "query_hash": "a" * 64,
+            "workspace": "feedback-workspace",
+        })
+        self.assertNotIn("error", first, first)
+        self.assertFalse(first["duplicate"])
+        duplicate = mcp.record_feedback({
+            "feedback_id": "feedback-profile-1",
+            "site": "search_facts",
+            "item_type": "fact",
+            "item_ref": "fact:42",
+            "signal": "helpful",
+            "query_hash": "a" * 64,
+            "workspace": "feedback-workspace",
+        })
+        self.assertTrue(duplicate["duplicate"])
+        conflict = mcp.record_feedback({
+            "feedback_id": "feedback-profile-1",
+            "site": "search_facts",
+            "item_type": "fact",
+            "item_ref": "fact:42",
+            "signal": "stale",
+            "workspace": "feedback-workspace",
+        })
+        self.assertEqual(conflict["code"], "feedback_id_conflict")
+        summary = mcp.query_feedback({"workspace": "feedback-workspace"})
+        self.assertEqual(summary["count"], 1)
+        self.assertEqual(summary["signals"]["helpful"], 1)
+        self.assertEqual(summary["feedback"][0]["query_hash"], "a" * 64)
+
+    def test_entity_names_are_unicode_and_case_normalized(self):
+        first = mcp.remember_entity({"name": "  Widget   Service ", "workspace": "entity-workspace"})
+        second = mcp.remember_entity({"name": "widget service", "workspace": "entity-workspace"})
+        self.assertEqual(first["id"], second["id"])
+        relation = mcp.remember_relation({
+            "subject": "WIDGET SERVICE",
+            "predicate": "uses",
+            "object": "Widget DB",
+            "workspace": "entity-workspace",
+        })
+        self.assertNotIn("error", relation, relation)
+        graph = mcp.search_graph({"entity": " widget service ", "workspace": "entity-workspace"})
+        self.assertNotIn("error", graph, graph)
+        self.assertTrue(any(node["name"] == "Widget DB" for node in graph["nodes"]))
+
     def test_list_and_summarize(self):
         self.remember("listable fact about the gamma module")
         lst = mcp.list_facts({"limit": 50})
@@ -389,6 +466,86 @@ class ContextArtifactTest(unittest.TestCase):
         other = mcp.search_context({"query": "needle", "workspace": "ctx-search-other"})
         self.assertEqual(other["count"], 1)
         self.assertNotEqual(other["contexts"][0]["ref"], source_ref["context"]["ref"])
+
+    def test_local_document_adapter_previews_commits_and_blocks_escape(self):
+        workspace = "local-document"
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "docs"))
+            path = os.path.join(root, "docs", "guide.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("heading\n\nlocal document retrieval contract\n" * 20)
+            preview = mcp.ingest_document({
+                "root": root,
+                "path": "docs/guide.md",
+                "workspace": workspace,
+                "chunk_chars": 256,
+            })
+            self.assertNotIn("error", preview, preview)
+            self.assertFalse(preview["committed"])
+            self.assertGreater(preview["chunks"], 1)
+            self.assertEqual(mcp.search_context({
+                "query": "local document retrieval",
+                "workspace": workspace,
+            })["count"], 0)
+            committed = mcp.ingest_document({
+                "root": root,
+                "path": "docs/guide.md",
+                "workspace": workspace,
+                "chunk_chars": 256,
+                "commit": True,
+            })
+            self.assertNotIn("error", committed, committed)
+            self.assertTrue(committed["committed"])
+            self.assertEqual(committed["result_status"], "ok")
+            self.assertEqual(len(committed["refs"]), preview["chunks"])
+            found = mcp.search_context({
+                "query": "local document retrieval",
+                "workspace": workspace,
+            })
+            self.assertGreater(found["count"], 0)
+            read = mcp.read_context({
+                "ref": committed["refs"][0],
+                "workspace": workspace,
+                "max_chars": 200,
+            })
+            self.assertIn("local document retrieval contract", read["context"]["content"])
+            duplicate = mcp.ingest_document({
+                "root": root,
+                "path": "docs/guide.md",
+                "workspace": workspace,
+                "chunk_chars": 256,
+                "commit": True,
+            })
+            self.assertTrue(duplicate["duplicate"])
+            escaped = mcp.ingest_document({
+                "root": root,
+                "path": "../outside.md",
+                "workspace": workspace,
+            })
+            self.assertEqual(escaped["code"], "path_outside_root")
+            os.makedirs(os.path.join(root, "secrets"))
+            with open(os.path.join(root, "secrets", "note.txt"), "w", encoding="utf-8") as handle:
+                handle.write("must not be captured")
+            excluded = mcp.ingest_document({
+                "root": root,
+                "path": "secrets/note.txt",
+                "workspace": workspace,
+            })
+            self.assertEqual(excluded["code"], "document_path_excluded")
+            outside_dir = tempfile.TemporaryDirectory()
+            try:
+                outside_path = os.path.join(outside_dir.name, "outside.md")
+                with open(outside_path, "w", encoding="utf-8") as handle:
+                    handle.write("outside")
+                os.symlink(outside_path, os.path.join(root, "escape.md"))
+                symlink = mcp.ingest_document({
+                    "root": root,
+                    "path": "escape.md",
+                    "workspace": workspace,
+                })
+                self.assertEqual(symlink["code"], "path_outside_root")
+            finally:
+                outside_dir.cleanup()
 
     def test_context_chunks_are_bounded_and_paginated(self):
         payload = "abcdefghij" * 3

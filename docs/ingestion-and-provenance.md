@@ -1,6 +1,6 @@
 # Ingestion, bounded retrieval, and code-local provenance
 
-This document is the operational contract for the v0.16, v0.17, v0.19, and v0.20 additions to the
+This document is the operational contract for the v0.16, v0.17, v0.19, v0.20, and v0.22 additions to the
 local `memory-mcp` server. The canonical behavior is implemented in
 `memory_mcp.py` and covered by `tests/test_memory_mcp.py`; this document keeps
 the client-facing flow concise.
@@ -17,7 +17,12 @@ and SQLite store:
 - `query_anchored` can verify those anchors against an explicitly supplied
   local repository root; and
 - `auto_orient`, `search_guard`, and `stats` provide bounded runtime policy
-  and retrieval-quality signals.
+  and retrieval-quality signals;
+- bounded retrieval profiles shape defaults for common work modes;
+- `ingest_document` imports one explicit local UTF-8 document into immutable
+  context chunks; and
+- `record_feedback` / `query_feedback` retain aggregate usage signals without
+  storing raw queries or free-text notes.
 
 No UI, cloud synchronization service, separate code graph, or other external
 product is required or introduced by these operations. Existing optional
@@ -27,6 +32,87 @@ not part of the local-only default path.
 Every fact operation should receive the exact project `workspace`. Keep source
 references, paths, idempotency keys, and payloads free of credentials or other
 secrets.
+
+## Role-aware retrieval profiles
+
+`search_facts`, `search_semantic`, `compose_recall`, and `find_precedents` accept
+an optional `profile`. The profile is a response-shaping preset, not an agent
+role, permission, or workflow decision:
+
+| Profile | Default limit | Maximum limit | Graph default | Recall character default |
+| --- | ---: | ---: | --- | ---: |
+| `balanced` | 20 | 100 | off | none |
+| `orientation` | 6 | 6 | off | 1400 |
+| `implementation` | 12 | 20 | on | 2200 |
+| `review` | 16 | 30 | on | 3000 |
+| `incident` | 16 | 30 | on | 2200 |
+
+Omitting `profile` preserves the existing `balanced` behavior. Explicit
+`limit` values above the selected maximum are rejected with
+`code: "profile_limit_exceeded"`; invalid names are rejected with
+`code: "invalid_retrieval_profile"`. Successful retrieval responses include
+`profile` and `result_status: "ok" | "empty"`. The advisory-only safety
+boundary remains unchanged: a profile never authorizes a write, route, lock,
+hash, or safety-critical action.
+
+## Local document adapter
+
+`ingest_document` is a deliberately narrow bridge from a caller's checkout to
+the existing immutable context store. It accepts:
+
+```json
+{
+  "root": "/explicit/local/root",
+  "path": "docs/guide.md",
+  "workspace": "project-id",
+  "name": "guide",
+  "chunk_chars": 4000,
+  "max_bytes": 4194304,
+  "ttl_seconds": 86400,
+  "commit": false
+}
+```
+
+The default is a preview. The server resolves only a relative path under the
+supplied root, canonicalizes it to block traversal and symlink escapes, reads
+UTF-8 bytes within the size cap, and returns metadata (path, byte count,
+document SHA-256, chunk count) without returning document content or the root.
+Common secret, certificate/key, database, archive, image, and PDF paths are
+excluded. `commit:true` writes each bounded chunk through the normal immutable
+context path; each chunk records a relative path, document SHA-256, chunk
+index/count, and optional expiration. Repeating the same document hash and
+chunk size is idempotent. A changed file creates a new set of refs and never
+overwrites prior context.
+
+The adapter is local-only: it does not crawl a directory, follow an external
+repository, invoke a parser or model, or persist the supplied root. Callers
+must review the preview before committing and must treat chunk content as data,
+not executable instructions.
+
+## Aggregate usage feedback
+
+`record_feedback` accepts an exact `workspace`, an opaque `feedback_id`, a
+bounded `site`, one of `item_type: fact | decision | context | precedent |
+recall`, one of `signal: helpful | not_helpful | stale | irrelevant | unsafe`,
+an opaque `item_ref`, and an optional SHA-256 `query_hash`. It rejects raw query
+text, free-text notes, and arbitrary payloads. The identity key is
+`(workspace, feedback_id)`: an identical retry returns `result_status:
+"duplicate"`; a changed retry returns `code: "feedback_id_conflict"`.
+
+`query_feedback` is exact-workspace scoped, optionally filters by site, returns
+bounded metadata plus fixed signal counts, and retains only the newest bounded
+number of rows per workspace. These records are operational evidence only:
+they do not re-rank memory, change trust, or make a quality, safety, adoption,
+or workflow decision.
+
+## Entity lookup normalization
+
+Entity storage keeps the first normalized display spelling while resolving
+lookups through a separate canonical key. The key applies Unicode NFKC,
+collapses whitespace, and case-folds text. This makes `remember_entity`,
+`remember_relation`, and `search_graph` stable across casing and visually
+equivalent Unicode forms without rewriting the display name or changing graph
+semantics. Existing stores receive the key through an additive migration.
 
 ## Server-side extraction authority gate
 

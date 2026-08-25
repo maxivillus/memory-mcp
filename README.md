@@ -19,10 +19,10 @@ pipeline into the server for runtimes that have no client patches.
   ingestion with `new` / `duplicate` / `related` classification. Preview is
   the default; `commit:true` only writes `new` items and leaves related,
   update, and contradiction candidates for review.
-- `search_facts {query, limit?, trust_min?, strong_only?, project?, domain?, category?, valid_at?, workspace?, chunk_chars?, purpose?}` —
+- `search_facts {query, limit?, profile?, trust_min?, strong_only?, project?, domain?, category?, valid_at?, workspace?, chunk_chars?, purpose?}` —
   advisory FTS5 full-text, BM25 ranking; falls back to literal phrase on FTS syntax errors.
   `chunk_chars?` optionally adds bounded, offset-addressable chunks to hits.
-- `search_semantic {query, limit?, threshold?, workspace?, valid_at?, trust_min?, strong_only?, project?, domain?, category?, purpose?}` — advisory embedding
+- `search_semantic {query, limit?, profile?, threshold?, workspace?, valid_at?, trust_min?, strong_only?, project?, domain?, category?, purpose?}` — advisory embedding
   search when `MEMORY_MCP_EMBEDDINGS=1`; its eligibility filters match
   `search_facts`, and it cannot authorize safety-critical operations.
 - `chunk_fact {id | fact_id | sha256, workspace?, chunk_chars?, chunk_overlap?, start_chunk?, max_chunks?}` — read one active fact through a bounded page API
@@ -41,6 +41,7 @@ pipeline into the server for runtimes that have no client patches.
 - `search_context {query, workspace, limit?}` — search context metadata and payloads, returning metadata only
 - `chunk_context {ref, workspace, chunk_chars?, start_chunk?, max_chunks?}` — read a bounded page of numbered chunks
 - `reduce_context {name, refs, workspace, separator?, schema?, source?, checksum?, ttl_seconds?}` — create a derived ref by deterministic concatenation
+- `ingest_document {root, path, workspace, name?, chunk_chars?, max_bytes?, ttl_seconds?, commit?}` — preview or explicitly commit one UTF-8 local document as immutable, bounded context chunks; paths stay under the supplied root and sensitive/binary files are excluded
 - `capture_event {idempotency_key, event_kind, payload, workspace, session_id?, source?, path?, exclude_paths?}` — sanitize and capture one bounded lifecycle envelope; returns stable refs and deduplicates retries
 - `list_events {workspace, session_id?, event_kind?, limit?}` / `read_event {event_ref, workspace, max_chars?}` — inspect event metadata and read one bounded payload slice
 - `handoff_begin {content, owner, workspace, source?, checksum?, ttl_seconds?, cwd?, shared?, idempotency_key?}` — create an expiring typed handoff over immutable context
@@ -51,6 +52,7 @@ pipeline into the server for runtimes that have no client patches.
 - `query_run {run_id?, workspace?, state?, issue_ref?, limit?}` — one run record or a filtered list; diffs are clipped to bounded slices
 - `record_measurement {measurement_id, sample_key, variant, workspace, run_id?|issue_ref?, input_tokens?, output_tokens?, memory_calls?, external_tool_calls?, context_bytes?, comment_bytes?, wall_time_ms?, time_to_first_useful_ms?, memory_latency_ms?, duplicate_rate?, conflict_rate?, reference_resolution_rate?, fallback_rate?, qa_rework?, quality_score?, safety_regression?}` — record one bounded aggregate observation for a `baseline` or `memory` sample; prompts, payloads, comments, diffs, and unknown fields are rejected
 - `query_measurement {measurement_id, workspace, min_pairs?}` — report complete-pair counts plus per-variant median/p95 numeric metrics; stays `not_claimed` until the configured paired slice is complete
+- `record_feedback {feedback_id, site, item_type, item_ref, signal, workspace, query_hash?}` / `query_feedback {workspace, site?, limit?}` — record and aggregate bounded usage signals without free-text notes or raw queries; retries are idempotent
 - `prepare_summary {run_id, workspace?, max_decisions?}` — assemble a ready-to-post markdown summary from a run's own records (decisions in its window or bound to its issue_ref, event catalog); posts nothing
 - `query_anchored {path?, symbol?, repo?, repo_root?, workspace?, limit?, purpose?}` — advisory lookup of facts (via evidence code anchors) and decisions (via their own path/symbol anchors) bound to a code location; an explicit local `repo_root` adds read-only filesystem verdicts
 - `auto_orient {turn_text, session_id?, workspace?}` — one first-input, six-hit, 2.5-second capped recall orientation with silent degradation
@@ -68,6 +70,13 @@ and local lock/hash checks.
 anchors. Raw `selected_text` is never stored; only its SHA-256 is kept. The
 complete v0.16 ingestion and provenance flow is documented in
 [`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md).
+
+The v0.22 retrieval profiles are bounded response-shaping presets, not roles or
+permissions: `balanced` (default), `orientation`, `implementation`, `review`,
+and `incident`. They only choose a default limit, optional graph expansion, and
+for `compose_recall` a character budget; explicit limits are still capped by
+the selected profile. Results add `profile` and `result_status` (`ok` or
+`empty`) while keeping retrieval advisory-only.
 
 ### v0.6 — database & workspace management (2026-08-17)
 
@@ -430,6 +439,40 @@ archive:
 
 The public MCP server reports `serverInfo.version = 0.20.0`.
 
+### v0.22 — bounded profiles, local document adapter, feedback, and entity keys (2026-08-25)
+
+This release adds local, dependency-free seams that make the existing memory
+store more useful to different work modes without changing its advisory
+authority:
+
+- **Retrieval profiles**: `search_facts`, `search_semantic`, `compose_recall`,
+  and `find_precedents` accept `profile` values `balanced`, `orientation`,
+  `implementation`, `review`, or `incident`. Profiles choose bounded defaults
+  and return typed `profile`/`result_status` fields; they do not grant access,
+  alter source-of-truth rules, or bypass `purpose: "safety_critical"` rejection.
+- **Local document adapter**: `ingest_document` requires an explicit root,
+  repository-relative path, and exact workspace. Preview is the default;
+  `commit:true` stores UTF-8 chunks as immutable context with the document
+  SHA-256, relative path, chunk index, and bounded TTL. Root paths are never
+  stored or returned, traversal/symlink escapes are rejected, and common
+  secret, database, archive, binary, and certificate files are excluded.
+- **Usage feedback**: `record_feedback` accepts only bounded identifiers,
+  item types, fixed signals, and an optional query SHA-256. `query_feedback`
+  returns signal counts and bounded metadata; duplicate IDs are no-ops and
+  conflicting retries are rejected. Raw queries and free-text notes are not
+  accepted.
+- **Entity normalization**: entity lookup uses Unicode NFKC, whitespace
+  folding, and case-folding while preserving the first display spelling. This
+  makes graph retrieval stable across casing and visually equivalent names;
+  existing stores migrate additively.
+- The public MCP server reports `serverInfo.version = 0.22.0`. No external
+  dependency, cloud service, UI, or workflow authority is introduced.
+
+The operational contract and threat notes are in
+[`docs/ingestion-and-provenance.md`](docs/ingestion-and-provenance.md), and
+the architecture boundary is recorded in
+[`docs/decisions/ADR-0005-bounded-local-retrieval-and-feedback.md`](docs/decisions/ADR-0005-bounded-local-retrieval-and-feedback.md).
+
 ### v0.3 — knowledge graph, decision log, provenance (2026-08-15)
 
 Covers decision rationale, precedent search and evidence lineage with zero
@@ -519,6 +562,17 @@ open):
   `(workspace_id, measurement_id, sample_key, variant)` and bounded
   per-workspace retention. The table contains no payload column.
 
+v0.22 additions (additive — existing stores migrate in place):
+
+- `entities.canonical_name` — Unicode-normalized, case-folded lookup key; the
+  original `name` remains the display value.
+- `memory_feedback(feedback_id, site, item_type, item_ref, signal, query_hash,
+  workspace_id, created_at)` with a unique `(workspace_id, feedback_id)` and
+  bounded per-workspace retention. It contains no free-text note or raw query.
+- `ingest_document` uses the existing `contexts` table; each committed chunk
+  carries a schema marker, relative path, document SHA-256, chunk index/count,
+  and optional expiration. The supplied root is transient and is never stored.
+
 ## Environment
 
 - `MEMORY_MCP_DB` — SQLite path. Default is **script-relative**: `<repo>/data/facts.db`
@@ -560,6 +614,12 @@ open):
   session-state cap (default 1024).
 - `MEMORY_MCP_MEASUREMENT_MAX_OBSERVATIONS` — maximum retained aggregate
   measurement observations per workspace (default 10,000).
+- `MEMORY_MCP_DOCUMENT_MAX_BYTES` / `_MAX_ALLOWED_BYTES` — default and hard
+  maximum local-document size (defaults 4 MiB / 16 MiB).
+- `MEMORY_MCP_DOCUMENT_CHUNK_CHARS` / `_MAX_CHUNKS` — default chunk size and
+  hard chunk-count cap (defaults 4000 / 256).
+- `MEMORY_MCP_FEEDBACK_MAX_FIELD_CHARS` / `_MAX_EVENTS` — feedback identifier
+  and retention caps (defaults 256 / 5000).
 - `MEMORY_MCP_LLM_KEY` / `MEMORY_MCP_EMBED_KEY` — bearer tokens for
   OpenAI-compatible providers. Credential-bearing plaintext HTTP is rejected
   unless `MEMORY_MCP_ALLOW_INSECURE_HTTP=1` is explicitly set.
