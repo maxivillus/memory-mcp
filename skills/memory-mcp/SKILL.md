@@ -221,6 +221,22 @@ decay_sweep, list_forgotten, restore_fact, detect_conflicts, fact_references.
   Feedback is observational; it does not re-rank, change trust, authorize, or
   establish quality, safety, adoption, or workflow decisions.
 
+### Issue-shaped pilot
+
+For a bounded project pilot, follow the sequence in
+the repository document `docs/pilot-workflow.md`: `run_begin` → strict
+code evidence/decision → `put_context` and, when needed, an owner-scoped
+typed handoff → read-only `query_anchored`/opt-in `context_map` → `run_end` /
+`prepare_summary` → paired `record_measurement` observations. Use one exact
+workspace and opaque run, issue, sample, and handoff identifiers. The current
+repository/ref and live runtime state remain authoritative; memory is only an
+advisory data plane. Keep the pilot synthetic and never put raw prompts,
+comments, diffs, credentials, or personal data in payloads or measurements.
+Do not treat `ready_for_review` as a claim; the default threshold is ten
+complete pairs and `not_claimed` is the expected result below it. `context_map`
+is disabled by default and can be rolled back by unsetting
+`MEMORY_MCP_CONTEXT_MAP`.
+
 ## Decisions, graph, provenance, and telemetry
 
 - record_decision stores scenario, reasoning, outcome, confidence, maker,
